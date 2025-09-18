@@ -34,6 +34,86 @@
 #include <trace/hooks/cpufreq.h>
 #include <trace/hooks/thermal.h>
 
+#ifdef CONFIG_UCI
+#include <linux/uci/uci.h>
+#include <linux/notification/notification.h>
+
+/*
+cheetah:/sys/devices/system/cpu/cpufreq $ cat policy0/scaling_available_frequencies
+300000 574000 738000 930000 1098000 1197000 1328000 1401000 1598000 1704000 1803000
+cheetah:/sys/devices/system/cpu/cpufreq $ cat policy4/scaling_available_frequencies
+400000 553000 696000 799000 910000 1024000 1197000 1328000 1491000 1663000 1836000 1999000 2130000 2253000 2348000
+cheetah:/sys/devices/system/cpu/cpufreq $ cat policy6/scaling_available_frequencies
+500000 851000 984000 1106000 1277000 1426000 1582000 1745000 1826000 2048000 2188000 2252000 2401000 2507000 2630000 2704000 2802000 2850000
+*/
+
+// saver 1
+#define LVL1_LITTLE 1704000
+#define LVL1_BIG    2130000
+#define LVL1_PRIME  2401000
+
+// saver 2
+#define LVL2_LITTLE 1598000
+#define LVL2_BIG    1836000
+#define LVL2_PRIME  2188000
+
+// saver 3
+#define LVL3_LITTLE 1401000
+#define LVL3_BIG    1491000
+#define LVL3_PRIME  1745000
+
+static int batterysaver = 0; // 0 - 1 - 3
+// default 0, seriously cutting back max freqs for sunshine inside car/long gps tracking...
+// 1 medium cutback, 2 full cutback, 3 full cutback and disable touch freq min boost
+static int batterysaver_level = 0; // 0 - 1 - 3
+static bool batterysaver_touch_limiting = false;
+static bool batterysaver_skip_only_google_cam = false;
+static bool batterysaver_no_skip = false;
+static bool gcam_detected = false;
+#define BATTERY_SAVER_MAX_LEVEL 3
+
+static void uci_user_listener(void) {
+    batterysaver = !!uci_get_user_property_int_mm("batterysaver", 0,0,1);
+    batterysaver_level = uci_get_user_property_int_mm("batterysaver_level", 0,0,BATTERY_SAVER_MAX_LEVEL);
+    batterysaver_touch_limiting = !!uci_get_user_property_int_mm("batterysaver_touch_limiting", 0,0,1);
+    batterysaver_skip_only_google_cam = !!uci_get_user_property_int_mm("batterysaver_skip_only_google_cam", 0,0,1);
+    batterysaver_no_skip = !!uci_get_user_property_int_mm("batterysaver_no_skip", 0,0,1);
+}
+
+static void uci_sys_listener(void) {
+	const char* new_fg_process0 = uci_get_sys_property_str("active_process0","");
+	if (new_fg_process0) {
+		if (strstr(new_fg_process0, "GoogleCamera")) {
+			gcam_detected = true;
+		} else {
+			gcam_detected = false;
+		}
+	} else {
+		gcam_detected = false;
+	}
+
+}
+
+static bool camera_on = false;
+
+static void ntf_listener(char* event, int num_param, char* str_param) {
+        if (strcmp(event,NTF_EVENT_CHARGE_LEVEL) && strcmp(event, NTF_EVENT_INPUT)) {
+                pr_info("%s CPUFREQ listener event %s %d %s\n",__func__,event,num_param,str_param);
+        }
+
+        if (!strcmp(event,NTF_EVENT_CAMERA_ON)) {
+                if (!!num_param) {
+                        // camera on..
+			pr_info("%s suspending battery saver, camera on\n",__func__);
+			gcam_detected = false;
+			camera_on = true;
+		} else {
+			pr_info("%s stop suspending battery saver, camera off\n",__func__);
+			camera_on = false;
+		}
+	}
+}
+#endif
 static LIST_HEAD(cpufreq_policy_list);
 
 /* Macros to iterate over CPU policies */
@@ -532,12 +612,59 @@ void cpufreq_disable_fast_switch(struct cpufreq_policy *policy)
 }
 EXPORT_SYMBOL_GPL(cpufreq_disable_fast_switch);
 
+#ifdef CONFIG_UCI
+
+#define NUM_OF_CORES 8
+
+// cpu max freqs for saver modes...
+static int batterysaver_max_freqs[BATTERY_SAVER_MAX_LEVEL][NUM_OF_CORES] = {
+	// little x 4 , big x 2, prime x 2 - clusters
+	// saver 1
+	{ LVL1_LITTLE,LVL1_LITTLE,LVL1_LITTLE,LVL1_LITTLE,
+	LVL1_BIG,LVL1_BIG,
+	LVL1_PRIME,LVL1_PRIME },
+	// saver 2
+	{ LVL2_LITTLE,LVL2_LITTLE,LVL2_LITTLE,LVL2_LITTLE,
+	LVL2_BIG,LVL2_BIG,
+	LVL2_PRIME,LVL2_PRIME },
+	// saver 3
+	{ LVL3_LITTLE,LVL3_LITTLE,LVL3_LITTLE,LVL3_LITTLE,
+	LVL3_BIG,LVL3_BIG,
+	LVL3_PRIME,LVL3_PRIME }
+};
+
+static int get_cpu_max_for_core(unsigned int cpu, int batterysaverlevel) {
+	if (cpu<=7 && batterysaverlevel>0 && batterysaverlevel<=BATTERY_SAVER_MAX_LEVEL) {
+		return batterysaver_max_freqs[batterysaverlevel-1][cpu];
+	} else {
+	    return -EINVAL;
+	}
+}
+
+static bool get_suspend_saving(void) {
+	return camera_on && (!batterysaver_skip_only_google_cam || gcam_detected) && !batterysaver_no_skip;
+}
+#endif
+
 static unsigned int __resolve_freq(struct cpufreq_policy *policy,
 		unsigned int target_freq, unsigned int relation)
 {
 	unsigned int idx;
 	unsigned int old_target_freq = target_freq;
 
+#ifdef CONFIG_UCI
+	bool suspend_saving = get_suspend_saving();
+	if (!suspend_saving && batterysaver>0) {
+		unsigned int cpu = policy->cpu;
+		int max = 0;
+		max = get_cpu_max_for_core(cpu,batterysaver_level);
+#if 0
+		pr_info("%s max freq for core: %u saver_level %d  cpu: %d  target: %u",__func__,max,batterysaver_level,cpu,target_freq);
+#endif
+		if (max<=0) max = policy->max;
+		target_freq = clamp_val(target_freq, policy->min, max);
+	} else
+#endif
 	target_freq = clamp_val(target_freq, policy->min, policy->max);
 	trace_android_vh_cpufreq_resolve_freq(policy, &target_freq, old_target_freq);
 
@@ -2572,6 +2699,9 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	struct cpufreq_policy_data new_data;
 	struct cpufreq_governor *old_gov;
 	int ret;
+#ifdef CONFIG_UCI
+	bool suspend_saving = get_suspend_saving();
+#endif
 
 	memcpy(&new_data.cpuinfo, &policy->cpuinfo, sizeof(policy->cpuinfo));
 	new_data.freq_table = policy->freq_table;
@@ -2603,6 +2733,27 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	policy->max = new_data.max;
 	policy->min = __resolve_freq(policy, policy->min, CPUFREQ_RELATION_L);
 	policy->max = __resolve_freq(policy, policy->max, CPUFREQ_RELATION_H);
+#ifdef CONFIG_UCI
+	if (!suspend_saving && batterysaver && batterysaver_touch_limiting) {
+		unsigned int cpu = policy->cpu;
+		int max = 0;
+		pr_debug("%s [cleanslate_policy] new min and max freqs are %u - %u kHz\n",__func__,
+			 policy->min, policy->max);
+		max = get_cpu_max_for_core(cpu,batterysaver_level);
+		if (policy->min>max) {
+			pr_debug("%s [cleanslate_policy] freq for core: %u saver_level %d  cpu: %d  target MIN: %u",__func__,max,batterysaver_level,cpu,policy->min);
+			policy->min = max;
+			new_data.min = max;
+		}
+		if (policy->max>max) {
+			pr_debug("%s [cleanslate_policy] freq for core: %u saver_level %d  cpu: %d  target MAX: %u",__func__,max,batterysaver_level,cpu,policy->max);
+			policy->max = max;
+			new_data.max = max;
+		}
+		pr_debug("%s [cleanslate_policy] OVERRIDDEN: new min and max freqs are %u - %u kHz\n",__func__,
+			 policy->min, policy->max);
+	}
+#endif
 	trace_cpu_frequency_limits(policy);
 
 	policy->cached_target_freq = UINT_MAX;
@@ -2979,6 +3130,11 @@ static int __init cpufreq_core_init(void)
 	if (!strlen(default_governor))
 		strncpy(default_governor, gov->name, CPUFREQ_NAME_LEN);
 
+#ifdef CONFIG_UCI
+	uci_add_user_listener(uci_user_listener);
+	uci_add_sys_listener(uci_sys_listener);
+	ntf_add_listener(ntf_listener);
+#endif
 	return 0;
 }
 module_param(off, int, 0444);
