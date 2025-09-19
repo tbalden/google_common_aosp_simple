@@ -160,14 +160,19 @@ static int get_s2s_y_above(void) {
 #endif
 
 extern bool machine_is_cheetah(void);
+extern bool machine_is_raven(void);
 
 // device specifics
 static void s2s_setup_values(void) {
 	if (machine_is_cheetah()) {
 		pr_info("%s hw cheetah\n",__func__);
 		// leave original values
-	} else {	
-                pr_info("%s hw panther\n",__func__);
+	} else
+	if (machine_is_raven()) {
+		pr_info("%s hw raven\n",__func__);
+		// leave original values
+	} else {
+		pr_info("%s hw panther or oriole\n",__func__);
 		S2S_Y_MAX = 2400;
 		S2S_X_MAX = 1080;
 		S2S_X_LEFT_CORNER_END = 100;

@@ -188,6 +188,11 @@ bool machine_is_cheetah(void) {
 	return is_cheetah;
 }
 EXPORT_SYMBOL(machine_is_cheetah);
+static bool is_raven = true;
+bool machine_is_raven(void) {
+	return is_raven;
+}
+EXPORT_SYMBOL(machine_is_raven);
 #endif
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
 {
@@ -222,6 +227,7 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 		return;
 #ifdef CONFIG_UCI
 	if (!strstr(name,"CHEETAH")) is_cheetah = false;
+	if (!strstr(name,"Raven") && !strstr(name,"RAVEN")) is_raven = false;
 #endif
 	pr_info("Machine model: %s\n", name);
 	dump_stack_set_arch_desc("%s (DT)", name);
