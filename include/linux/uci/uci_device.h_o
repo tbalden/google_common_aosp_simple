@@ -1,0 +1,8 @@
+#ifndef __UCI_DEVICE_H__
+#define __UCI_DEVICE_H__
+
+#define DEVICE_SHUSKY
+#define DEVICE_RAVIOLE
+#define DEVICE_PANTAH
+
+#endif

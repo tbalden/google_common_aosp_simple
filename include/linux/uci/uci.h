@@ -3,9 +3,7 @@
 
 #include <drm/drm_panel.h>
 
-#define DEVICE_SHUSKY
-#define DEVICE_RAVIOLE
-#define DEVICE_PANTAH
+#include <linux/uci/uci_device.h>
 
 #define UCI_INVALID_INT -999999
 
