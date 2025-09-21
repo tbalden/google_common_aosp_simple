@@ -56,6 +56,36 @@ cheetah:/sys/devices/system/cpu/cpufreq $ cat policy6/scaling_available_frequenc
 500000 851000 984000 1106000 1277000 1426000 1582000 1745000 1826000 2048000 2188000 2252000 2401000 2507000 2630000 2704000 2802000 2850000
 */
 
+/*
+husky:/sys/devices/system/cpu/cpufreq $ cat policy0/scaling_available_frequencies
+324000 610000 820000 955000 1098000 1197000 1328000 1425000 1548000 1704000
+
+husky:/sys/devices/system/cpu/cpufreq $ cat policy4/scaling_available_frequencies
+402000 578000 697000 712000 910000 1065000 1221000 1328000 1418000 1572000 1836000 1945000 2130000 2245000 2367000
+
+husky:/sys/devices/system/cpu/cpufreq $ cat policy8/scaling_available_frequencies
+500000 880000 1164000 1298000 1557000 1745000 1885000 2049000 2147000 2294000 2363000 2556000 2687000 2850000 2914000
+*/
+
+#ifdef DEVICE_SHUSKY
+///////////////// SHUSKY //
+// saver 1
+#define LVL1_LITTLE 1548000
+#define LVL1_BIG    1945000
+#define LVL1_PRIME  2556000
+
+// saver 2
+#define LVL2_LITTLE 1425000
+#define LVL2_BIG    1836000
+#define LVL2_PRIME  2147000
+
+// saver 3
+#define LVL3_LITTLE 1328000
+#define LVL3_BIG    1572000
+#define LVL3_PRIME  1885000
+
+#else
+///////////////////////////
 // saver 1
 #define LVL1_LITTLE 1704000
 #define LVL1_BIG    2130000
@@ -70,6 +100,8 @@ cheetah:/sys/devices/system/cpu/cpufreq $ cat policy6/scaling_available_frequenc
 #define LVL3_LITTLE 1401000
 #define LVL3_BIG    1491000
 #define LVL3_PRIME  1745000
+
+#endif
 
 static int batterysaver = 0; // 0 - 1 - 3
 // default 0, seriously cutting back max freqs for sunshine inside car/long gps tracking...
@@ -623,6 +655,29 @@ EXPORT_SYMBOL_GPL(cpufreq_disable_fast_switch);
 
 #ifdef CONFIG_UCI
 
+#ifdef DEVICE_SHUSKY
+/////////////////// SHUSKY //
+#define NUM_OF_CORES 9
+
+// cpu max freqs for saver modes...
+static int batterysaver_max_freqs[BATTERY_SAVER_MAX_LEVEL][NUM_OF_CORES] = {
+	// little x 4 , big x 4, prime x 1 - clusters
+	// saver 1
+	{ LVL1_LITTLE,LVL1_LITTLE,LVL1_LITTLE,LVL1_LITTLE,
+	LVL1_BIG,LVL1_BIG,LVL1_BIG,LVL1_BIG,
+	LVL1_PRIME },
+	// saver 2
+	{ LVL2_LITTLE,LVL2_LITTLE,LVL2_LITTLE,LVL2_LITTLE,
+	LVL2_BIG,LVL2_BIG,LVL2_BIG,LVL2_BIG,
+	LVL2_PRIME },
+	// saver 3
+	{ LVL3_LITTLE,LVL3_LITTLE,LVL3_LITTLE,LVL3_LITTLE,
+	LVL3_BIG,LVL3_BIG,LVL3_BIG,LVL3_BIG,
+	LVL3_PRIME }
+};
+
+#else
+/////////////////////////////
 #define NUM_OF_CORES 8
 
 // cpu max freqs for saver modes...
@@ -642,8 +697,11 @@ static int batterysaver_max_freqs[BATTERY_SAVER_MAX_LEVEL][NUM_OF_CORES] = {
 	LVL3_PRIME,LVL3_PRIME }
 };
 
+#endif
+
+
 static int get_cpu_max_for_core(unsigned int cpu, int batterysaverlevel) {
-	if (cpu<=7 && batterysaverlevel>0 && batterysaverlevel<=BATTERY_SAVER_MAX_LEVEL) {
+	if (cpu<=(NUM_OF_CORES-1) && batterysaverlevel>0 && batterysaverlevel<=BATTERY_SAVER_MAX_LEVEL) {
 		return batterysaver_max_freqs[batterysaverlevel-1][cpu];
 	} else {
 	    return -EINVAL;

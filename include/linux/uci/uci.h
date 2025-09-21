@@ -3,6 +3,10 @@
 
 #include <drm/drm_panel.h>
 
+#define DEVICE_SHUSKY
+#define DEVICE_RAVIOLE
+#define DEVICE_PANTAH
+
 #define UCI_INVALID_INT -999999
 
 // user config file to read data coming from user space
