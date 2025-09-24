@@ -465,7 +465,6 @@ static int set_rq_size(struct hns_roce_dev *hr_dev, struct ib_qp_cap *cap,
 	if (!has_rq) {
 		hr_qp->rq.wqe_cnt = 0;
 		hr_qp->rq.max_gs = 0;
-		hr_qp->rq_inl_buf.wqe_cnt = 0;
 		cap->max_recv_wr = 0;
 		cap->max_recv_sge = 0;
 
@@ -495,12 +494,6 @@ static int set_rq_size(struct hns_roce_dev *hr_dev, struct ib_qp_cap *cap,
 				    hr_qp->rq.max_gs);
 
 	hr_qp->rq.wqe_cnt = cnt;
-	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RQ_INLINE &&
-	    hr_qp->ibqp.qp_type != IB_QPT_UD &&
-	    hr_qp->ibqp.qp_type != IB_QPT_GSI)
-		hr_qp->rq_inl_buf.wqe_cnt = cnt;
-	else
-		hr_qp->rq_inl_buf.wqe_cnt = 0;
 
 	cap->max_recv_wr = cnt;
 	cap->max_recv_sge = hr_qp->rq.max_gs - hr_qp->rq.rsv_sge;
@@ -766,49 +759,6 @@ static int hns_roce_qp_has_rq(struct ib_qp_init_attr *attr)
 	return 1;
 }
 
-static int alloc_rq_inline_buf(struct hns_roce_qp *hr_qp,
-			       struct ib_qp_init_attr *init_attr)
-{
-	u32 max_recv_sge = init_attr->cap.max_recv_sge;
-	u32 wqe_cnt = hr_qp->rq_inl_buf.wqe_cnt;
-	struct hns_roce_rinl_wqe *wqe_list;
-	int i;
-
-	/* allocate recv inline buf */
-	wqe_list = kcalloc(wqe_cnt, sizeof(struct hns_roce_rinl_wqe),
-			   GFP_KERNEL);
-	if (!wqe_list)
-		goto err;
-
-	/* Allocate a continuous buffer for all inline sge we need */
-	wqe_list[0].sg_list = kcalloc(wqe_cnt, (max_recv_sge *
-				      sizeof(struct hns_roce_rinl_sge)),
-				      GFP_KERNEL);
-	if (!wqe_list[0].sg_list)
-		goto err_wqe_list;
-
-	/* Assign buffers of sg_list to each inline wqe */
-	for (i = 1; i < wqe_cnt; i++)
-		wqe_list[i].sg_list = &wqe_list[0].sg_list[i * max_recv_sge];
-
-	hr_qp->rq_inl_buf.wqe_list = wqe_list;
-
-	return 0;
-
-err_wqe_list:
-	kfree(wqe_list);
-
-err:
-	return -ENOMEM;
-}
-
-static void free_rq_inline_buf(struct hns_roce_qp *hr_qp)
-{
-	if (hr_qp->rq_inl_buf.wqe_list)
-		kfree(hr_qp->rq_inl_buf.wqe_list[0].sg_list);
-	kfree(hr_qp->rq_inl_buf.wqe_list);
-}
-
 static int alloc_qp_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
 			struct ib_qp_init_attr *init_attr,
 			struct ib_udata *udata, unsigned long addr)
@@ -816,18 +766,6 @@ static int alloc_qp_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
 	struct ib_device *ibdev = &hr_dev->ib_dev;
 	struct hns_roce_buf_attr buf_attr = {};
 	int ret;
-
-	if (!udata && hr_qp->rq_inl_buf.wqe_cnt) {
-		ret = alloc_rq_inline_buf(hr_qp, init_attr);
-		if (ret) {
-			ibdev_err(ibdev,
-				  "failed to alloc inline buf, ret = %d.\n",
-				  ret);
-			return ret;
-		}
-	} else {
-		hr_qp->rq_inl_buf.wqe_list = NULL;
-	}
 
 	ret = set_wqe_buf_attr(hr_dev, hr_qp, &buf_attr);
 	if (ret) {
@@ -848,7 +786,6 @@ static int alloc_qp_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
 	return 0;
 
 err_inline:
-	free_rq_inline_buf(hr_qp);
 
 	return ret;
 }
@@ -856,7 +793,6 @@ err_inline:
 static void free_qp_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp)
 {
 	hns_roce_mtr_destroy(hr_dev, &hr_qp->mtr);
-	free_rq_inline_buf(hr_qp);
 }
 
 static inline bool user_qp_has_sdb(struct hns_roce_dev *hr_dev,
@@ -924,14 +860,12 @@ static int alloc_user_qp_db(struct hns_roce_dev *hr_dev,
 			    struct hns_roce_ib_create_qp *ucmd,
 			    struct hns_roce_ib_create_qp_resp *resp)
 {
-	bool has_sdb = user_qp_has_sdb(hr_dev, init_attr, udata, resp, ucmd);
 	struct hns_roce_ucontext *uctx = rdma_udata_to_drv_context(udata,
 		struct hns_roce_ucontext, ibucontext);
-	bool has_rdb = user_qp_has_rdb(hr_dev, init_attr, udata, resp);
 	struct ib_device *ibdev = &hr_dev->ib_dev;
 	int ret;
 
-	if (has_sdb) {
+	if (user_qp_has_sdb(hr_dev, init_attr, udata, resp, ucmd)) {
 		ret = hns_roce_db_map_user(uctx, ucmd->sdb_addr, &hr_qp->sdb);
 		if (ret) {
 			ibdev_err(ibdev,
@@ -942,7 +876,7 @@ static int alloc_user_qp_db(struct hns_roce_dev *hr_dev,
 		hr_qp->en_flags |= HNS_ROCE_QP_CAP_SQ_RECORD_DB;
 	}
 
-	if (has_rdb) {
+	if (user_qp_has_rdb(hr_dev, init_attr, udata, resp)) {
 		ret = hns_roce_db_map_user(uctx, ucmd->db_addr, &hr_qp->rdb);
 		if (ret) {
 			ibdev_err(ibdev,
@@ -956,7 +890,7 @@ static int alloc_user_qp_db(struct hns_roce_dev *hr_dev,
 	return 0;
 
 err_sdb:
-	if (has_sdb)
+	if (hr_qp->en_flags & HNS_ROCE_QP_CAP_SQ_RECORD_DB)
 		hns_roce_db_unmap_user(uctx, &hr_qp->sdb);
 err_out:
 	return ret;
@@ -1213,7 +1147,7 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
 				       min(udata->outlen, sizeof(resp)));
 		if (ret) {
 			ibdev_err(ibdev, "copy qp resp failed!\n");
-			goto err_flow_ctrl;
+			goto err_store;
 		}
 	}
 
@@ -1444,7 +1378,7 @@ int hns_roce_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		goto out;
 
 	ret = hr_dev->hw->modify_qp(ibqp, attr, attr_mask, cur_state,
-				    new_state);
+				    new_state, udata);
 
 out:
 	mutex_unlock(&hr_qp->mutex);

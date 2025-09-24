@@ -385,7 +385,7 @@ static inline void __nodes_fold(nodemask_t *dstp, const nodemask_t *origp,
 #if MAX_NUMNODES > 1
 #define for_each_node_mask(node, mask)				    \
 	for ((node) = first_node(mask);				    \
-	     (node >= 0) && (node) < MAX_NUMNODES;		    \
+	     (node) < MAX_NUMNODES;				    \
 	     (node) = next_node((node), (mask)))
 #else /* MAX_NUMNODES == 1 */
 #define for_each_node_mask(node, mask)                                  \
@@ -404,7 +404,7 @@ enum node_states {
 #else
 	N_HIGH_MEMORY = N_NORMAL_MEMORY,
 #endif
-	N_MEMORY,		/* The node has memory(regular, high, movable) */
+	N_MEMORY,		/* The node has memory in any of the zones */
 	N_CPU,		/* The node has one or more cpus */
 	N_GENERIC_INITIATOR,	/* The node has one or more Generic Initiators */
 	NR_NODE_STATES
@@ -516,7 +516,7 @@ static inline int node_random(const nodemask_t *maskp)
 		bit = first_node(*maskp);
 		break;
 	default:
-		bit = find_nth_bit(maskp->bits, MAX_NUMNODES, prandom_u32_max(w));
+		bit = find_nth_bit(maskp->bits, MAX_NUMNODES, get_random_u32_below(w));
 		break;
 	}
 	return bit;

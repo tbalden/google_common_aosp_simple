@@ -51,6 +51,7 @@ static struct oplock_info *alloc_opinfo(struct ksmbd_work *work,
 	init_waitqueue_head(&opinfo->oplock_brk);
 	atomic_set(&opinfo->refcount, 1);
 	atomic_set(&opinfo->breaking_cnt, 0);
+	atomic_inc(&opinfo->conn->refcnt);
 
 	return opinfo;
 }
@@ -124,6 +125,8 @@ static void free_opinfo(struct oplock_info *opinfo)
 {
 	if (opinfo->is_lease)
 		free_lease(opinfo);
+	if (opinfo->conn && atomic_dec_and_test(&opinfo->conn->refcnt))
+		kfree(opinfo->conn);
 	kfree(opinfo);
 }
 
@@ -159,12 +162,11 @@ static struct oplock_info *opinfo_get_list(struct ksmbd_inode *ci)
 	opinfo = list_first_or_null_rcu(&ci->m_op_list, struct oplock_info,
 					op_entry);
 	if (opinfo) {
-		if (!atomic_inc_not_zero(&opinfo->refcount))
+		if (opinfo->conn == NULL ||
+		    !atomic_inc_not_zero(&opinfo->refcount))
 			opinfo = NULL;
 		else {
-			atomic_inc(&opinfo->conn->r_count);
 			if (ksmbd_conn_releasing(opinfo->conn)) {
-				atomic_dec(&opinfo->conn->r_count);
 				atomic_dec(&opinfo->refcount);
 				opinfo = NULL;
 			}
@@ -176,26 +178,11 @@ static struct oplock_info *opinfo_get_list(struct ksmbd_inode *ci)
 	return opinfo;
 }
 
-static void opinfo_conn_put(struct oplock_info *opinfo)
+void opinfo_put(struct oplock_info *opinfo)
 {
-	struct ksmbd_conn *conn;
-
 	if (!opinfo)
 		return;
 
-	conn = opinfo->conn;
-	/*
-	 * Checking waitqueue to dropping pending requests on
-	 * disconnection. waitqueue_active is safe because it
-	 * uses atomic operation for condition.
-	 */
-	if (!atomic_dec_return(&conn->r_count) && waitqueue_active(&conn->r_count_q))
-		wake_up(&conn->r_count_q);
-	opinfo_put(opinfo);
-}
-
-void opinfo_put(struct oplock_info *opinfo)
-{
 	if (!atomic_dec_and_test(&opinfo->refcount))
 		return;
 
@@ -206,9 +193,9 @@ static void opinfo_add(struct oplock_info *opinfo)
 {
 	struct ksmbd_inode *ci = opinfo->o_fp->f_ci;
 
-	write_lock(&ci->m_lock);
+	down_write(&ci->m_lock);
 	list_add_rcu(&opinfo->op_entry, &ci->m_op_list);
-	write_unlock(&ci->m_lock);
+	up_write(&ci->m_lock);
 }
 
 static void opinfo_del(struct oplock_info *opinfo)
@@ -220,9 +207,9 @@ static void opinfo_del(struct oplock_info *opinfo)
 		lease_del_list(opinfo);
 		write_unlock(&lease_list_lock);
 	}
-	write_lock(&ci->m_lock);
+	down_write(&ci->m_lock);
 	list_del_rcu(&opinfo->op_entry);
-	write_unlock(&ci->m_lock);
+	up_write(&ci->m_lock);
 }
 
 static unsigned long opinfo_count(struct ksmbd_file *fp)
@@ -525,21 +512,18 @@ static struct oplock_info *same_client_has_lease(struct ksmbd_inode *ci,
 	 * Compare lease key and client_guid to know request from same owner
 	 * of same client
 	 */
-	read_lock(&ci->m_lock);
+	down_read(&ci->m_lock);
 	list_for_each_entry(opinfo, &ci->m_op_list, op_entry) {
-		if (!opinfo->is_lease)
+		if (!opinfo->is_lease || !opinfo->conn)
 			continue;
-		read_unlock(&ci->m_lock);
 		lease = opinfo->o_lease;
 
 		ret = compare_guid_key(opinfo, client_guid, lctx->lease_key);
 		if (ret) {
 			m_opinfo = opinfo;
 			/* skip upgrading lease about breaking lease */
-			if (atomic_read(&opinfo->breaking_cnt)) {
-				read_lock(&ci->m_lock);
+			if (atomic_read(&opinfo->breaking_cnt))
 				continue;
-			}
 
 			/* upgrading lease */
 			if ((atomic_read(&ci->op_count) +
@@ -569,9 +553,8 @@ static struct oplock_info *same_client_has_lease(struct ksmbd_inode *ci,
 				lease_none_upgrade(opinfo, lctx->req_state);
 			}
 		}
-		read_lock(&ci->m_lock);
 	}
-	read_unlock(&ci->m_lock);
+	up_read(&ci->m_lock);
 
 	return m_opinfo;
 }
@@ -656,7 +639,7 @@ static void __smb2_oplock_break_noti(struct work_struct *wk)
 	struct smb2_hdr *rsp_hdr;
 	struct ksmbd_file *fp;
 
-	fp = ksmbd_lookup_durable_fd(br_info->fid);
+	fp = ksmbd_lookup_global_fd(br_info->fid);
 	if (!fp)
 		goto out;
 
@@ -1118,9 +1101,9 @@ void smb_send_parent_lease_break_noti(struct ksmbd_file *fp,
 	if (!p_ci)
 		return;
 
-	read_lock(&p_ci->m_lock);
+	down_read(&p_ci->m_lock);
 	list_for_each_entry(opinfo, &p_ci->m_op_list, op_entry) {
-		if (!opinfo->is_lease)
+		if (opinfo->conn == NULL || !opinfo->is_lease)
 			continue;
 
 		if (opinfo->o_lease->state != SMB2_OPLOCK_LEVEL_NONE &&
@@ -1130,19 +1113,14 @@ void smb_send_parent_lease_break_noti(struct ksmbd_file *fp,
 			if (!atomic_inc_not_zero(&opinfo->refcount))
 				continue;
 
-			atomic_inc(&opinfo->conn->r_count);
-			if (ksmbd_conn_releasing(opinfo->conn)) {
-				atomic_dec(&opinfo->conn->r_count);
+			if (ksmbd_conn_releasing(opinfo->conn))
 				continue;
-			}
 
-			read_unlock(&p_ci->m_lock);
 			oplock_break(opinfo, SMB2_OPLOCK_LEVEL_NONE);
-			opinfo_conn_put(opinfo);
-			read_lock(&p_ci->m_lock);
+			opinfo_put(opinfo);
 		}
 	}
-	read_unlock(&p_ci->m_lock);
+	up_read(&p_ci->m_lock);
 
 	ksmbd_inode_put(p_ci);
 }
@@ -1156,34 +1134,29 @@ void smb_lazy_parent_lease_break_close(struct ksmbd_file *fp)
 	opinfo = rcu_dereference(fp->f_opinfo);
 	rcu_read_unlock();
 
-	if (!opinfo->is_lease || opinfo->o_lease->version != 2)
+	if (!opinfo || !opinfo->is_lease || opinfo->o_lease->version != 2)
 		return;
 
 	p_ci = ksmbd_inode_lookup_lock(fp->filp->f_path.dentry->d_parent);
 	if (!p_ci)
 		return;
 
-	read_lock(&p_ci->m_lock);
+	down_read(&p_ci->m_lock);
 	list_for_each_entry(opinfo, &p_ci->m_op_list, op_entry) {
-		if (!opinfo->is_lease)
+		if (opinfo->conn == NULL || !opinfo->is_lease)
 			continue;
 
 		if (opinfo->o_lease->state != SMB2_OPLOCK_LEVEL_NONE) {
 			if (!atomic_inc_not_zero(&opinfo->refcount))
 				continue;
 
-			atomic_inc(&opinfo->conn->r_count);
-			if (ksmbd_conn_releasing(opinfo->conn)) {
-				atomic_dec(&opinfo->conn->r_count);
+			if (ksmbd_conn_releasing(opinfo->conn))
 				continue;
-			}
-			read_unlock(&p_ci->m_lock);
 			oplock_break(opinfo, SMB2_OPLOCK_LEVEL_NONE);
-			opinfo_conn_put(opinfo);
-			read_lock(&p_ci->m_lock);
+			opinfo_put(opinfo);
 		}
 	}
-	read_unlock(&p_ci->m_lock);
+	up_read(&p_ci->m_lock);
 
 	ksmbd_inode_put(p_ci);
 }
@@ -1259,7 +1232,7 @@ int smb_grant_oplock(struct ksmbd_work *work, int req_op_level, u64 pid,
 	prev_opinfo = opinfo_get_list(ci);
 	if (!prev_opinfo ||
 	    (prev_opinfo->level == SMB2_OPLOCK_LEVEL_NONE && lctx)) {
-		opinfo_conn_put(prev_opinfo);
+		opinfo_put(prev_opinfo);
 		goto set_lev;
 	}
 	prev_op_has_lease = prev_opinfo->is_lease;
@@ -1269,19 +1242,19 @@ int smb_grant_oplock(struct ksmbd_work *work, int req_op_level, u64 pid,
 	if (share_ret < 0 &&
 	    prev_opinfo->level == SMB2_OPLOCK_LEVEL_EXCLUSIVE) {
 		err = share_ret;
-		opinfo_conn_put(prev_opinfo);
+		opinfo_put(prev_opinfo);
 		goto err_out;
 	}
 
 	if (prev_opinfo->level != SMB2_OPLOCK_LEVEL_BATCH &&
 	    prev_opinfo->level != SMB2_OPLOCK_LEVEL_EXCLUSIVE) {
-		opinfo_conn_put(prev_opinfo);
+		opinfo_put(prev_opinfo);
 		goto op_break_not_needed;
 	}
 
 	list_add(&work->interim_entry, &prev_opinfo->interim_list);
 	err = oplock_break(prev_opinfo, SMB2_OPLOCK_LEVEL_II);
-	opinfo_conn_put(prev_opinfo);
+	opinfo_put(prev_opinfo);
 	if (err == -ENOENT)
 		goto set_lev;
 	/* Check all oplock was freed by close */
@@ -1344,14 +1317,14 @@ static void smb_break_all_write_oplock(struct ksmbd_work *work,
 		return;
 	if (brk_opinfo->level != SMB2_OPLOCK_LEVEL_BATCH &&
 	    brk_opinfo->level != SMB2_OPLOCK_LEVEL_EXCLUSIVE) {
-		opinfo_conn_put(brk_opinfo);
+		opinfo_put(brk_opinfo);
 		return;
 	}
 
 	brk_opinfo->open_trunc = is_trunc;
 	list_add(&work->interim_entry, &brk_opinfo->interim_list);
 	oplock_break(brk_opinfo, SMB2_OPLOCK_LEVEL_II);
-	opinfo_conn_put(brk_opinfo);
+	opinfo_put(brk_opinfo);
 }
 
 /**
@@ -1377,14 +1350,14 @@ void smb_break_all_levII_oplock(struct ksmbd_work *work, struct ksmbd_file *fp,
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(brk_op, &ci->m_op_list, op_entry) {
+		if (brk_op->conn == NULL)
+			continue;
+
 		if (!atomic_inc_not_zero(&brk_op->refcount))
 			continue;
 
-		atomic_inc(&brk_op->conn->r_count);
-		if (ksmbd_conn_releasing(brk_op->conn)) {
-			atomic_dec(&brk_op->conn->r_count);
+		if (ksmbd_conn_releasing(brk_op->conn))
 			continue;
-		}
 
 		rcu_read_unlock();
 		if (brk_op->is_lease && (brk_op->o_lease->state &
@@ -1415,7 +1388,7 @@ void smb_break_all_levII_oplock(struct ksmbd_work *work, struct ksmbd_file *fp,
 		brk_op->open_trunc = is_trunc;
 		oplock_break(brk_op, SMB2_OPLOCK_LEVEL_NONE);
 next:
-		opinfo_conn_put(brk_op);
+		opinfo_put(brk_op);
 		rcu_read_lock();
 	}
 	rcu_read_unlock();
@@ -1513,11 +1486,10 @@ void create_lease_buf(u8 *rbuf, struct lease *lease)
 /**
  * parse_lease_state() - parse lease context containted in file open request
  * @open_req:	buffer containing smb2 file open(create) request
- * @is_dir:	whether leasing file is directory
  *
- * Return:  oplock state, -ENOENT if create lease context not found
+ * Return: allocated lease context object on success, otherwise NULL
  */
-struct lease_ctx_info *parse_lease_state(void *open_req, bool is_dir)
+struct lease_ctx_info *parse_lease_state(void *open_req)
 {
 	struct create_context *cc;
 	struct smb2_create_req *req = (struct smb2_create_req *)open_req;
@@ -1534,17 +1506,8 @@ struct lease_ctx_info *parse_lease_state(void *open_req, bool is_dir)
 	if (sizeof(struct lease_context_v2) == le32_to_cpu(cc->DataLength)) {
 		struct create_lease_v2 *lc = (struct create_lease_v2 *)cc;
 
-		if (le16_to_cpu(cc->DataOffset) + le32_to_cpu(cc->DataLength) <
-		    sizeof(struct create_lease_v2) - 4)
-			return NULL;
-
 		memcpy(lreq->lease_key, lc->lcontext.LeaseKey, SMB2_LEASE_KEY_SIZE);
-		if (is_dir) {
-			lreq->req_state = lc->lcontext.LeaseState &
-				~SMB2_LEASE_WRITE_CACHING_LE;
-			lreq->is_dir = true;
-		} else
-			lreq->req_state = lc->lcontext.LeaseState;
+		lreq->req_state = lc->lcontext.LeaseState;
 		lreq->flags = lc->lcontext.LeaseFlags;
 		lreq->epoch = lc->lcontext.Epoch;
 		lreq->duration = lc->lcontext.LeaseDuration;
@@ -1554,10 +1517,6 @@ struct lease_ctx_info *parse_lease_state(void *open_req, bool is_dir)
 		lreq->version = 2;
 	} else {
 		struct create_lease *lc = (struct create_lease *)cc;
-
-		if (le16_to_cpu(cc->DataOffset) + le32_to_cpu(cc->DataLength) <
-		    sizeof(struct create_lease))
-			return NULL;
 
 		memcpy(lreq->lease_key, lc->lcontext.LeaseKey, SMB2_LEASE_KEY_SIZE);
 		lreq->req_state = lc->lcontext.LeaseState;
@@ -1672,6 +1631,8 @@ void create_durable_v2_rsp_buf(char *cc, struct ksmbd_file *fp)
 	buf->Name[3] = 'Q';
 
 	buf->Timeout = cpu_to_le32(fp->durable_timeout);
+	if (fp->is_persistent)
+		buf->Flags = cpu_to_le32(SMB2_DHANDLE_FLAG_PERSISTENT);
 }
 
 /**
@@ -1732,9 +1693,9 @@ void create_posix_rsp_buf(char *cc, struct ksmbd_file *fp)
 {
 	struct create_posix_rsp *buf;
 	struct inode *inode = file_inode(fp->filp);
-	struct user_namespace *user_ns = file_mnt_user_ns(fp->filp);
-	vfsuid_t vfsuid = i_uid_into_vfsuid(user_ns, inode);
-	vfsgid_t vfsgid = i_gid_into_vfsgid(user_ns, inode);
+	struct mnt_idmap *idmap = file_mnt_idmap(fp->filp);
+	vfsuid_t vfsuid = i_uid_into_vfsuid(idmap, inode);
+	vfsgid_t vfsgid = i_gid_into_vfsgid(idmap, inode);
 
 	buf = (struct create_posix_rsp *)cc;
 	memset(buf, 0, sizeof(struct create_posix_rsp));
@@ -1838,4 +1799,72 @@ op_next:
 out:
 	read_unlock(&lease_list_lock);
 	return ret_op;
+}
+
+int smb2_check_durable_oplock(struct ksmbd_conn *conn,
+			      struct ksmbd_share_config *share,
+			      struct ksmbd_file *fp,
+			      struct lease_ctx_info *lctx,
+			      char *name)
+{
+	struct oplock_info *opinfo = opinfo_get(fp);
+	int ret = 0;
+
+	if (!opinfo)
+		return 0;
+
+	if (opinfo->is_lease == false) {
+		if (lctx) {
+			pr_err("create context include lease\n");
+			ret = -EBADF;
+			goto out;
+		}
+
+		if (opinfo->level != SMB2_OPLOCK_LEVEL_BATCH) {
+			pr_err("oplock level is not equal to SMB2_OPLOCK_LEVEL_BATCH\n");
+			ret = -EBADF;
+		}
+
+		goto out;
+	}
+
+	if (memcmp(conn->ClientGUID, fp->client_guid,
+				SMB2_CLIENT_GUID_SIZE)) {
+		ksmbd_debug(SMB, "Client guid of fp is not equal to the one of connection\n");
+		ret = -EBADF;
+		goto out;
+	}
+
+	if (!lctx) {
+		ksmbd_debug(SMB, "create context does not include lease\n");
+		ret = -EBADF;
+		goto out;
+	}
+
+	if (memcmp(opinfo->o_lease->lease_key, lctx->lease_key,
+				SMB2_LEASE_KEY_SIZE)) {
+		ksmbd_debug(SMB,
+			    "lease key of fp does not match lease key in create context\n");
+		ret = -EBADF;
+		goto out;
+	}
+
+	if (!(opinfo->o_lease->state & SMB2_LEASE_HANDLE_CACHING_LE)) {
+		ksmbd_debug(SMB, "lease state does not contain SMB2_LEASE_HANDLE_CACHING\n");
+		ret = -EBADF;
+		goto out;
+	}
+
+	if (opinfo->o_lease->version != lctx->version) {
+		ksmbd_debug(SMB,
+			    "lease version of fp does not match the one in create context\n");
+		ret = -EBADF;
+		goto out;
+	}
+
+	if (!ksmbd_inode_pending_delete(fp))
+		ret = ksmbd_validate_name_reconnect(share, fp, name);
+out:
+	opinfo_put(opinfo);
+	return ret;
 }

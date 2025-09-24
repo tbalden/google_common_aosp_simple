@@ -7,6 +7,7 @@
  * Author: Lan Tianyu <tianyu.lan@intel.com>
  */
 
+#include <linux/kstrtox.h>
 #include <linux/slab.h>
 #include <linux/pm_qos.h>
 #include <linux/component.h>
@@ -109,7 +110,7 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 
 	if (!hub)
 		return -ENODEV;
-	rc = strtobool(buf, &disabled);
+	rc = kstrtobool(buf, &disabled);
 	if (rc)
 		return rc;
 

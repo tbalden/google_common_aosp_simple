@@ -32,28 +32,33 @@
  * - future firmware versions could add support for >1 planes
  */
 static const struct venus_format venc_formats[] = {
-	{
+	[VENUS_FMT_NV12] = {
 		.pixfmt = V4L2_PIX_FMT_NV12,
 		.num_planes = 1,
 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-	}, {
-		.pixfmt = V4L2_PIX_FMT_MPEG4,
-		.num_planes = 1,
-		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-	}, {
-		.pixfmt = V4L2_PIX_FMT_H263,
-		.num_planes = 1,
-		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-	}, {
+	},
+	[VENUS_FMT_H264] = {
 		.pixfmt = V4L2_PIX_FMT_H264,
 		.num_planes = 1,
 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-	}, {
+	},
+	[VENUS_FMT_VP8] = {
 		.pixfmt = V4L2_PIX_FMT_VP8,
 		.num_planes = 1,
 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-	}, {
+	},
+	[VENUS_FMT_HEVC] = {
 		.pixfmt = V4L2_PIX_FMT_HEVC,
+		.num_planes = 1,
+		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+	},
+	[VENUS_FMT_MPEG4] = {
+		.pixfmt = V4L2_PIX_FMT_MPEG4,
+		.num_planes = 1,
+		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+	},
+	[VENUS_FMT_H263] = {
+		.pixfmt = V4L2_PIX_FMT_H263,
 		.num_planes = 1,
 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
 	},
@@ -663,6 +668,7 @@ static int venc_set_properties(struct venus_inst *inst)
 	struct hfi_idr_period idrp;
 	struct hfi_quantization quant;
 	struct hfi_quantization_range quant_range;
+	struct hfi_quantization_range_v2 quant_range_v2;
 	struct hfi_enable en;
 	struct hfi_ltr_mode ltr_mode;
 	struct hfi_intra_refresh intra_refresh = {};
@@ -871,16 +877,40 @@ static int venc_set_properties(struct venus_inst *inst)
 	if (ret)
 		return ret;
 
-	ptype = HFI_PROPERTY_PARAM_VENC_SESSION_QP_RANGE;
-	if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_HEVC) {
-		quant_range.min_qp = ctr->hevc_min_qp;
-		quant_range.max_qp = ctr->hevc_max_qp;
+	if (inst->core->res->hfi_version == HFI_VERSION_4XX ||
+	    inst->core->res->hfi_version == HFI_VERSION_6XX) {
+		ptype = HFI_PROPERTY_PARAM_VENC_SESSION_QP_RANGE_V2;
+
+		if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_HEVC) {
+			quant_range_v2.min_qp.qp_packed = ctr->hevc_min_qp;
+			quant_range_v2.max_qp.qp_packed = ctr->hevc_max_qp;
+		} else if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_VP8) {
+			quant_range_v2.min_qp.qp_packed = ctr->vp8_min_qp;
+			quant_range_v2.max_qp.qp_packed = ctr->vp8_max_qp;
+		} else {
+			quant_range_v2.min_qp.qp_packed = ctr->h264_min_qp;
+			quant_range_v2.max_qp.qp_packed = ctr->h264_max_qp;
+		}
+
+		ret = hfi_session_set_property(inst, ptype, &quant_range_v2);
 	} else {
-		quant_range.min_qp = ctr->h264_min_qp;
-		quant_range.max_qp = ctr->h264_max_qp;
+		ptype = HFI_PROPERTY_PARAM_VENC_SESSION_QP_RANGE;
+
+		if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_HEVC) {
+			quant_range.min_qp = ctr->hevc_min_qp;
+			quant_range.max_qp = ctr->hevc_max_qp;
+		} else if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_VP8) {
+			quant_range.min_qp = ctr->vp8_min_qp;
+			quant_range.max_qp = ctr->vp8_max_qp;
+		} else {
+			quant_range.min_qp = ctr->h264_min_qp;
+			quant_range.max_qp = ctr->h264_max_qp;
+		}
+
+		quant_range.layer_id = 0;
+		ret = hfi_session_set_property(inst, ptype, &quant_range);
 	}
-	quant_range.layer_id = 0;
-	ret = hfi_session_set_property(inst, ptype, &quant_range);
+
 	if (ret)
 		return ret;
 
@@ -1177,7 +1207,7 @@ static int venc_verify_conf(struct venus_inst *inst)
 		return ret;
 
 	if (inst->num_output_bufs < bufreq.count_actual ||
-	    inst->num_output_bufs < HFI_BUFREQ_COUNT_MIN(&bufreq, ver))
+	    inst->num_output_bufs < hfi_bufreq_get_count_min(&bufreq, ver))
 		return -EINVAL;
 
 	ret = venus_helper_get_bufreq(inst, HFI_BUFFER_INPUT, &bufreq);
@@ -1185,7 +1215,7 @@ static int venc_verify_conf(struct venus_inst *inst)
 		return ret;
 
 	if (inst->num_input_bufs < bufreq.count_actual ||
-	    inst->num_input_bufs < HFI_BUFREQ_COUNT_MIN(&bufreq, ver))
+	    inst->num_input_bufs < hfi_bufreq_get_count_min(&bufreq, ver))
 		return -EINVAL;
 
 	return 0;
@@ -1393,8 +1423,8 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
 
 static void venc_inst_init(struct venus_inst *inst)
 {
-	inst->fmt_cap = &venc_formats[3];
-	inst->fmt_out = &venc_formats[0];
+	inst->fmt_cap = &venc_formats[VENUS_FMT_H264];
+	inst->fmt_out = &venc_formats[VENUS_FMT_NV12];
 	inst->width = 1280;
 	inst->height = ALIGN(720, 32);
 	inst->out_width = 1280;
@@ -1564,7 +1594,7 @@ err_vdev_release:
 	return ret;
 }
 
-static int venc_remove(struct platform_device *pdev)
+static void venc_remove(struct platform_device *pdev)
 {
 	struct venus_core *core = dev_get_drvdata(pdev->dev.parent);
 
@@ -1573,8 +1603,6 @@ static int venc_remove(struct platform_device *pdev)
 
 	if (core->pm_ops->venc_put)
 		core->pm_ops->venc_put(core->dev_enc);
-
-	return 0;
 }
 
 static __maybe_unused int venc_runtime_suspend(struct device *dev)
@@ -1615,7 +1643,7 @@ MODULE_DEVICE_TABLE(of, venc_dt_match);
 
 static struct platform_driver qcom_venus_enc_driver = {
 	.probe = venc_probe,
-	.remove = venc_remove,
+	.remove_new = venc_remove,
 	.driver = {
 		.name = "qcom-venus-encoder",
 		.of_match_table = venc_dt_match,

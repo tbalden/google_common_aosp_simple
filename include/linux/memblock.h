@@ -122,6 +122,7 @@ unsigned long memblock_addrs_overlap(phys_addr_t base1, phys_addr_t size1,
 				     phys_addr_t base2, phys_addr_t size2);
 bool memblock_overlaps_region(struct memblock_type *type,
 			      phys_addr_t base, phys_addr_t size);
+bool memblock_validate_numa_coverage(unsigned long threshold_bytes);
 int memblock_mark_hotplug(phys_addr_t base, phys_addr_t size);
 int memblock_clear_hotplug(phys_addr_t base, phys_addr_t size);
 int memblock_mark_mirror(phys_addr_t base, phys_addr_t size);
@@ -130,7 +131,6 @@ int memblock_clear_nomap(phys_addr_t base, phys_addr_t size);
 
 void memblock_free_all(void);
 void memblock_free(void *ptr, size_t size);
-void reset_node_managed_pages(pg_data_t *pgdat);
 void reset_all_zones_managed_pages(void);
 
 /* Low level functions */
@@ -584,9 +584,7 @@ extern void *alloc_large_system_hash(const char *tablename,
 				     unsigned long high_limit);
 
 #define HASH_EARLY	0x00000001	/* Allocating during early boot? */
-#define HASH_SMALL	0x00000002	/* sub-page allocation allowed, min
-					 * shift passed via *_hash_shift */
-#define HASH_ZERO	0x00000004	/* Zero allocated hash table */
+#define HASH_ZERO	0x00000002	/* Zero allocated hash table */
 
 /* Only NUMA needs hash distribution. 64bit NUMA architectures have
  * sufficient vmalloc space.
@@ -599,12 +597,22 @@ extern int hashdist;		/* Distribute hashes across NUMA nodes? */
 #endif
 
 #ifdef CONFIG_MEMTEST
-extern void early_memtest(phys_addr_t start, phys_addr_t end);
+void early_memtest(phys_addr_t start, phys_addr_t end);
+void memtest_report_meminfo(struct seq_file *m);
 #else
-static inline void early_memtest(phys_addr_t start, phys_addr_t end)
-{
-}
+static inline void early_memtest(phys_addr_t start, phys_addr_t end) { }
+static inline void memtest_report_meminfo(struct seq_file *m) { }
 #endif
 
 
+extern void __init_memblock memblock_memsize_record(const char *name,
+		phys_addr_t base, phys_addr_t size, bool nomap, bool reusable);
+extern void __init memblock_memsize_detect_hole(void);
+extern void __init memblock_memsize_enable_tracking(void);
+extern void __init memblock_memsize_disable_tracking(void);
+extern void memblock_memsize_mod_kernel_size(long size);
+extern void __init memblock_memsize_mod_memmap_size(long size);
+extern void __init memblock_memsize_kernel_code_data(unsigned long code,
+		unsigned long data, unsigned long ro, unsigned long bss);
+extern void memblock_memsize_mod_reusable_size(long size);
 #endif /* _LINUX_MEMBLOCK_H */

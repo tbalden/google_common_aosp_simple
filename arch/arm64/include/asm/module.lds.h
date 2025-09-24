@@ -2,11 +2,9 @@
 #include <asm/page-def.h>
 
 SECTIONS {
-#ifdef CONFIG_ARM64_MODULE_PLTS
 	.plt 0 : { BYTE(0) }
 	.init.plt 0 : { BYTE(0) }
 	.text.ftrace_trampoline 0 : { BYTE(0) }
-#endif
 
 #ifdef CONFIG_KASAN_SW_TAGS
 	/*
@@ -19,6 +17,14 @@ SECTIONS {
 	 * warning.
 	 */
 	.text.hot : { *(.text.hot) }
+#endif
+
+#ifdef CONFIG_UNWIND_TABLES
+	/*
+	 * Currently, we only use unwind info at module load time, so we can
+	 * put it into the .init allocation.
+	 */
+	.init.eh_frame : { *(.eh_frame) }
 #endif
 
 #ifdef CONFIG_KVM
@@ -34,18 +40,16 @@ SECTIONS {
 		*(.hyp.rodata)
 		. = ALIGN(PAGE_SIZE);
 	}
+
+	.hyp.event_ids : ALIGN(PAGE_SIZE) {
+		*(.hyp.event_ids)
+		. = ALIGN(PAGE_SIZE);
+	}
+
 	.hyp.data : ALIGN(PAGE_SIZE) {
 		*(.hyp.data)
 		. = ALIGN(PAGE_SIZE);
 	}
 	.hyp.reloc : ALIGN(4) {	*(.hyp.reloc) }
-#endif
-
-#ifdef CONFIG_UNWIND_TABLES
-	/*
-	 * Currently, we only use unwind info at module load time, so we can
-	 * put it into the .init allocation.
-	 */
-	.init.eh_frame : { *(.eh_frame) }
 #endif
 }

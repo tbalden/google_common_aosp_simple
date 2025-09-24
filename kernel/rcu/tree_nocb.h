@@ -77,9 +77,9 @@ __setup("rcu_nocbs", rcu_nocb_setup);
 static int __init parse_rcu_nocb_poll(char *arg)
 {
 	rcu_nocb_poll = true;
-	return 0;
+	return 1;
 }
-early_param("rcu_nocb_poll", parse_rcu_nocb_poll);
+__setup("rcu_nocb_poll", parse_rcu_nocb_poll);
 
 /*
  * Don't bother bypassing ->cblist if the call_rcu() rate is low.
@@ -516,9 +516,7 @@ static bool rcu_nocb_try_bypass(struct rcu_data *rdp, struct rcu_head *rhp,
 	// 2. Both of these conditions are met:
 	//    a. The bypass list previously had only lazy CBs, and:
 	//    b. The new CB is non-lazy.
-	if (ncbs && (!bypass_is_lazy || lazy)) {
-		local_irq_restore(flags);
-	} else {
+	if (!ncbs || (bypass_is_lazy && !lazy)) {
 		// No-CBs GP kthread might be indefinitely asleep, if so, wake.
 		rcu_nocb_lock(rdp); // Rare during call_rcu() flood.
 		if (!rcu_segcblist_pend_cbs(&rdp->cblist)) {
@@ -528,7 +526,7 @@ static bool rcu_nocb_try_bypass(struct rcu_data *rdp, struct rcu_head *rhp,
 		} else {
 			trace_rcu_nocb_wake(rcu_state.name, rdp->cpu,
 					    TPS("FirstBQnoWake"));
-			rcu_nocb_unlock_irqrestore(rdp, flags);
+			rcu_nocb_unlock(rdp);
 		}
 	}
 	return true; // Callback already enqueued.
@@ -554,7 +552,7 @@ static void __call_rcu_nocb_wake(struct rcu_data *rdp, bool was_alldone,
 	// If we are being polled or there is no kthread, just leave.
 	t = READ_ONCE(rdp->nocb_gp_kthread);
 	if (rcu_nocb_poll || !t) {
-		rcu_nocb_unlock_irqrestore(rdp, flags);
+		rcu_nocb_unlock(rdp);
 		trace_rcu_nocb_wake(rcu_state.name, rdp->cpu,
 				    TPS("WakeNotPoll"));
 		return;
@@ -567,17 +565,23 @@ static void __call_rcu_nocb_wake(struct rcu_data *rdp, bool was_alldone,
 		rdp->qlen_last_fqs_check = len;
 		// Only lazy CBs in bypass list
 		if (lazy_len && bypass_len == lazy_len) {
-			rcu_nocb_unlock_irqrestore(rdp, flags);
+			rcu_nocb_unlock(rdp);
 			wake_nocb_gp_defer(rdp, RCU_NOCB_WAKE_LAZY,
 					   TPS("WakeLazy"));
-		} else if (!irqs_disabled_flags(flags)) {
+		} else if (!irqs_disabled_flags(flags) && cpu_online(rdp->cpu)) {
 			/* ... if queue was empty ... */
-			rcu_nocb_unlock_irqrestore(rdp, flags);
+			rcu_nocb_unlock(rdp);
 			wake_nocb_gp(rdp, false);
 			trace_rcu_nocb_wake(rcu_state.name, rdp->cpu,
 					    TPS("WakeEmpty"));
 		} else {
-			rcu_nocb_unlock_irqrestore(rdp, flags);
+			/*
+			 * Don't do the wake-up upfront on fragile paths.
+			 * Also offline CPUs can't call swake_up_one_online() from
+			 * (soft-)IRQs. Rely on the final deferred wake-up from
+			 * rcutree_report_cpu_dead()
+			 */
+			rcu_nocb_unlock(rdp);
 			wake_nocb_gp_defer(rdp, RCU_NOCB_WAKE,
 					   TPS("WakeEmptyIsDeferred"));
 		}
@@ -595,15 +599,15 @@ static void __call_rcu_nocb_wake(struct rcu_data *rdp, bool was_alldone,
 		if ((rdp->nocb_cb_sleep ||
 		     !rcu_segcblist_ready_cbs(&rdp->cblist)) &&
 		    !timer_pending(&rdp->nocb_timer)) {
-			rcu_nocb_unlock_irqrestore(rdp, flags);
+			rcu_nocb_unlock(rdp);
 			wake_nocb_gp_defer(rdp, RCU_NOCB_WAKE_FORCE,
 					   TPS("WakeOvfIsDeferred"));
 		} else {
-			rcu_nocb_unlock_irqrestore(rdp, flags);
+			rcu_nocb_unlock(rdp);
 			trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("WakeNot"));
 		}
 	} else {
-		rcu_nocb_unlock_irqrestore(rdp, flags);
+		rcu_nocb_unlock(rdp);
 		trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("WakeNot"));
 	}
 }
@@ -1296,18 +1300,28 @@ int rcu_nocb_cpu_offload(int cpu)
 }
 EXPORT_SYMBOL_GPL(rcu_nocb_cpu_offload);
 
+#ifdef CONFIG_RCU_LAZY
 static unsigned long
 lazy_rcu_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 {
 	int cpu;
 	unsigned long count = 0;
 
+	if (WARN_ON_ONCE(!cpumask_available(rcu_nocb_mask)))
+		return 0;
+
+	/*  Protect rcu_nocb_mask against concurrent (de-)offloading. */
+	if (!mutex_trylock(&rcu_state.barrier_mutex))
+		return 0;
+
 	/* Snapshot count of all CPUs */
-	for_each_possible_cpu(cpu) {
+	for_each_cpu(cpu, rcu_nocb_mask) {
 		struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
 
 		count +=  READ_ONCE(rdp->lazy_len);
 	}
+
+	mutex_unlock(&rcu_state.barrier_mutex);
 
 	return count ? count : SHRINK_EMPTY;
 }
@@ -1319,15 +1333,45 @@ lazy_rcu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 	unsigned long flags;
 	unsigned long count = 0;
 
-	/* Snapshot count of all CPUs */
-	for_each_possible_cpu(cpu) {
-		struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
-		int _count = READ_ONCE(rdp->lazy_len);
+	if (WARN_ON_ONCE(!cpumask_available(rcu_nocb_mask)))
+		return 0;
+	/*
+	 * Protect against concurrent (de-)offloading. Otherwise nocb locking
+	 * may be ignored or imbalanced.
+	 */
+	if (!mutex_trylock(&rcu_state.barrier_mutex)) {
+		/*
+		 * But really don't insist if barrier_mutex is contended since we
+		 * can't guarantee that it will never engage in a dependency
+		 * chain involving memory allocation. The lock is seldom contended
+		 * anyway.
+		 */
+		return 0;
+	}
 
-		if (_count == 0)
+	/* Snapshot count of all CPUs */
+	for_each_cpu(cpu, rcu_nocb_mask) {
+		struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
+		int _count;
+
+		if (WARN_ON_ONCE(!rcu_rdp_is_offloaded(rdp)))
 			continue;
+
+		if (!READ_ONCE(rdp->lazy_len))
+			continue;
+
 		rcu_nocb_lock_irqsave(rdp, flags);
-		WRITE_ONCE(rdp->lazy_len, 0);
+		/*
+		 * Recheck under the nocb lock. Since we are not holding the bypass
+		 * lock we may still race with increments from the enqueuer but still
+		 * we know for sure if there is at least one lazy callback.
+		 */
+		_count = READ_ONCE(rdp->lazy_len);
+		if (!_count) {
+			rcu_nocb_unlock_irqrestore(rdp, flags);
+			continue;
+		}
+		rcu_nocb_try_flush_bypass(rdp, jiffies);
 		rcu_nocb_unlock_irqrestore(rdp, flags);
 		wake_nocb_gp(rdp, false);
 		sc->nr_to_scan -= _count;
@@ -1335,6 +1379,9 @@ lazy_rcu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 		if (sc->nr_to_scan <= 0)
 			break;
 	}
+
+	mutex_unlock(&rcu_state.barrier_mutex);
+
 	return count ? count : SHRINK_STOP;
 }
 
@@ -1344,51 +1391,42 @@ static struct shrinker lazy_rcu_shrinker = {
 	.batch = 0,
 	.seeks = DEFAULT_SEEKS,
 };
+#endif // #ifdef CONFIG_RCU_LAZY
 
 void __init rcu_init_nohz(void)
 {
 	int cpu;
-	bool need_rcu_nocb_mask = false;
-	bool offload_all = false;
 	struct rcu_data *rdp;
-
-#if defined(CONFIG_RCU_NOCB_CPU_DEFAULT_ALL)
-	if (!rcu_state.nocb_is_setup) {
-		need_rcu_nocb_mask = true;
-		offload_all = true;
-	}
-#endif /* #if defined(CONFIG_RCU_NOCB_CPU_DEFAULT_ALL) */
+	const struct cpumask *cpumask = NULL;
 
 #if defined(CONFIG_NO_HZ_FULL)
-	if (tick_nohz_full_running && !cpumask_empty(tick_nohz_full_mask)) {
-		need_rcu_nocb_mask = true;
-		offload_all = false; /* NO_HZ_FULL has its own mask. */
-	}
-#endif /* #if defined(CONFIG_NO_HZ_FULL) */
+	if (tick_nohz_full_running && !cpumask_empty(tick_nohz_full_mask))
+		cpumask = tick_nohz_full_mask;
+#endif
 
-	if (need_rcu_nocb_mask) {
+	if (IS_ENABLED(CONFIG_RCU_NOCB_CPU_DEFAULT_ALL) &&
+	    !rcu_state.nocb_is_setup && !cpumask)
+		cpumask = cpu_possible_mask;
+
+	if (cpumask) {
 		if (!cpumask_available(rcu_nocb_mask)) {
 			if (!zalloc_cpumask_var(&rcu_nocb_mask, GFP_KERNEL)) {
 				pr_info("rcu_nocb_mask allocation failed, callback offloading disabled.\n");
 				return;
 			}
 		}
+
+		cpumask_or(rcu_nocb_mask, rcu_nocb_mask, cpumask);
 		rcu_state.nocb_is_setup = true;
 	}
 
 	if (!rcu_state.nocb_is_setup)
 		return;
 
-#if defined(CONFIG_NO_HZ_FULL)
-	if (tick_nohz_full_running)
-		cpumask_or(rcu_nocb_mask, rcu_nocb_mask, tick_nohz_full_mask);
-#endif /* #if defined(CONFIG_NO_HZ_FULL) */
-
-	if (offload_all)
-		cpumask_setall(rcu_nocb_mask);
-
+#ifdef CONFIG_RCU_LAZY
 	if (register_shrinker(&lazy_rcu_shrinker, "rcu-lazy"))
 		pr_err("Failed to register lazy_rcu shrinker!\n");
+#endif // #ifdef CONFIG_RCU_LAZY
 
 	if (!cpumask_subset(rcu_nocb_mask, cpu_possible_mask)) {
 		pr_info("\tNote: kernel parameter 'rcu_nocbs=', 'nohz_full', or 'isolcpus=' contains nonexistent CPUs.\n");

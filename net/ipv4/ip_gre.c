@@ -189,10 +189,10 @@ static int ipgre_err(struct sk_buff *skb, u32 info,
 	}
 
 #if IS_ENABLED(CONFIG_IPV6)
-       if (tpi->proto == htons(ETH_P_IPV6) &&
-           !ip6_err_gen_icmpv6_unreach(skb, iph->ihl * 4 + tpi->hdr_len,
-				       type, data_len))
-               return 0;
+	if (tpi->proto == htons(ETH_P_IPV6) &&
+	    !ip6_err_gen_icmpv6_unreach(skb, iph->ihl * 4 + tpi->hdr_len,
+					type, data_len))
+		return 0;
 #endif
 
 	if (t->parms.iph.daddr == 0 ||
@@ -515,7 +515,7 @@ static void gre_fb_xmit(struct sk_buff *skb, struct net_device *dev,
 
 err_free_skb:
 	kfree_skb(skb);
-	dev->stats.tx_dropped++;
+	DEV_STATS_INC(dev, tx_dropped);
 }
 
 static void erspan_fb_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -553,7 +553,8 @@ static void erspan_fb_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto err_free_skb;
 
 	if (skb->len > dev->mtu + dev->hard_header_len) {
-		pskb_trim(skb, dev->mtu + dev->hard_header_len);
+		if (pskb_trim(skb, dev->mtu + dev->hard_header_len))
+			goto err_free_skb;
 		truncate = true;
 	}
 
@@ -597,7 +598,7 @@ static void erspan_fb_xmit(struct sk_buff *skb, struct net_device *dev)
 
 err_free_skb:
 	kfree_skb(skb);
-	dev->stats.tx_dropped++;
+	DEV_STATS_INC(dev, tx_dropped);
 }
 
 static int gre_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
@@ -671,7 +672,7 @@ static netdev_tx_t ipgre_xmit(struct sk_buff *skb,
 
 free_skb:
 	kfree_skb(skb);
-	dev->stats.tx_dropped++;
+	DEV_STATS_INC(dev, tx_dropped);
 	return NETDEV_TX_OK;
 }
 
@@ -697,7 +698,8 @@ static netdev_tx_t erspan_xmit(struct sk_buff *skb,
 		goto free_skb;
 
 	if (skb->len > dev->mtu + dev->hard_header_len) {
-		pskb_trim(skb, dev->mtu + dev->hard_header_len);
+		if (pskb_trim(skb, dev->mtu + dev->hard_header_len))
+			goto free_skb;
 		truncate = true;
 	}
 
@@ -725,7 +727,7 @@ static netdev_tx_t erspan_xmit(struct sk_buff *skb,
 
 free_skb:
 	kfree_skb(skb);
-	dev->stats.tx_dropped++;
+	DEV_STATS_INC(dev, tx_dropped);
 	return NETDEV_TX_OK;
 }
 
@@ -753,7 +755,7 @@ static netdev_tx_t gre_tap_xmit(struct sk_buff *skb,
 
 free_skb:
 	kfree_skb(skb);
-	dev->stats.tx_dropped++;
+	DEV_STATS_INC(dev, tx_dropped);
 	return NETDEV_TX_OK;
 }
 
@@ -1683,7 +1685,7 @@ struct net_device *gretap_fb_dev_create(struct net *net, const char *name,
 	if (err)
 		goto out;
 
-	err = rtnl_configure_link(dev, NULL);
+	err = rtnl_configure_link(dev, NULL, 0, NULL);
 	if (err < 0)
 		goto out;
 

@@ -88,11 +88,6 @@ static struct trace_uprobe *to_trace_uprobe(struct dyn_event *ev)
 static int register_uprobe_event(struct trace_uprobe *tu);
 static int unregister_uprobe_event(struct trace_uprobe *tu);
 
-struct uprobe_dispatch_data {
-	struct trace_uprobe	*tu;
-	unsigned long		bp_addr;
-};
-
 static int uprobe_dispatcher(struct uprobe_consumer *con, struct pt_regs *regs);
 static int uretprobe_dispatcher(struct uprobe_consumer *con,
 				unsigned long func, struct pt_regs *regs);
@@ -216,11 +211,12 @@ static unsigned long translate_user_vaddr(unsigned long file_offset)
 
 /* Note that we don't verify it, since the code does not come from user space */
 static int
-process_fetch_insn(struct fetch_insn *code, void *rec, void *dest,
-		   void *base)
+process_fetch_insn(struct fetch_insn *code, void *rec, void *edata,
+		   void *dest, void *base)
 {
 	struct pt_regs *regs = rec;
 	unsigned long val;
+	int ret;
 
 	/* 1st stage: get value from context */
 	switch (code->op) {
@@ -236,20 +232,16 @@ process_fetch_insn(struct fetch_insn *code, void *rec, void *dest,
 	case FETCH_OP_RETVAL:
 		val = regs_return_value(regs);
 		break;
-	case FETCH_OP_IMM:
-		val = code->immediate;
-		break;
 	case FETCH_OP_COMM:
 		val = FETCH_TOKEN_COMM;
-		break;
-	case FETCH_OP_DATA:
-		val = (unsigned long)code->data;
 		break;
 	case FETCH_OP_FOFFS:
 		val = translate_user_vaddr(code->immediate);
 		break;
 	default:
-		return -EILSEQ;
+		ret = process_common_fetch_insn(code, &val);
+		if (ret < 0)
+			return ret;
 	}
 	code++;
 
@@ -345,7 +337,7 @@ alloc_trace_uprobe(const char *group, const char *event, int nargs, bool is_ret)
 	if (!tu)
 		return ERR_PTR(-ENOMEM);
 
-	ret = trace_probe_init(&tu->tp, event, group, true);
+	ret = trace_probe_init(&tu->tp, event, group, true, nargs);
 	if (ret < 0)
 		goto error;
 
@@ -564,6 +556,8 @@ static int __trace_uprobe_create(int argc, const char **argv)
 
 	if (argc < 2)
 		return -ECANCELED;
+	if (argc - 2 > MAX_TRACE_ARGS)
+		return -E2BIG;
 
 	if (argv[0][1] == ':')
 		event = &argv[0][2];
@@ -689,10 +683,14 @@ static int __trace_uprobe_create(int argc, const char **argv)
 	tu->filename = filename;
 
 	/* parse arguments */
-	for (i = 0; i < argc && i < MAX_TRACE_ARGS; i++) {
+	for (i = 0; i < argc; i++) {
+		struct traceprobe_parse_context ctx = {
+			.flags = (is_return ? TPARG_FL_RETURN : 0) | TPARG_FL_USER,
+		};
+
 		trace_probe_log_set_index(i + 2);
-		ret = traceprobe_parse_probe_arg(&tu->tp, i, argv[i],
-					is_return ? TPARG_FL_RETURN : 0);
+		ret = traceprobe_parse_probe_arg(&tu->tp, i, argv[i], &ctx);
+		traceprobe_finish_parse(&ctx);
 		if (ret)
 			goto error;
 	}
@@ -946,17 +944,23 @@ static struct uprobe_cpu_buffer *uprobe_buffer_get(void)
 
 static void uprobe_buffer_put(struct uprobe_cpu_buffer *ucb)
 {
+	if (!ucb)
+		return;
 	mutex_unlock(&ucb->mutex);
 }
 
 static struct uprobe_cpu_buffer *prepare_uprobe_buffer(struct trace_uprobe *tu,
-						       struct pt_regs *regs)
+						       struct pt_regs *regs,
+						       struct uprobe_cpu_buffer **ucbp)
 {
 	struct uprobe_cpu_buffer *ucb;
 	int dsize, esize;
 
+	if (*ucbp)
+		return *ucbp;
+
 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
-	dsize = __get_data_size(&tu->tp, regs);
+	dsize = __get_data_size(&tu->tp, regs, NULL);
 
 	ucb = uprobe_buffer_get();
 	ucb->dsize = tu->tp.size + dsize;
@@ -966,8 +970,9 @@ static struct uprobe_cpu_buffer *prepare_uprobe_buffer(struct trace_uprobe *tu,
 		dsize = MAX_UCB_BUFFER_SIZE - tu->tp.size;
 	}
 
-	store_trace_args(ucb->buf, &tu->tp, regs, esize, dsize);
+	store_trace_args(ucb->buf, &tu->tp, regs, NULL, esize, dsize);
 
+	*ucbp = ucb;
 	return ucb;
 }
 
@@ -1009,12 +1014,15 @@ static void __uprobe_trace_func(struct trace_uprobe *tu,
 
 /* uprobe handler */
 static int uprobe_trace_func(struct trace_uprobe *tu, struct pt_regs *regs,
-			     struct uprobe_cpu_buffer *ucb)
+			     struct uprobe_cpu_buffer **ucbp)
 {
 	struct event_file_link *link;
+	struct uprobe_cpu_buffer *ucb;
 
 	if (is_ret_probe(tu))
 		return 0;
+
+	ucb = prepare_uprobe_buffer(tu, regs, ucbp);
 
 	rcu_read_lock();
 	trace_probe_for_each_link_rcu(link, &tu->tp)
@@ -1026,9 +1034,12 @@ static int uprobe_trace_func(struct trace_uprobe *tu, struct pt_regs *regs,
 
 static void uretprobe_trace_func(struct trace_uprobe *tu, unsigned long func,
 				 struct pt_regs *regs,
-				 struct uprobe_cpu_buffer *ucb)
+				 struct uprobe_cpu_buffer **ucbp)
 {
 	struct event_file_link *link;
+	struct uprobe_cpu_buffer *ucb;
+
+	ucb = prepare_uprobe_buffer(tu, regs, ucbp);
 
 	rcu_read_lock();
 	trace_probe_for_each_link_rcu(link, &tu->tp)
@@ -1063,7 +1074,7 @@ print_uprobe_event(struct trace_iterator *iter, int flags, struct trace_event *e
 		data = DATAOF_TRACE_ENTRY(entry, false);
 	}
 
-	if (print_probe_args(s, tu->tp.args, tu->tp.nr_args, data, entry) < 0)
+	if (trace_probe_print_args(s, tu->tp.args, tu->tp.nr_args, data, entry) < 0)
 		goto out;
 
 	trace_seq_putc(s, '\n');
@@ -1360,10 +1371,11 @@ static bool uprobe_perf_filter(struct uprobe_consumer *uc,
 
 static void __uprobe_perf_func(struct trace_uprobe *tu,
 			       unsigned long func, struct pt_regs *regs,
-			       struct uprobe_cpu_buffer *ucb)
+			       struct uprobe_cpu_buffer **ucbp)
 {
 	struct trace_event_call *call = trace_probe_event_call(&tu->tp);
 	struct uprobe_trace_entry_head *entry;
+	struct uprobe_cpu_buffer *ucb;
 	struct hlist_head *head;
 	void *data;
 	int size, esize;
@@ -1371,9 +1383,13 @@ static void __uprobe_perf_func(struct trace_uprobe *tu,
 
 #ifdef CONFIG_BPF_EVENTS
 	if (bpf_prog_array_valid(call)) {
+		const struct bpf_prog_array *array;
 		u32 ret;
 
-		ret = bpf_prog_run_array_sleepable(call->prog_array, regs, bpf_prog_run);
+		rcu_read_lock_trace();
+		array = rcu_dereference_check(call->prog_array, rcu_read_lock_trace_held());
+		ret = bpf_prog_run_array_uprobe(array, regs, bpf_prog_run);
+		rcu_read_unlock_trace();
 		if (!ret)
 			return;
 	}
@@ -1381,6 +1397,7 @@ static void __uprobe_perf_func(struct trace_uprobe *tu,
 
 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
 
+	ucb = prepare_uprobe_buffer(tu, regs, ucbp);
 	size = esize + ucb->dsize;
 	size = ALIGN(size + sizeof(u32), sizeof(u64)) - sizeof(u32);
 	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE, "profile buffer not large enough"))
@@ -1417,21 +1434,21 @@ static void __uprobe_perf_func(struct trace_uprobe *tu,
 
 /* uprobe profile handler */
 static int uprobe_perf_func(struct trace_uprobe *tu, struct pt_regs *regs,
-			    struct uprobe_cpu_buffer *ucb)
+			    struct uprobe_cpu_buffer **ucbp)
 {
 	if (!uprobe_perf_filter(&tu->consumer, 0, current->mm))
 		return UPROBE_HANDLER_REMOVE;
 
 	if (!is_ret_probe(tu))
-		__uprobe_perf_func(tu, 0, regs, ucb);
+		__uprobe_perf_func(tu, 0, regs, ucbp);
 	return 0;
 }
 
 static void uretprobe_perf_func(struct trace_uprobe *tu, unsigned long func,
 				struct pt_regs *regs,
-				struct uprobe_cpu_buffer *ucb)
+				struct uprobe_cpu_buffer **ucbp)
 {
-	__uprobe_perf_func(tu, func, regs, ucb);
+	__uprobe_perf_func(tu, func, regs, ucbp);
 }
 
 int bpf_get_uprobe_info(const struct perf_event *event, u32 *fd_type,
@@ -1496,7 +1513,7 @@ static int uprobe_dispatcher(struct uprobe_consumer *con, struct pt_regs *regs)
 {
 	struct trace_uprobe *tu;
 	struct uprobe_dispatch_data udd;
-	struct uprobe_cpu_buffer *ucb;
+	struct uprobe_cpu_buffer *ucb = NULL;
 	int ret = 0;
 
 	tu = container_of(con, struct trace_uprobe, consumer);
@@ -1510,14 +1527,12 @@ static int uprobe_dispatcher(struct uprobe_consumer *con, struct pt_regs *regs)
 	if (WARN_ON_ONCE(!uprobe_cpu_buffer))
 		return 0;
 
-	ucb = prepare_uprobe_buffer(tu, regs);
-
 	if (trace_probe_test_flag(&tu->tp, TP_FLAG_TRACE))
-		ret |= uprobe_trace_func(tu, regs, ucb);
+		ret |= uprobe_trace_func(tu, regs, &ucb);
 
 #ifdef CONFIG_PERF_EVENTS
 	if (trace_probe_test_flag(&tu->tp, TP_FLAG_PROFILE))
-		ret |= uprobe_perf_func(tu, regs, ucb);
+		ret |= uprobe_perf_func(tu, regs, &ucb);
 #endif
 	uprobe_buffer_put(ucb);
 	return ret;
@@ -1528,7 +1543,7 @@ static int uretprobe_dispatcher(struct uprobe_consumer *con,
 {
 	struct trace_uprobe *tu;
 	struct uprobe_dispatch_data udd;
-	struct uprobe_cpu_buffer *ucb;
+	struct uprobe_cpu_buffer *ucb = NULL;
 
 	tu = container_of(con, struct trace_uprobe, consumer);
 
@@ -1540,13 +1555,12 @@ static int uretprobe_dispatcher(struct uprobe_consumer *con,
 	if (WARN_ON_ONCE(!uprobe_cpu_buffer))
 		return 0;
 
-	ucb = prepare_uprobe_buffer(tu, regs);
 	if (trace_probe_test_flag(&tu->tp, TP_FLAG_TRACE))
-		uretprobe_trace_func(tu, func, regs, ucb);
+		uretprobe_trace_func(tu, func, regs, &ucb);
 
 #ifdef CONFIG_PERF_EVENTS
 	if (trace_probe_test_flag(&tu->tp, TP_FLAG_PROFILE))
-		uretprobe_perf_func(tu, func, regs, ucb);
+		uretprobe_perf_func(tu, func, regs, &ucb);
 #endif
 	uprobe_buffer_put(ucb);
 	return 0;

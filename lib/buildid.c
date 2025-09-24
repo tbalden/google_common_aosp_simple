@@ -5,7 +5,6 @@
 #include <linux/elf.h>
 #include <linux/kernel.h>
 #include <linux/pagemap.h>
-#include <linux/secretmem.h>
 
 #define BUILD_ID 3
 
@@ -158,10 +157,6 @@ int build_id_parse(struct vm_area_struct *vma, unsigned char *build_id,
 	if (!vma->vm_file)
 		return -EINVAL;
 
-	/* reject secretmem folios created with memfd_secret() */
-	if (vma_is_secretmem(vma))
-		return -EFAULT;
-
 	page = find_get_page(vma->vm_file->f_mapping, 0);
 	if (!page)
 		return -EFAULT;	/* page not mapped */
@@ -194,7 +189,7 @@ out:
 
 /**
  * build_id_parse_buf - Get build ID from a buffer
- * @buf:      Elf note section(s) to parse
+ * @buf:      ELF note section(s) to parse
  * @buf_size: Size of @buf in bytes
  * @build_id: Build ID parsed from @buf, at least BUILD_ID_SIZE_MAX long
  *

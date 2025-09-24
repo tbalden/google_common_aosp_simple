@@ -470,7 +470,7 @@ static void __init copy_bootdata(char *real_mode_data)
 	sme_unmap_bootdata(real_mode_data);
 }
 
-asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
+asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode_data)
 {
 	/*
 	 * Build-time sanity checks on the kernel image and module
@@ -536,7 +536,7 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 	x86_64_start_reservations(real_mode_data);
 }
 
-void __init x86_64_start_reservations(char *real_mode_data)
+void __init __noreturn x86_64_start_reservations(char *real_mode_data)
 {
 	/* version is always not zero if it is copied */
 	if (!boot_params.hdr.version)
@@ -587,7 +587,7 @@ static void set_bringup_idt_handler(gate_desc *idt, int n, void *handler)
 }
 
 /* This runs while still in the direct mapping */
-static void __head startup_64_load_idt(unsigned long physbase)
+static void startup_64_load_idt(unsigned long physbase)
 {
 	struct desc_ptr *desc = fixup_pointer(&bringup_idt_descr, physbase);
 	gate_desc *idt = fixup_pointer(bringup_idt_table, physbase);

@@ -1356,8 +1356,8 @@ static int mcam_vidioc_try_fmt_vid_cap(struct file *filp, void *priv,
 	struct v4l2_pix_format *pix = &fmt->fmt.pix;
 	struct v4l2_subdev_pad_config pad_cfg;
 	struct v4l2_subdev_state pad_state = {
-		.pads = &pad_cfg
-		};
+		.pads = &pad_cfg,
+	};
 	struct v4l2_subdev_format format = {
 		.which = V4L2_SUBDEV_FORMAT_TRY,
 	};
@@ -1761,7 +1761,7 @@ EXPORT_SYMBOL_GPL(mccic_irq);
  */
 
 static int mccic_notify_bound(struct v4l2_async_notifier *notifier,
-	struct v4l2_subdev *subdev, struct v4l2_async_subdev *asd)
+	struct v4l2_subdev *subdev, struct v4l2_async_connection *asd)
 {
 	struct mcam_camera *cam = notifier_to_mcam(notifier);
 	int ret;
@@ -1806,7 +1806,7 @@ out:
 }
 
 static void mccic_notify_unbind(struct v4l2_async_notifier *notifier,
-	struct v4l2_subdev *subdev, struct v4l2_async_subdev *asd)
+	struct v4l2_subdev *subdev, struct v4l2_async_connection *asd)
 {
 	struct mcam_camera *cam = notifier_to_mcam(notifier);
 
@@ -1868,13 +1868,6 @@ int mccic_register(struct mcam_camera *cam)
 		goto out;
 	}
 
-	/*
-	 * Register with V4L
-	 */
-	ret = v4l2_device_register(cam->dev, &cam->v4l2_dev);
-	if (ret)
-		goto out;
-
 	mutex_init(&cam->s_mutex);
 	cam->state = S_NOTREADY;
 	mcam_set_config_needed(cam, 1);
@@ -1882,7 +1875,7 @@ int mccic_register(struct mcam_camera *cam)
 	cam->mbus_code = mcam_def_mbus_code;
 
 	cam->notifier.ops = &mccic_notify_ops;
-	ret = v4l2_async_nf_register(&cam->v4l2_dev, &cam->notifier);
+	ret = v4l2_async_nf_register(&cam->notifier);
 	if (ret < 0) {
 		cam_warn(cam, "failed to register a sensor notifier");
 		goto out;
@@ -1920,7 +1913,6 @@ int mccic_register(struct mcam_camera *cam)
 
 out:
 	v4l2_async_nf_unregister(&cam->notifier);
-	v4l2_device_unregister(&cam->v4l2_dev);
 	v4l2_async_nf_cleanup(&cam->notifier);
 	return ret;
 }
@@ -1942,7 +1934,6 @@ void mccic_shutdown(struct mcam_camera *cam)
 		mcam_free_dma_bufs(cam);
 	v4l2_ctrl_handler_free(&cam->ctrl_handler);
 	v4l2_async_nf_unregister(&cam->notifier);
-	v4l2_device_unregister(&cam->v4l2_dev);
 	v4l2_async_nf_cleanup(&cam->notifier);
 }
 EXPORT_SYMBOL_GPL(mccic_shutdown);

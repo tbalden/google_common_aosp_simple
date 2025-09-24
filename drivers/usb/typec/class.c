@@ -22,7 +22,6 @@ static DEFINE_IDA(typec_index_ida);
 
 struct class typec_class = {
 	.name = "typec",
-	.owner = THIS_MODULE,
 };
 
 /* ------------------------------------------------------------------------- */
@@ -589,6 +588,7 @@ void typec_unregister_altmode(struct typec_altmode *adev)
 {
 	if (IS_ERR_OR_NULL(adev))
 		return;
+	typec_retimer_put(to_altmode(adev)->retimer);
 	typec_mux_put(to_altmode(adev)->mux);
 	device_unregister(&adev->dev);
 }
@@ -826,6 +826,25 @@ void typec_partner_set_svdm_version(struct typec_partner *partner,
 	partner->svdm_version = svdm_version;
 }
 EXPORT_SYMBOL_GPL(typec_partner_set_svdm_version);
+
+/**
+ * typec_partner_usb_power_delivery_register - Register Type-C partner USB Power Delivery Support
+ * @partner: Type-C partner device.
+ * @desc: Description of the USB PD contract.
+ *
+ * This routine is a wrapper around usb_power_delivery_register(). It registers
+ * USB Power Delivery Capabilities for a Type-C partner device. Specifically,
+ * it sets the Type-C partner device as a parent for the resulting USB Power Delivery object.
+ *
+ * Returns handle to struct usb_power_delivery or ERR_PTR.
+ */
+struct usb_power_delivery *
+typec_partner_usb_power_delivery_register(struct typec_partner *partner,
+					  struct usb_power_delivery_desc *desc)
+{
+	return usb_power_delivery_register(&partner->dev, desc);
+}
+EXPORT_SYMBOL_GPL(typec_partner_usb_power_delivery_register);
 
 /**
  * typec_register_partner - Register a USB Type-C Partner
@@ -1728,7 +1747,7 @@ static const struct attribute_group *typec_groups[] = {
 	NULL
 };
 
-static int typec_uevent(struct device *dev, struct kobj_uevent_env *env)
+static int typec_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
 	int ret;
 
@@ -2099,16 +2118,26 @@ typec_port_register_altmode(struct typec_port *port,
 {
 	struct typec_altmode *adev;
 	struct typec_mux *mux;
+	struct typec_retimer *retimer;
 
-	mux = typec_mux_get(&port->dev, desc);
+	mux = typec_mux_get(&port->dev);
 	if (IS_ERR(mux))
 		return ERR_CAST(mux);
 
-	adev = typec_register_altmode(&port->dev, desc);
-	if (IS_ERR(adev))
+	retimer = typec_retimer_get(&port->dev);
+	if (IS_ERR(retimer)) {
 		typec_mux_put(mux);
-	else
+		return ERR_CAST(retimer);
+	}
+
+	adev = typec_register_altmode(&port->dev, desc);
+	if (IS_ERR(adev)) {
+		typec_retimer_put(retimer);
+		typec_mux_put(mux);
+	} else {
 		to_altmode(adev)->mux = mux;
+		to_altmode(adev)->retimer = retimer;
+	}
 
 	return adev;
 }
@@ -2118,14 +2147,16 @@ void typec_port_register_altmodes(struct typec_port *port,
 	const struct typec_altmode_ops *ops, void *drvdata,
 	struct typec_altmode **altmodes, size_t n)
 {
-	struct fwnode_handle *altmodes_node, *child;
+	struct fwnode_handle *child;
 	struct typec_altmode_desc desc;
 	struct typec_altmode *alt;
 	size_t index = 0;
 	u32 svid, vdo;
 	int ret;
 
-	altmodes_node = device_get_named_child_node(&port->dev, "altmodes");
+	struct fwnode_handle *altmodes_node  __free(fwnode_handle) =
+		device_get_named_child_node(&port->dev, "altmodes");
+
 	if (!altmodes_node)
 		return; /* No altmodes specified */
 
@@ -2256,7 +2287,7 @@ struct typec_port *typec_register_port(struct device *parent,
 		return ERR_PTR(ret);
 	}
 
-	port->mux = typec_mux_get(&port->dev, NULL);
+	port->mux = typec_mux_get(&port->dev);
 	if (IS_ERR(port->mux)) {
 		ret = PTR_ERR(port->mux);
 		put_device(&port->dev);

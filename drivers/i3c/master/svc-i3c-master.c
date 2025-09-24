@@ -147,11 +147,17 @@ struct svc_i3c_xfer {
 	struct svc_i3c_cmd cmds[];
 };
 
+struct svc_i3c_regs_save {
+	u32 mconfig;
+	u32 mdynaddr;
+};
+
 /**
  * struct svc_i3c_master - Silvaco I3C Master structure
  * @base: I3C master controller
  * @dev: Corresponding device
  * @regs: Memory mapping
+ * @saved_regs: Volatile values for PM operations
  * @free_slots: Bit array of available slots
  * @addrs: Array containing the dynamic addresses of each attached device
  * @descs: Array of descriptors, one per attached device
@@ -176,6 +182,7 @@ struct svc_i3c_master {
 	struct i3c_master_controller base;
 	struct device *dev;
 	void __iomem *regs;
+	struct svc_i3c_regs_save saved_regs;
 	u32 free_slots;
 	u8 addrs[SVC_I3C_MAX_DEVS];
 	struct i3c_dev_desc *descs[SVC_I3C_MAX_DEVS];
@@ -877,7 +884,7 @@ static int svc_i3c_update_ibirules(struct svc_i3c_master *master)
 
 	/* Create the IBIRULES register for both cases */
 	i3c_bus_for_each_i3cdev(&master->base.bus, dev) {
-		if (!(dev->info.bcr & I3C_BCR_IBI_REQ_CAP))
+		if (I3C_BCR_DEVICE_ROLE(dev->info.bcr) == I3C_BCR_I3C_MASTER)
 			continue;
 
 		if (dev->info.bcr & I3C_BCR_IBI_PAYLOAD) {
@@ -1044,36 +1051,58 @@ static int svc_i3c_master_xfer(struct svc_i3c_master *master,
 			       u8 *in, const u8 *out, unsigned int xfer_len,
 			       unsigned int *read_len, bool continued)
 {
+	int retry = 2;
 	u32 reg;
 	int ret;
 
 	/* clean SVC_I3C_MINT_IBIWON w1c bits */
 	writel(SVC_I3C_MINT_IBIWON, master->regs + SVC_I3C_MSTATUS);
 
-	writel(SVC_I3C_MCTRL_REQUEST_START_ADDR |
-	       xfer_type |
-	       SVC_I3C_MCTRL_IBIRESP_NACK |
-	       SVC_I3C_MCTRL_DIR(rnw) |
-	       SVC_I3C_MCTRL_ADDR(addr) |
-	       SVC_I3C_MCTRL_RDTERM(*read_len),
-	       master->regs + SVC_I3C_MCTRL);
-
-	ret = readl_poll_timeout(master->regs + SVC_I3C_MSTATUS, reg,
+	while (retry--) {
+		writel(SVC_I3C_MCTRL_REQUEST_START_ADDR |
+		       xfer_type |
+		       SVC_I3C_MCTRL_IBIRESP_NACK |
+		       SVC_I3C_MCTRL_DIR(rnw) |
+		       SVC_I3C_MCTRL_ADDR(addr) |
+		       SVC_I3C_MCTRL_RDTERM(*read_len),
+		       master->regs + SVC_I3C_MCTRL);
+		ret = readl_poll_timeout(master->regs + SVC_I3C_MSTATUS, reg,
 				 SVC_I3C_MSTATUS_MCTRLDONE(reg), 0, 1000);
-	if (ret)
-		goto emit_stop;
+		if (ret)
+			goto emit_stop;
 
-	if (readl(master->regs + SVC_I3C_MERRWARN) & SVC_I3C_MERRWARN_NACK) {
-		ret = -ENXIO;
-		goto emit_stop;
+		if (readl(master->regs + SVC_I3C_MERRWARN) & SVC_I3C_MERRWARN_NACK) {
+			/*
+			 * According to I3C Spec 1.1.1, 11-Jun-2021, section: 5.1.2.2.3.
+			 * If the Controller chooses to start an I3C Message with an I3C Dynamic
+			 * Address, then special provisions shall be made because that same I3C
+			 * Target may be initiating an IBI or a Controller Role Request. So, one of
+			 * three things may happen: (skip 1, 2)
+			 *
+			 * 3. The Addresses match and the RnW bits also match, and so neither
+			 * Controller nor Target will ACK since both are expecting the other side to
+			 * provide ACK. As a result, each side might think it had "won" arbitration,
+			 * but neither side would continue, as each would subsequently see that the
+			 * other did not provide ACK.
+			 * ...
+			 * For either value of RnW: Due to the NACK, the Controller shall defer the
+			 * Private Write or Private Read, and should typically transmit the Target
+			 * Address again after a Repeated START (i.e., the next one or any one prior
+			 * to a STOP in the Frame). Since the Address Header following a Repeated
+			 * START is not arbitrated, the Controller will always win (see Section
+			 * 5.1.2.2.4).
+			 */
+			if (retry && addr != 0x7e) {
+				writel(SVC_I3C_MERRWARN_NACK, master->regs + SVC_I3C_MERRWARN);
+			} else {
+				ret = -ENXIO;
+				*read_len = 0;
+				goto emit_stop;
+			}
+		} else {
+			break;
+		}
 	}
-
-	if (rnw)
-		ret = svc_i3c_master_read(master, in, xfer_len);
-	else
-		ret = svc_i3c_master_write(master, out, xfer_len);
-	if (ret < 0)
-		goto emit_stop;
 
 	/*
 	 * According to I3C spec ver 1.1.1, 5.1.2.2.3 Consequence of Controller Starting a Frame
@@ -1091,6 +1120,13 @@ static int svc_i3c_master_xfer(struct svc_i3c_master *master,
 		ret = -ENXIO;
 		goto emit_stop;
 	}
+
+	if (rnw)
+		ret = svc_i3c_master_read(master, in, xfer_len);
+	else
+		ret = svc_i3c_master_write(master, out, xfer_len);
+	if (ret < 0)
+		goto emit_stop;
 
 	if (rnw)
 		*read_len = ret;
@@ -1597,8 +1633,8 @@ static int svc_i3c_master_probe(struct platform_device *pdev)
 		return PTR_ERR(master->sclk);
 
 	master->irq = platform_get_irq(pdev, 0);
-	if (master->irq <= 0)
-		return -ENOENT;
+	if (master->irq < 0)
+		return master->irq;
 
 	master->dev = dev;
 
@@ -1663,25 +1699,39 @@ err_disable_clks:
 	return ret;
 }
 
-static int svc_i3c_master_remove(struct platform_device *pdev)
+static void svc_i3c_master_remove(struct platform_device *pdev)
 {
 	struct svc_i3c_master *master = platform_get_drvdata(pdev);
-	int ret;
 
-	ret = i3c_master_unregister(&master->base);
-	if (ret)
-		return ret;
+	cancel_work_sync(&master->hj_work);
+	i3c_master_unregister(&master->base);
 
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
+}
 
-	return 0;
+static void svc_i3c_save_regs(struct svc_i3c_master *master)
+{
+	master->saved_regs.mconfig = readl(master->regs + SVC_I3C_MCONFIG);
+	master->saved_regs.mdynaddr = readl(master->regs + SVC_I3C_MDYNADDR);
+}
+
+static void svc_i3c_restore_regs(struct svc_i3c_master *master)
+{
+	if (readl(master->regs + SVC_I3C_MDYNADDR) !=
+	    master->saved_regs.mdynaddr) {
+		writel(master->saved_regs.mconfig,
+		       master->regs + SVC_I3C_MCONFIG);
+		writel(master->saved_regs.mdynaddr,
+		       master->regs + SVC_I3C_MDYNADDR);
+	}
 }
 
 static int __maybe_unused svc_i3c_runtime_suspend(struct device *dev)
 {
 	struct svc_i3c_master *master = dev_get_drvdata(dev);
 
+	svc_i3c_save_regs(master);
 	svc_i3c_master_unprepare_clks(master);
 	pinctrl_pm_select_sleep_state(dev);
 
@@ -1694,6 +1744,8 @@ static int __maybe_unused svc_i3c_runtime_resume(struct device *dev)
 
 	pinctrl_pm_select_default_state(dev);
 	svc_i3c_master_prepare_clks(master);
+
+	svc_i3c_restore_regs(master);
 
 	return 0;
 }
@@ -1713,7 +1765,7 @@ MODULE_DEVICE_TABLE(of, svc_i3c_master_of_match_tbl);
 
 static struct platform_driver svc_i3c_master = {
 	.probe = svc_i3c_master_probe,
-	.remove = svc_i3c_master_remove,
+	.remove_new = svc_i3c_master_remove,
 	.driver = {
 		.name = "silvaco-i3c-master",
 		.of_match_table = svc_i3c_master_of_match_tbl,

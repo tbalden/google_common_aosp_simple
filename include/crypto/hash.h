@@ -8,8 +8,10 @@
 #ifndef _CRYPTO_HASH_H
 #define _CRYPTO_HASH_H
 
+#include <linux/atomic.h>
 #include <linux/crypto.h>
 #include <linux/string.h>
+#include <linux/android_kabi.h>
 
 struct crypto_ahash;
 
@@ -22,8 +24,27 @@ struct crypto_ahash;
  * crypto_unregister_shash().
  */
 
-/**
+/*
+ * struct crypto_istat_hash - statistics for has algorithm
+ * @hash_cnt:		number of hash requests
+ * @hash_tlen:		total data size hashed
+ * @err_cnt:		number of error for hash requests
+ */
+struct crypto_istat_hash {
+	atomic64_t hash_cnt;
+	atomic64_t hash_tlen;
+	atomic64_t err_cnt;
+};
+
+#ifdef CONFIG_CRYPTO_STATS
+#define HASH_ALG_COMMON_STAT struct crypto_istat_hash stat;
+#else
+#define HASH_ALG_COMMON_STAT
+#endif
+
+/*
  * struct hash_alg_common - define properties of message digest
+ * @stat: Statistics for hash algorithm.
  * @digestsize: Size of the result of the transformation. A buffer of this size
  *	        must be available to the @final and @finup calls, so they can
  *	        store the resulting hash into it. For various predefined sizes,
@@ -39,12 +60,15 @@ struct crypto_ahash;
  *	  The hash_alg_common data structure now adds the hash-specific
  *	  information.
  */
-struct hash_alg_common {
-	unsigned int digestsize;
-	unsigned int statesize;
-
-	struct crypto_alg base;
-};
+#define HASH_ALG_COMMON {		\
+	HASH_ALG_COMMON_STAT		\
+					\
+	unsigned int digestsize;	\
+	unsigned int statesize;		\
+					\
+	struct crypto_alg base;		\
+}
+struct hash_alg_common HASH_ALG_COMMON;
 
 struct ahash_request {
 	struct crypto_async_request base;
@@ -129,6 +153,7 @@ struct ahash_request {
  * @exit_tfm: Deinitialize the cryptographic transformation object.
  *	      This is a counterpart to @init_tfm, used to remove
  *	      various changes set in @init_tfm.
+ * @clone_tfm: Copy transform into new object, may allocate memory.
  * @halg: see struct hash_alg_common
  */
 struct ahash_alg {
@@ -143,6 +168,7 @@ struct ahash_alg {
 		      unsigned int keylen);
 	int (*init_tfm)(struct crypto_ahash *tfm);
 	void (*exit_tfm)(struct crypto_ahash *tfm);
+	int (*clone_tfm)(struct crypto_ahash *dst, struct crypto_ahash *src);
 
 	struct hash_alg_common halg;
 };
@@ -152,15 +178,15 @@ struct shash_desc {
 	void *__ctx[] __aligned(ARCH_SLAB_MINALIGN);
 };
 
-#define HASH_MAX_DIGESTSIZE	 64
+#define HASH_MAX_DIGESTSIZE	64
+
+#define HASH_MAX_MB_MSGS	2  /* max value of crypto_shash_mb_max_msgs() */
 
 /*
  * Worst case is hmac(sha3-224-generic).  Its context is a nested 'shash_desc'
  * containing a 'struct sha3_state'.
  */
 #define HASH_MAX_DESCSIZE	(sizeof(struct shash_desc) + 360)
-
-#define HASH_MAX_STATESIZE	512
 
 #define SHASH_DESC_ON_STACK(shash, ctx)					     \
 	char __##shash##_desc[sizeof(struct shash_desc) + HASH_MAX_DESCSIZE] \
@@ -177,6 +203,15 @@ struct shash_desc {
  * @export: see struct ahash_alg
  * @import: see struct ahash_alg
  * @setkey: see struct ahash_alg
+ * @finup_mb: **[optional]** Multibuffer hashing support.  Finish calculating
+ *	      the digests of multiple messages, interleaving the instructions to
+ *	      potentially achieve better performance than hashing each message
+ *	      individually.  The num_msgs argument will be between 2 and
+ *	      @mb_max_msgs inclusively.  If there are particular values of len
+ *	      or num_msgs, or a particular calling context (e.g. no-SIMD) that
+ *	      the implementation does not support with this function, then it
+ *	      must return -EOPNOTSUPP in those cases to cause the crypto API to
+ *	      fall back to repeated finups.
  * @init_tfm: Initialize the cryptographic transformation object.
  *	      This function is called only once at the instantiation
  *	      time, right after the transformation context was
@@ -188,12 +223,17 @@ struct shash_desc {
  * @exit_tfm: Deinitialize the cryptographic transformation object.
  *	      This is a counterpart to @init_tfm, used to remove
  *	      various changes set in @init_tfm.
+ * @clone_tfm: Copy transform into new object, may allocate memory.
  * @digestsize: see struct ahash_alg
  * @statesize: see struct ahash_alg
  * @descsize: Size of the operational state for the message digest. This state
  * 	      size is the memory size that needs to be allocated for
  *	      shash_desc.__ctx
+ * @stat: Statistics for hash algorithm.
  * @base: internally used
+ * @mb_max_msgs: Maximum supported value of num_msgs argument to @finup_mb
+ * @halg: see struct hash_alg_common
+ * @HASH_ALG_COMMON: see struct hash_alg_common
  */
 struct shash_alg {
 	int (*init)(struct shash_desc *desc);
@@ -210,16 +250,24 @@ struct shash_alg {
 		      unsigned int keylen);
 	int (*init_tfm)(struct crypto_shash *tfm);
 	void (*exit_tfm)(struct crypto_shash *tfm);
+	int (*clone_tfm)(struct crypto_shash *dst, struct crypto_shash *src);
 
 	unsigned int descsize;
 
-	/* These fields must match hash_alg_common. */
-	unsigned int digestsize
-		__attribute__ ((aligned(__alignof__(struct hash_alg_common))));
-	unsigned int statesize;
+	ANDROID_BACKPORT_USE(1, int (*finup_mb)(struct shash_desc *desc,
+						const u8 * const data[],
+						unsigned int len,
+						u8 * const outs[],
+						unsigned int num_msgs));
+	ANDROID_BACKPORT_USE(2, unsigned int mb_max_msgs);
 
-	struct crypto_alg base;
+	union {
+		struct HASH_ALG_COMMON;
+		struct hash_alg_common halg;
+	};
 };
+#undef HASH_ALG_COMMON
+#undef HASH_ALG_COMMON_STAT
 
 struct crypto_ahash {
 	int (*init)(struct ahash_request *req);
@@ -232,6 +280,7 @@ struct crypto_ahash {
 	int (*setkey)(struct crypto_ahash *tfm, const u8 *key,
 		      unsigned int keylen);
 
+	unsigned int statesize;
 	unsigned int reqsize;
 	struct crypto_tfm base;
 };
@@ -272,6 +321,8 @@ static inline struct crypto_ahash *__crypto_ahash_cast(struct crypto_tfm *tfm)
  */
 struct crypto_ahash *crypto_alloc_ahash(const char *alg_name, u32 type,
 					u32 mask);
+
+struct crypto_ahash *crypto_clone_ahash(struct crypto_ahash *tfm);
 
 static inline struct crypto_tfm *crypto_ahash_tfm(struct crypto_ahash *tfm)
 {
@@ -370,7 +421,7 @@ static inline unsigned int crypto_ahash_digestsize(struct crypto_ahash *tfm)
  */
 static inline unsigned int crypto_ahash_statesize(struct crypto_ahash *tfm)
 {
-	return crypto_hash_alg_common(tfm)->statesize;
+	return tfm->statesize;
 }
 
 static inline u32 crypto_ahash_get_flags(struct crypto_ahash *tfm)
@@ -535,6 +586,27 @@ static inline int crypto_ahash_init(struct ahash_request *req)
 	return tfm->init(req);
 }
 
+static inline struct crypto_istat_hash *hash_get_stat(
+	struct hash_alg_common *alg)
+{
+#ifdef CONFIG_CRYPTO_STATS
+	return &alg->stat;
+#else
+	return NULL;
+#endif
+}
+
+static inline int crypto_hash_errstat(struct hash_alg_common *alg, int err)
+{
+	if (!IS_ENABLED(CONFIG_CRYPTO_STATS))
+		return err;
+
+	if (err && err != -EINPROGRESS && err != -EBUSY)
+		atomic64_inc(&hash_get_stat(alg)->err_cnt);
+
+	return err;
+}
+
 /**
  * crypto_ahash_update() - add data to message digest for processing
  * @req: ahash_request handle that was previously initialized with the
@@ -549,14 +621,12 @@ static inline int crypto_ahash_init(struct ahash_request *req)
 static inline int crypto_ahash_update(struct ahash_request *req)
 {
 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
-	struct crypto_alg *alg = tfm->base.__crt_alg;
-	unsigned int nbytes = req->nbytes;
-	int ret;
+	struct hash_alg_common *alg = crypto_hash_alg_common(tfm);
 
-	crypto_stats_get(alg);
-	ret = crypto_ahash_reqtfm(req)->update(req);
-	crypto_stats_ahash_update(nbytes, ret, alg);
-	return ret;
+	if (IS_ENABLED(CONFIG_CRYPTO_STATS))
+		atomic64_add(req->nbytes, &hash_get_stat(alg)->hash_tlen);
+
+	return crypto_hash_errstat(alg, tfm->update(req));
 }
 
 /**
@@ -718,6 +788,8 @@ static inline void ahash_request_set_crypt(struct ahash_request *req,
 struct crypto_shash *crypto_alloc_shash(const char *alg_name, u32 type,
 					u32 mask);
 
+struct crypto_shash *crypto_clone_shash(struct crypto_shash *tfm);
+
 int crypto_has_shash(const char *alg_name, u32 type, u32 mask);
 
 static inline struct crypto_tfm *crypto_shash_tfm(struct crypto_shash *tfm)
@@ -793,6 +865,19 @@ static inline unsigned int crypto_shash_digestsize(struct crypto_shash *tfm)
 static inline unsigned int crypto_shash_statesize(struct crypto_shash *tfm)
 {
 	return crypto_shash_alg(tfm)->statesize;
+}
+
+/**
+ * crypto_shash_mb_max_msgs() - get max multibuffer interleaving factor
+ * @tfm: hash transformation object
+ *
+ * Return the maximum supported multibuffer hashing interleaving factor, i.e.
+ * the maximum num_msgs that can be passed to crypto_shash_finup_mb().  The
+ * return value will be between 1 and HASH_MAX_MB_MSGS inclusively.
+ */
+static inline unsigned int crypto_shash_mb_max_msgs(struct crypto_shash *tfm)
+{
+	return crypto_shash_alg(tfm)->mb_max_msgs;
 }
 
 static inline u32 crypto_shash_get_flags(struct crypto_shash *tfm)
@@ -997,6 +1082,27 @@ int crypto_shash_final(struct shash_desc *desc, u8 *out);
  */
 int crypto_shash_finup(struct shash_desc *desc, const u8 *data,
 		       unsigned int len, u8 *out);
+
+/**
+ * crypto_shash_finup_mb() - multibuffer message hashing
+ * @desc: the starting state that is forked for each message.  It contains the
+ *	  state after hashing a (possibly-empty) common prefix of the messages.
+ * @data: the data of each message (not including any common prefix from @desc)
+ * @len: length of each data buffer in bytes
+ * @outs: output buffer for each message digest
+ * @num_msgs: number of messages, i.e. the number of entries in @data and @outs.
+ *	      This can't be more than crypto_shash_mb_max_msgs().
+ *
+ * This function provides support for hashing multiple messages with the
+ * instructions interleaved, if supported by the algorithm.  This can
+ * significantly improve performance, depending on the CPU and algorithm.
+ *
+ * Context: Any context.
+ * Return: 0 on success; a negative errno value on failure.
+ */
+int crypto_shash_finup_mb(struct shash_desc *desc, const u8 * const data[],
+			  unsigned int len, u8 * const outs[],
+			  unsigned int num_msgs);
 
 static inline void shash_desc_zero(struct shash_desc *desc)
 {

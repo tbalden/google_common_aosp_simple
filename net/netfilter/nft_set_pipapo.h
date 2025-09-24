@@ -155,7 +155,7 @@ struct nft_pipapo_match {
 	struct nft_pipapo_scratch * __percpu *scratch;
 	size_t bsize_max;
 	struct rcu_head rcu;
-	struct nft_pipapo_field f[];
+	struct nft_pipapo_field f[] __counted_by(field_count);
 };
 
 /**

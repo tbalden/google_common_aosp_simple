@@ -545,7 +545,6 @@ static int sc16is7xx_set_baud(struct uart_port *port, int baud)
 			      SC16IS7XX_MCR_CLKSEL_BIT,
 			      prescaler == 1 ? 0 : SC16IS7XX_MCR_CLKSEL_BIT);
 
-
 	mutex_lock(&one->efr_lock);
 
 	/* Open the LCR divisors for configuration */
@@ -570,8 +569,9 @@ static void sc16is7xx_handle_rx(struct uart_port *port, unsigned int rxlen,
 				unsigned int iir)
 {
 	struct sc16is7xx_port *s = dev_get_drvdata(port->dev);
-	unsigned int lsr = 0, ch, flag, bytes_read, i;
+	unsigned int lsr = 0, bytes_read, i;
 	bool read_lsr = (iir == SC16IS7XX_IIR_RLSE_SRC) ? true : false;
+	u8 ch, flag;
 
 	if (unlikely(rxlen >= sizeof(s->buf))) {
 		dev_warn_ratelimited(port->dev,
@@ -678,13 +678,10 @@ static void sc16is7xx_handle_tx(struct uart_port *port)
 		}
 		to_send = (to_send > txlen) ? txlen : to_send;
 
-		/* Add data to send */
-		port->icount.tx += to_send;
-
 		/* Convert to linear buffer */
 		for (i = 0; i < to_send; ++i) {
 			s->buf[i] = xmit->buf[xmit->tail];
-			xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+			uart_xmit_advance(port, 1);
 		}
 
 		sc16is7xx_fifo_write(port, to_send);
@@ -1413,6 +1410,29 @@ static int sc16is7xx_setup_gpio_chip(struct sc16is7xx_port *s)
 }
 #endif
 
+static void sc16is7xx_setup_irda_ports(struct sc16is7xx_port *s)
+{
+	int i;
+	int ret;
+	int count;
+	u32 irda_port[2];
+	struct device *dev = s->p[0].port.dev;
+
+	count = device_property_count_u32(dev, "irda-mode-ports");
+	if (count < 0 || count > ARRAY_SIZE(irda_port))
+		return;
+
+	ret = device_property_read_u32_array(dev, "irda-mode-ports",
+					     irda_port, count);
+	if (ret)
+		return;
+
+	for (i = 0; i < count; i++) {
+		if (irda_port[i] < s->devtype->nr_uart)
+			s->p[irda_port[i]].irda_mode = true;
+	}
+}
+
 /*
  * Configure ports designated to operate as modem control lines.
  */
@@ -1606,16 +1626,7 @@ static int sc16is7xx_probe(struct device *dev,
 		sc16is7xx_power(&s->p[i].port, 0);
 	}
 
-	if (dev->of_node) {
-		struct property *prop;
-		const __be32 *p;
-		u32 u;
-
-		of_property_for_each_u32(dev->of_node, "irda-mode-ports",
-					 prop, p, u)
-			if (u < devtype->nr_uart)
-				s->p[u].irda_mode = true;
-	}
+	sc16is7xx_setup_irda_ports(s);
 
 	ret = sc16is7xx_setup_mctrl_ports(s, regmaps[0]);
 	if (ret)
@@ -1807,9 +1818,9 @@ MODULE_ALIAS("spi:sc16is7xx");
 #endif
 
 #ifdef CONFIG_SERIAL_SC16IS7XX_I2C
-static int sc16is7xx_i2c_probe(struct i2c_client *i2c,
-			       const struct i2c_device_id *id)
+static int sc16is7xx_i2c_probe(struct i2c_client *i2c)
 {
+	const struct i2c_device_id *id = i2c_client_get_device_id(i2c);
 	const struct sc16is7xx_devtype *devtype;
 	struct regmap *regmaps[2];
 	unsigned int i;

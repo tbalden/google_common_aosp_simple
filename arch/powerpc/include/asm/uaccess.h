@@ -75,7 +75,7 @@ __pu_failed:							\
 /* -mprefixed can generate offsets beyond range, fall back hack */
 #ifdef CONFIG_PPC_KERNEL_PREFIXED
 #define __put_user_asm_goto(x, addr, label, op)			\
-	asm_volatile_goto(					\
+	asm goto(					\
 		"1:	" op " %0,0(%1)	# put_user\n"		\
 		EX_TABLE(1b, %l2)				\
 		:						\
@@ -94,6 +94,10 @@ __pu_failed:							\
 #endif
 
 #ifdef __powerpc64__
+#ifdef CONFIG_PPC_KERNEL_PREFIXED
+#define __put_user_asm2_goto(x, ptr, label)			\
+	__put_user_asm_goto(x, ptr, label, "std")
+#else
 #define __put_user_asm2_goto(x, addr, label)			\
 	asm goto ("1: std%U1%X1 %0,%1	# put_user\n"		\
 		EX_TABLE(1b, %l2)				\
@@ -101,6 +105,7 @@ __pu_failed:							\
 		: "r" (x), DS_FORM_CONSTRAINT (*addr)		\
 		:						\
 		: label)
+#endif // CONFIG_PPC_KERNEL_PREFIXED
 #else /* __powerpc64__ */
 #define __put_user_asm2_goto(x, addr, label)			\
 	asm goto(					\
@@ -152,7 +157,7 @@ do {								\
 /* -mprefixed can generate offsets beyond range, fall back hack */
 #ifdef CONFIG_PPC_KERNEL_PREFIXED
 #define __get_user_asm_goto(x, addr, label, op)			\
-	asm_volatile_goto(					\
+	asm_goto_output(					\
 		"1:	"op" %0,0(%1)	# get_user\n"		\
 		EX_TABLE(1b, %l2)				\
 		: "=r" (x)					\
@@ -391,10 +396,8 @@ copy_mc_to_user(void __user *to, const void *from, unsigned long n)
 
 extern long __copy_from_user_flushcache(void *dst, const void __user *src,
 		unsigned size);
-extern void memcpy_page_flushcache(char *to, struct page *page, size_t offset,
-			   size_t len);
 
-static __must_check inline bool user_access_begin(const void __user *ptr, size_t len)
+static __must_check __always_inline bool user_access_begin(const void __user *ptr, size_t len)
 {
 	if (unlikely(!access_ok(ptr, len)))
 		return false;
@@ -409,7 +412,7 @@ static __must_check inline bool user_access_begin(const void __user *ptr, size_t
 #define user_access_save	prevent_user_access_return
 #define user_access_restore	restore_user_access
 
-static __must_check inline bool
+static __must_check __always_inline bool
 user_read_access_begin(const void __user *ptr, size_t len)
 {
 	if (unlikely(!access_ok(ptr, len)))
@@ -423,7 +426,7 @@ user_read_access_begin(const void __user *ptr, size_t len)
 #define user_read_access_begin	user_read_access_begin
 #define user_read_access_end		prevent_current_read_from_user
 
-static __must_check inline bool
+static __must_check __always_inline bool
 user_write_access_begin(const void __user *ptr, size_t len)
 {
 	if (unlikely(!access_ok(ptr, len)))

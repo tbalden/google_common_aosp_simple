@@ -50,6 +50,7 @@
 #include <linux/sizes.h>
 #include <linux/dma-map-ops.h>
 #include <linux/cma.h>
+#include <linux/nospec.h>
 
 #ifdef CONFIG_CMA_SIZE_MBYTES
 #define CMA_SIZE_MBYTES CONFIG_CMA_SIZE_MBYTES
@@ -97,10 +98,43 @@ static int __init early_cma(char *p)
 }
 early_param("cma", early_cma);
 
-#ifdef CONFIG_DMA_PERNUMA_CMA
+#ifdef CONFIG_DMA_NUMA_CMA
 
+static struct cma *dma_contiguous_numa_area[MAX_NUMNODES];
+static phys_addr_t numa_cma_size[MAX_NUMNODES] __initdata;
 static struct cma *dma_contiguous_pernuma_area[MAX_NUMNODES];
 static phys_addr_t pernuma_size_bytes __initdata;
+
+static int __init early_numa_cma(char *p)
+{
+	int nid, count = 0;
+	unsigned long tmp;
+	char *s = p;
+
+	while (*s) {
+		if (sscanf(s, "%lu%n", &tmp, &count) != 1)
+			break;
+
+		if (s[count] == ':') {
+			if (tmp >= MAX_NUMNODES)
+				break;
+			nid = array_index_nospec(tmp, MAX_NUMNODES);
+
+			s += count + 1;
+			tmp = memparse(s, &s);
+			numa_cma_size[nid] = tmp;
+
+			if (*s == ',')
+				s++;
+			else
+				break;
+		} else
+			break;
+	}
+
+	return 0;
+}
+early_param("numa_cma", early_numa_cma);
 
 static int __init early_cma_pernuma(char *p)
 {
@@ -128,31 +162,48 @@ static inline __maybe_unused phys_addr_t cma_early_percent_memory(void)
 
 #endif
 
-#ifdef CONFIG_DMA_PERNUMA_CMA
-void __init dma_pernuma_cma_reserve(void)
+#ifdef CONFIG_DMA_NUMA_CMA
+static void __init dma_numa_cma_reserve(void)
 {
 	int nid;
 
-	if (!pernuma_size_bytes)
-		return;
-
-	for_each_online_node(nid) {
+	for_each_node(nid) {
 		int ret;
 		char name[CMA_MAX_NAME];
-		struct cma **cma = &dma_contiguous_pernuma_area[nid];
+		struct cma **cma;
 
-		snprintf(name, sizeof(name), "pernuma%d", nid);
-		ret = cma_declare_contiguous_nid(0, pernuma_size_bytes, 0, 0,
-						 0, false, name, cma, nid);
-		if (ret) {
-			pr_warn("%s: reservation failed: err %d, node %d", __func__,
-				ret, nid);
+		if (!node_online(nid)) {
+			if (pernuma_size_bytes || numa_cma_size[nid])
+				pr_warn("invalid node %d specified\n", nid);
 			continue;
 		}
 
-		pr_debug("%s: reserved %llu MiB on node %d\n", __func__,
-			(unsigned long long)pernuma_size_bytes / SZ_1M, nid);
+		if (pernuma_size_bytes) {
+
+			cma = &dma_contiguous_pernuma_area[nid];
+			snprintf(name, sizeof(name), "pernuma%d", nid);
+			ret = cma_declare_contiguous_nid(0, pernuma_size_bytes, 0, 0,
+							 0, false, name, cma, nid);
+			if (ret)
+				pr_warn("%s: reservation failed: err %d, node %d", __func__,
+					ret, nid);
+		}
+
+		if (numa_cma_size[nid]) {
+
+			cma = &dma_contiguous_numa_area[nid];
+			snprintf(name, sizeof(name), "numa%d", nid);
+			ret = cma_declare_contiguous_nid(0, numa_cma_size[nid], 0, 0, 0, false,
+							 name, cma, nid);
+			if (ret)
+				pr_warn("%s: reservation failed: err %d, node %d", __func__,
+					ret, nid);
+		}
 	}
+}
+#else
+static inline void __init dma_numa_cma_reserve(void)
+{
 }
 #endif
 
@@ -170,13 +221,21 @@ void __init dma_contiguous_reserve(phys_addr_t limit)
 	phys_addr_t selected_size = 0;
 	phys_addr_t selected_base = 0;
 	phys_addr_t selected_limit = limit;
+	phys_addr_t virtzone_limit = cma_get_first_virtzone_base(0);
 	bool fixed = false;
+
+	dma_numa_cma_reserve();
 
 	pr_debug("%s(limit %08lx)\n", __func__, (unsigned long)limit);
 
 	if (size_cmdline != -1) {
 		selected_size = size_cmdline;
 		selected_base = base_cmdline;
+		if (virtzone_limit && selected_base &&
+			selected_base + selected_size >= virtzone_limit) {
+			pr_err("default cma init fail, overlap with virtzone\n");
+			return;
+		}
 		selected_limit = min_not_zero(limit_cmdline, limit);
 		if (base_cmdline + size_cmdline == limit_cmdline)
 			fixed = true;
@@ -191,7 +250,7 @@ void __init dma_contiguous_reserve(phys_addr_t limit)
 		selected_size = max(size_bytes, cma_early_percent_memory());
 #endif
 	}
-
+	selected_limit = min_not_zero(selected_limit, virtzone_limit);
 	if (selected_size && !dma_contiguous_default_area) {
 		pr_debug("%s: reserving %ld MiB for global area\n", __func__,
 			 (unsigned long)selected_size / SZ_1M);
@@ -231,16 +290,21 @@ int __init dma_contiguous_reserve_area(phys_addr_t size, phys_addr_t base,
 {
 	int ret;
 
+	memblock_memsize_disable_tracking();
 	ret = cma_declare_contiguous(base, size, limit, 0, 0, fixed,
 					"reserved", res_cma);
 	if (ret)
-		return ret;
+		goto out;
 
 	/* Architecture specific contiguous memory fixup. */
 	dma_contiguous_early_fixup(cma_get_base(*res_cma),
 				cma_get_size(*res_cma));
 
-	return 0;
+	memblock_memsize_record("dma_cma", cma_get_base(*res_cma),
+				cma_get_size(*res_cma), false, true);
+out:
+	memblock_memsize_enable_tracking();
+	return ret;
 }
 
 /**
@@ -304,7 +368,7 @@ static struct page *cma_alloc_aligned(struct cma *cma, size_t size, gfp_t gfp)
  */
 struct page *dma_alloc_contiguous(struct device *dev, size_t size, gfp_t gfp)
 {
-#ifdef CONFIG_DMA_PERNUMA_CMA
+#ifdef CONFIG_DMA_NUMA_CMA
 	int nid = dev_to_node(dev);
 #endif
 
@@ -316,11 +380,18 @@ struct page *dma_alloc_contiguous(struct device *dev, size_t size, gfp_t gfp)
 	if (size <= PAGE_SIZE)
 		return NULL;
 
-#ifdef CONFIG_DMA_PERNUMA_CMA
+#ifdef CONFIG_DMA_NUMA_CMA
 	if (nid != NUMA_NO_NODE && !(gfp & (GFP_DMA | GFP_DMA32))) {
 		struct cma *cma = dma_contiguous_pernuma_area[nid];
 		struct page *page;
 
+		if (cma) {
+			page = cma_alloc_aligned(cma, size, gfp);
+			if (page)
+				return page;
+		}
+
+		cma = dma_contiguous_numa_area[nid];
 		if (cma) {
 			page = cma_alloc_aligned(cma, size, gfp);
 			if (page)
@@ -357,8 +428,11 @@ void dma_free_contiguous(struct device *dev, struct page *page, size_t size)
 		/*
 		 * otherwise, page is from either per-numa cma or default cma
 		 */
-#ifdef CONFIG_DMA_PERNUMA_CMA
+#ifdef CONFIG_DMA_NUMA_CMA
 		if (cma_release(dma_contiguous_pernuma_area[page_to_nid(page)],
+					page, count))
+			return;
+		if (cma_release(dma_contiguous_numa_area[page_to_nid(page)],
 					page, count))
 			return;
 #endif
@@ -404,6 +478,7 @@ static int __init rmem_cma_setup(struct reserved_mem *rmem)
 	bool default_cma = of_get_flat_dt_prop(node, "linux,cma-default", NULL);
 	struct cma *cma;
 	int err;
+	phys_addr_t virtzone_limit = 0;
 
 	if (size_cmdline != -1 && default_cma) {
 		pr_info("Reserved memory: bypass %s node, using cmdline CMA params instead\n",
@@ -417,6 +492,12 @@ static int __init rmem_cma_setup(struct reserved_mem *rmem)
 
 	if (!IS_ALIGNED(rmem->base | rmem->size, CMA_MIN_ALIGNMENT_BYTES)) {
 		pr_err("Reserved memory: incorrect alignment of CMA region\n");
+		return -EINVAL;
+	}
+
+	virtzone_limit = cma_get_first_virtzone_base(0);
+	if (virtzone_limit && rmem->base + rmem->size > virtzone_limit) {
+		pr_err("%s cma init fail, overlap with virtzone\n", rmem->name);
 		return -EINVAL;
 	}
 

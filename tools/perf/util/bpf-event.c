@@ -22,72 +22,6 @@
 #include "record.h"
 #include "util/synthetic-events.h"
 
-#ifndef HAVE_LIBBPF_BTF__LOAD_FROM_KERNEL_BY_ID
-struct btf *btf__load_from_kernel_by_id(__u32 id)
-{
-       struct btf *btf;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-       int err = btf__get_from_id(id, &btf);
-#pragma GCC diagnostic pop
-
-       return err ? ERR_PTR(err) : btf;
-}
-#endif
-
-#ifndef HAVE_LIBBPF_BPF_PROG_LOAD
-LIBBPF_API int bpf_load_program(enum bpf_prog_type type,
-				const struct bpf_insn *insns, size_t insns_cnt,
-				const char *license, __u32 kern_version,
-				char *log_buf, size_t log_buf_sz);
-
-int bpf_prog_load(enum bpf_prog_type prog_type,
-		  const char *prog_name __maybe_unused,
-		  const char *license,
-		  const struct bpf_insn *insns, size_t insn_cnt,
-		  const struct bpf_prog_load_opts *opts)
-{
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-	return bpf_load_program(prog_type, insns, insn_cnt, license,
-				opts->kern_version, opts->log_buf, opts->log_size);
-#pragma GCC diagnostic pop
-}
-#endif
-
-#ifndef HAVE_LIBBPF_BPF_OBJECT__NEXT_PROGRAM
-struct bpf_program *
-bpf_object__next_program(const struct bpf_object *obj, struct bpf_program *prev)
-{
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-	return bpf_program__next(prev, obj);
-#pragma GCC diagnostic pop
-}
-#endif
-
-#ifndef HAVE_LIBBPF_BPF_OBJECT__NEXT_MAP
-struct bpf_map *
-bpf_object__next_map(const struct bpf_object *obj, const struct bpf_map *prev)
-{
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-	return bpf_map__next(prev, obj);
-#pragma GCC diagnostic pop
-}
-#endif
-
-#ifndef HAVE_LIBBPF_BTF__RAW_DATA
-const void *
-btf__raw_data(const struct btf *btf_ro, __u32 *size)
-{
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-	return btf__get_raw_data(btf_ro, size);
-#pragma GCC diagnostic pop
-}
-#endif
-
 static int snprintf_hex(char *buf, size_t size, unsigned char *data, size_t len)
 {
 	int ret = 0;
@@ -123,10 +57,12 @@ static int machine__process_bpf_event_load(struct machine *machine,
 		struct map *map = maps__find(machine__kernel_maps(machine), addr);
 
 		if (map) {
-			map->dso->binary_type = DSO_BINARY_TYPE__BPF_PROG_INFO;
-			map->dso->bpf_prog.id = id;
-			map->dso->bpf_prog.sub_id = i;
-			map->dso->bpf_prog.env = env;
+			struct dso *dso = map__dso(map);
+
+			dso->binary_type = DSO_BINARY_TYPE__BPF_PROG_INFO;
+			dso->bpf_prog.id = id;
+			dso->bpf_prog.sub_id = i;
+			dso->bpf_prog.env = env;
 		}
 	}
 	return 0;
@@ -352,7 +288,10 @@ static int perf_event__synthesize_one_bpf_prog(struct perf_session *session,
 		}
 
 		info_node->info_linear = info_linear;
-		perf_env__insert_bpf_prog_info(env, info_node);
+		if (!perf_env__insert_bpf_prog_info(env, info_node)) {
+			free(info_linear);
+			free(info_node);
+		}
 		info_linear = NULL;
 
 		/*
@@ -540,7 +479,10 @@ static void perf_env__add_bpf_info(struct perf_env *env, u32 id)
 	info_node = malloc(sizeof(struct bpf_prog_info_node));
 	if (info_node) {
 		info_node->info_linear = info_linear;
-		perf_env__insert_bpf_prog_info(env, info_node);
+		if (!perf_env__insert_bpf_prog_info(env, info_node)) {
+			free(info_linear);
+			free(info_node);
+		}
 	} else
 		free(info_linear);
 

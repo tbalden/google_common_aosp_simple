@@ -79,6 +79,57 @@ void __init fdt_reserved_mem_save_node(unsigned long node, const char *uname,
 }
 
 /*
+ * __reserved_mem_alloc_in_range() - allocate reserved memory described with
+ *	'alloc-ranges'. Choose bottom-up/top-down depending on nearby existing
+ *	reserved regions to keep the reserved memory contiguous if possible.
+ */
+static int __init __reserved_mem_alloc_in_range(phys_addr_t size,
+	phys_addr_t align, phys_addr_t start, phys_addr_t end, bool nomap,
+	phys_addr_t *res_base)
+{
+	bool prev_bottom_up = memblock_bottom_up();
+	bool bottom_up = false, top_down = false;
+	int ret, i;
+
+	for (i = 0; i < reserved_mem_count; i++) {
+		struct reserved_mem *rmem = &reserved_mem[i];
+
+		/* Skip regions that were not reserved yet */
+		if (rmem->size == 0)
+			continue;
+
+		/*
+		 * If range starts next to an existing reservation, use bottom-up:
+		 *	|....RRRR................RRRRRRRR..............|
+		 *	       --RRRR------
+		 */
+		if (start >= rmem->base && start <= (rmem->base + rmem->size))
+			bottom_up = true;
+
+		/*
+		 * If range ends next to an existing reservation, use top-down:
+		 *	|....RRRR................RRRRRRRR..............|
+		 *	              -------RRRR-----
+		 */
+		if (end >= rmem->base && end <= (rmem->base + rmem->size))
+			top_down = true;
+	}
+
+	/* Change setting only if either bottom-up or top-down was selected */
+	if (bottom_up != top_down)
+		memblock_set_bottom_up(bottom_up);
+
+	ret = early_init_dt_alloc_reserved_memory_arch(size, align,
+			start, end, nomap, res_base);
+
+	/* Restore old setting if needed */
+	if (bottom_up != top_down)
+		memblock_set_bottom_up(prev_bottom_up);
+
+	return ret;
+}
+
+/*
  * __reserved_mem_alloc_size() - allocate reserved memory described by
  *	'size', 'alignment'  and 'alloc-ranges' properties.
  */
@@ -91,7 +142,9 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
 	int len;
 	const __be32 *prop;
 	bool nomap;
+	bool is_cma = false;
 	int ret;
+	phys_addr_t virtzone_limit = 0;
 
 	prop = of_get_flat_dt_prop(node, "size", &len);
 	if (!prop)
@@ -119,9 +172,12 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
 	if (IS_ENABLED(CONFIG_CMA)
 	    && of_flat_dt_is_compatible(node, "shared-dma-pool")
 	    && of_get_flat_dt_prop(node, "reusable", NULL)
-	    && !nomap)
+	    && !nomap) {
 		align = max_t(phys_addr_t, align, CMA_MIN_ALIGNMENT_BYTES);
+		is_cma = true;
+	}
 
+	virtzone_limit = cma_get_first_virtzone_base(0);
 	prop = of_get_flat_dt_prop(node, "alloc-ranges", &len);
 	if (prop) {
 
@@ -137,9 +193,11 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
 			start = dt_mem_next_cell(dt_root_addr_cells, &prop);
 			end = start + dt_mem_next_cell(dt_root_size_cells,
 						       &prop);
+			if (is_cma)
+				end = min_not_zero(end, virtzone_limit);
 
-			ret = early_init_dt_alloc_reserved_memory_arch(size,
-					align, start, end, nomap, &base);
+			ret = __reserved_mem_alloc_in_range(size, align,
+					start, end, nomap, &base);
 			if (ret == 0) {
 				pr_debug("allocated memory for '%s' node: base %pa, size %lu MiB\n",
 					uname, &base,
@@ -151,7 +209,8 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
 
 	} else {
 		ret = early_init_dt_alloc_reserved_memory_arch(size, align,
-							0, 0, nomap, &base);
+							0, is_cma ? virtzone_limit : 0,
+							nomap, &base);
 		if (ret == 0)
 			pr_debug("allocated memory for '%s' node: base %pa, size %lu MiB\n",
 				uname, &base, (unsigned long)(size / SZ_1M));
@@ -218,6 +277,11 @@ static int __init __rmem_cmp(const void *a, const void *b)
 	if (ra->size > rb->size)
 		return 1;
 
+	if (ra->fdt_node < rb->fdt_node)
+		return -1;
+	if (ra->fdt_node > rb->fdt_node)
+		return 1;
+
 	return 0;
 }
 
@@ -264,9 +328,10 @@ void __init fdt_init_reserved_mem(void)
 		int len;
 		const __be32 *prop;
 		int err = 0;
-		bool nomap;
+		bool nomap, reusable;
 
 		nomap = of_get_flat_dt_prop(node, "no-map", NULL) != NULL;
+		reusable = of_get_flat_dt_prop(node, "reusable", NULL) != NULL;
 		prop = of_get_flat_dt_prop(node, "phandle", &len);
 		if (!prop)
 			prop = of_get_flat_dt_prop(node, "linux,phandle", &len);
@@ -288,14 +353,19 @@ void __init fdt_init_reserved_mem(void)
 							   rmem->size);
 			} else {
 				phys_addr_t end = rmem->base + rmem->size - 1;
-				bool reusable =
-					(of_get_flat_dt_prop(node, "reusable", NULL)) != NULL;
 
 				pr_info("%pa..%pa (%lu KiB) %s %s %s\n",
 					&rmem->base, &end, (unsigned long)(rmem->size / SZ_1K),
 					nomap ? "nomap" : "map",
 					reusable ? "reusable" : "non-reusable",
 					rmem->name ? rmem->name : "unknown");
+
+				memblock_memsize_record(rmem->name, rmem->base,
+							rmem->size, nomap,
+							reusable);
+				if (reusable &&
+				    !of_flat_dt_is_compatible(node, "shared-dma-pool"))
+					memblock_memsize_mod_reusable_size(rmem->size);
 			}
 		}
 	}

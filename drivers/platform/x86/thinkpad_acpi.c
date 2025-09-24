@@ -50,6 +50,7 @@
 #include <linux/kthread.h>
 #include <linux/leds.h>
 #include <linux/list.h>
+#include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvram.h>
@@ -265,9 +266,6 @@ enum tpacpi_hkey_event_t {
 
 #define FAN_NOT_PRESENT		65535
 
-#define strlencmp(a, b) (strncmp((a), (b), strlen(b)))
-
-
 /****************************************************************************
  * Driver-wide structs and misc. variables
  */
@@ -318,15 +316,10 @@ struct ibm_init_struct {
 /* DMI Quirks */
 struct quirk_entry {
 	bool btusb_bug;
-	u32 s2idle_bug_mmio;
 };
 
 static struct quirk_entry quirk_btusb_bug = {
 	.btusb_bug = true,
-};
-
-static struct quirk_entry quirk_s2idle_bug = {
-	.s2idle_bug_mmio = 0xfed80380,
 };
 
 static struct {
@@ -915,16 +908,9 @@ static ssize_t dispatch_proc_write(struct file *file,
 	if (count > PAGE_SIZE - 1)
 		return -EINVAL;
 
-	kernbuf = kmalloc(count + 1, GFP_KERNEL);
-	if (!kernbuf)
-		return -ENOMEM;
-
-	if (copy_from_user(kernbuf, userbuf, count)) {
-		kfree(kernbuf);
-		return -EFAULT;
-	}
-
-	kernbuf[count] = 0;
+	kernbuf = memdup_user_nul(userbuf, count);
+	if (IS_ERR(kernbuf))
+		return PTR_ERR(kernbuf);
 	ret = ibm->write(kernbuf);
 	if (ret == 0)
 		ret = count;
@@ -1335,9 +1321,9 @@ static int tpacpi_rfk_procfs_write(const enum tpacpi_rfk_id id, char *buf)
 		return -ENODEV;
 
 	while ((cmd = strsep(&buf, ","))) {
-		if (strlencmp(cmd, "enable") == 0)
+		if (strstarts(cmd, "enable"))
 			status = TPACPI_RFK_RADIO_ON;
-		else if (strlencmp(cmd, "disable") == 0)
+		else if (strstarts(cmd, "disable"))
 			status = TPACPI_RFK_RADIO_OFF;
 		else
 			return -EINVAL;
@@ -2074,11 +2060,11 @@ static int hotkey_get_tablet_mode(int *status)
  * hotkey_acpi_mask accordingly.  Also resets any bits
  * from hotkey_user_mask that are unavailable to be
  * delivered (shadow requirement of the userspace ABI).
- *
- * Call with hotkey_mutex held
  */
 static int hotkey_mask_get(void)
 {
+	lockdep_assert_held(&hotkey_mutex);
+
 	if (tp_features.hotkey_mask) {
 		u32 m = 0;
 
@@ -2114,8 +2100,6 @@ static void hotkey_mask_warn_incomplete_mask(void)
  * Also calls hotkey_mask_get to update hotkey_acpi_mask.
  *
  * NOTE: does not set bits in hotkey_user_mask, but may reset them.
- *
- * Call with hotkey_mutex held
  */
 static int hotkey_mask_set(u32 mask)
 {
@@ -2123,6 +2107,8 @@ static int hotkey_mask_set(u32 mask)
 	int rc = 0;
 
 	const u32 fwmask = mask & ~hotkey_source_mask;
+
+	lockdep_assert_held(&hotkey_mutex);
 
 	if (tp_features.hotkey_mask) {
 		for (i = 0; i < 32; i++) {
@@ -2155,12 +2141,12 @@ static int hotkey_mask_set(u32 mask)
 
 /*
  * Sets hotkey_user_mask and tries to set the firmware mask
- *
- * Call with hotkey_mutex held
  */
 static int hotkey_user_mask_set(const u32 mask)
 {
 	int rc;
+
+	lockdep_assert_held(&hotkey_mutex);
 
 	/* Give people a chance to notice they are doing something that
 	 * is bound to go boom on their users sooner or later */
@@ -2522,20 +2508,22 @@ exit:
 	return 0;
 }
 
-/* call with hotkey_mutex held */
 static void hotkey_poll_stop_sync(void)
 {
+	lockdep_assert_held(&hotkey_mutex);
+
 	if (tpacpi_hotkey_task) {
 		kthread_stop(tpacpi_hotkey_task);
 		tpacpi_hotkey_task = NULL;
 	}
 }
 
-/* call with hotkey_mutex held */
 static void hotkey_poll_setup(const bool may_warn)
 {
 	const u32 poll_driver_mask = hotkey_driver_mask & hotkey_source_mask;
 	const u32 poll_user_mask = hotkey_user_mask & hotkey_source_mask;
+
+	lockdep_assert_held(&hotkey_mutex);
 
 	if (hotkey_poll_freq > 0 &&
 	    (poll_driver_mask ||
@@ -2565,9 +2553,10 @@ static void hotkey_poll_setup_safe(const bool may_warn)
 	mutex_unlock(&hotkey_mutex);
 }
 
-/* call with hotkey_mutex held */
 static void hotkey_poll_set_freq(unsigned int freq)
 {
+	lockdep_assert_held(&hotkey_mutex);
+
 	if (!freq)
 		hotkey_poll_stop_sync();
 
@@ -3053,10 +3042,9 @@ static void tpacpi_send_radiosw_update(void)
 
 static void hotkey_exit(void)
 {
-#ifdef CONFIG_THINKPAD_ACPI_HOTKEY_POLL
 	mutex_lock(&hotkey_mutex);
+#ifdef CONFIG_THINKPAD_ACPI_HOTKEY_POLL
 	hotkey_poll_stop_sync();
-	mutex_unlock(&hotkey_mutex);
 #endif
 	dbg_printk(TPACPI_DBG_EXIT | TPACPI_DBG_HKEY,
 		   "restoring original HKEY status and mask\n");
@@ -3066,6 +3054,8 @@ static void hotkey_exit(void)
 	      hotkey_mask_set(hotkey_orig_mask)) |
 	     hotkey_status_set(false)) != 0)
 		pr_err("failed to restore hot key mask to BIOS defaults\n");
+
+	mutex_unlock(&hotkey_mutex);
 }
 
 static void __init hotkey_unmap(const unsigned int scancode)
@@ -3481,7 +3471,9 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 	if (tp_features.hotkey_mask) {
 		/* hotkey_source_mask *must* be zero for
 		 * the first hotkey_mask_get to return hotkey_orig_mask */
+		mutex_lock(&hotkey_mutex);
 		res = hotkey_mask_get();
+		mutex_unlock(&hotkey_mutex);
 		if (res)
 			return res;
 
@@ -3580,9 +3572,11 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 		hotkey_exit();
 		return res;
 	}
+	mutex_lock(&hotkey_mutex);
 	res = hotkey_mask_set(((hotkey_all_mask & ~hotkey_reserved_mask)
 			       | hotkey_driver_mask)
 			      & ~hotkey_source_mask);
+	mutex_unlock(&hotkey_mutex);
 	if (res < 0 && res != -ENXIO) {
 		hotkey_exit();
 		return res;
@@ -4123,9 +4117,11 @@ static void hotkey_resume(void)
 {
 	tpacpi_disable_brightness_delay();
 
+	mutex_lock(&hotkey_mutex);
 	if (hotkey_status_set(true) < 0 ||
 	    hotkey_mask_set(hotkey_acpi_mask) < 0)
 		pr_err("error while attempting to reset the event firmware interface\n");
+	mutex_unlock(&hotkey_mutex);
 
 	tpacpi_send_radiosw_update();
 	tpacpi_input_send_tabletsw();
@@ -4198,12 +4194,12 @@ static int hotkey_write(char *buf)
 
 	res = 0;
 	while ((cmd = strsep(&buf, ","))) {
-		if (strlencmp(cmd, "enable") == 0) {
+		if (strstarts(cmd, "enable")) {
 			hotkey_enabledisable_warn(1);
-		} else if (strlencmp(cmd, "disable") == 0) {
+		} else if (strstarts(cmd, "disable")) {
 			hotkey_enabledisable_warn(0);
 			res = -EPERM;
-		} else if (strlencmp(cmd, "reset") == 0) {
+		} else if (strstarts(cmd, "reset")) {
 			mask = (hotkey_all_mask | hotkey_source_mask)
 				& ~hotkey_reserved_mask;
 		} else if (sscanf(cmd, "0x%x", &mask) == 1) {
@@ -4425,208 +4421,8 @@ static const struct dmi_system_id fwbug_list[] __initconst = {
 			DMI_MATCH(DMI_BOARD_NAME, "20MV"),
 		},
 	},
-	{
-		.ident = "L14 Gen2 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20X5"),
-		}
-	},
-	{
-		.ident = "T14s Gen2 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20XF"),
-		}
-	},
-	{
-		.ident = "X13 Gen2 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20XH"),
-		}
-	},
-	{
-		.ident = "T14 Gen2 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20XK"),
-		}
-	},
-	{
-		.ident = "T14 Gen1 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20UD"),
-		}
-	},
-	{
-		.ident = "T14 Gen1 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20UE"),
-		}
-	},
-	{
-		.ident = "T14s Gen1 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20UH"),
-		}
-	},
-	{
-		.ident = "T14s Gen1 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20UJ"),
-		}
-	},
-	{
-		.ident = "P14s Gen1 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "20Y1"),
-		}
-	},
-	{
-		.ident = "P14s Gen2 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "21A0"),
-		}
-	},
-	{
-		.ident = "P14s Gen2 AMD",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "21A1"),
-		}
-	},
-	/* https://bugzilla.kernel.org/show_bug.cgi?id=218024 */
-	{
-		.ident = "V14 G4 AMN",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "82YT"),
-		}
-	},
-	{
-		.ident = "V14 G4 AMN",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "83GE"),
-		}
-	},
-	{
-		.ident = "V15 G4 AMN",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "82YU"),
-		}
-	},
-	{
-		.ident = "V15 G4 AMN",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "83CQ"),
-		}
-	},
-	{
-		.ident = "IdeaPad 1 14AMN7",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "82VF"),
-		}
-	},
-	{
-		.ident = "IdeaPad 1 15AMN7",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "82VG"),
-		}
-	},
-	{
-		.ident = "IdeaPad 1 15AMN7",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "82X5"),
-		}
-	},
-	{
-		.ident = "IdeaPad Slim 3 14AMN8",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "82XN"),
-		}
-	},
-	{
-		.ident = "IdeaPad Slim 3 15AMN8",
-		.driver_data = &quirk_s2idle_bug,
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "82XQ"),
-		}
-	},
 	{}
 };
-
-#ifdef CONFIG_SUSPEND
-/*
- * Lenovo laptops from a variety of generations run a SMI handler during the D3->D0
- * transition that occurs specifically when exiting suspend to idle which can cause
- * large delays during resume when the IOMMU translation layer is enabled (the default
- * behavior) for NVME devices:
- *
- * To avoid this firmware problem, skip the SMI handler on these machines before the
- * D0 transition occurs.
- */
-static void thinkpad_acpi_amd_s2idle_restore(void)
-{
-	struct resource *res;
-	void __iomem *addr;
-	u8 val;
-
-	res = request_mem_region_muxed(tp_features.quirks->s2idle_bug_mmio, 1,
-					"thinkpad_acpi_pm80");
-	if (!res)
-		return;
-
-	addr = ioremap(tp_features.quirks->s2idle_bug_mmio, 1);
-	if (!addr)
-		goto cleanup_resource;
-
-	val = ioread8(addr);
-	iowrite8(val & ~BIT(0), addr);
-
-	iounmap(addr);
-cleanup_resource:
-	release_resource(res);
-	kfree(res);
-}
-
-static struct acpi_s2idle_dev_ops thinkpad_acpi_s2idle_dev_ops = {
-	.restore = thinkpad_acpi_amd_s2idle_restore,
-};
-#endif
 
 static const struct pci_device_id fwbug_cards_ids[] __initconst = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x24F3) },
@@ -5314,33 +5110,33 @@ static int video_write(char *buf)
 	disable = 0;
 
 	while ((cmd = strsep(&buf, ","))) {
-		if (strlencmp(cmd, "lcd_enable") == 0) {
+		if (strstarts(cmd, "lcd_enable")) {
 			enable |= TP_ACPI_VIDEO_S_LCD;
-		} else if (strlencmp(cmd, "lcd_disable") == 0) {
+		} else if (strstarts(cmd, "lcd_disable")) {
 			disable |= TP_ACPI_VIDEO_S_LCD;
-		} else if (strlencmp(cmd, "crt_enable") == 0) {
+		} else if (strstarts(cmd, "crt_enable")) {
 			enable |= TP_ACPI_VIDEO_S_CRT;
-		} else if (strlencmp(cmd, "crt_disable") == 0) {
+		} else if (strstarts(cmd, "crt_disable")) {
 			disable |= TP_ACPI_VIDEO_S_CRT;
 		} else if (video_supported == TPACPI_VIDEO_NEW &&
-			   strlencmp(cmd, "dvi_enable") == 0) {
+			   strstarts(cmd, "dvi_enable")) {
 			enable |= TP_ACPI_VIDEO_S_DVI;
 		} else if (video_supported == TPACPI_VIDEO_NEW &&
-			   strlencmp(cmd, "dvi_disable") == 0) {
+			   strstarts(cmd, "dvi_disable")) {
 			disable |= TP_ACPI_VIDEO_S_DVI;
-		} else if (strlencmp(cmd, "auto_enable") == 0) {
+		} else if (strstarts(cmd, "auto_enable")) {
 			res = video_autosw_set(1);
 			if (res)
 				return res;
-		} else if (strlencmp(cmd, "auto_disable") == 0) {
+		} else if (strstarts(cmd, "auto_disable")) {
 			res = video_autosw_set(0);
 			if (res)
 				return res;
-		} else if (strlencmp(cmd, "video_switch") == 0) {
+		} else if (strstarts(cmd, "video_switch")) {
 			res = video_outputsw_cycle();
 			if (res)
 				return res;
-		} else if (strlencmp(cmd, "expand_toggle") == 0) {
+		} else if (strstarts(cmd, "expand_toggle")) {
 			res = video_expand_toggle();
 			if (res)
 				return res;
@@ -5734,9 +5530,9 @@ static int light_write(char *buf)
 		return -ENODEV;
 
 	while ((cmd = strsep(&buf, ","))) {
-		if (strlencmp(cmd, "on") == 0) {
+		if (strstarts(cmd, "on")) {
 			newstatus = 1;
-		} else if (strlencmp(cmd, "off") == 0) {
+		} else if (strstarts(cmd, "off")) {
 			newstatus = 0;
 		} else
 			return -EINVAL;
@@ -6736,11 +6532,12 @@ static unsigned int brightness_enable = 2; /* 2 = auto, 0 = no, 1 = yes */
 
 static struct mutex brightness_mutex;
 
-/* NVRAM brightness access,
- * call with brightness_mutex held! */
+/* NVRAM brightness access */
 static unsigned int tpacpi_brightness_nvram_get(void)
 {
 	u8 lnvram;
+
+	lockdep_assert_held(&brightness_mutex);
 
 	lnvram = (nvram_read_byte(TP_NVRAM_ADDR_BRIGHTNESS)
 		  & TP_NVRAM_MASK_LEVEL_BRIGHTNESS)
@@ -6789,10 +6586,11 @@ unlock:
 }
 
 
-/* call with brightness_mutex held! */
 static int tpacpi_brightness_get_raw(int *status)
 {
 	u8 lec = 0;
+
+	lockdep_assert_held(&brightness_mutex);
 
 	switch (brightness_mode) {
 	case TPACPI_BRGHT_MODE_UCMS_STEP:
@@ -6809,11 +6607,12 @@ static int tpacpi_brightness_get_raw(int *status)
 	}
 }
 
-/* call with brightness_mutex held! */
 /* do NOT call with illegal backlight level value */
 static int tpacpi_brightness_set_ec(unsigned int value)
 {
 	u8 lec = 0;
+
+	lockdep_assert_held(&brightness_mutex);
 
 	if (unlikely(!acpi_ec_read(TP_EC_BACKLIGHT, &lec)))
 		return -EIO;
@@ -6826,11 +6625,12 @@ static int tpacpi_brightness_set_ec(unsigned int value)
 	return 0;
 }
 
-/* call with brightness_mutex held! */
 static int tpacpi_brightness_set_ucmsstep(unsigned int value)
 {
 	int cmos_cmd, inc;
 	unsigned int current_value, i;
+
+	lockdep_assert_held(&brightness_mutex);
 
 	current_value = tpacpi_brightness_nvram_get();
 
@@ -7207,10 +7007,10 @@ static int brightness_write(char *buf)
 		return level;
 
 	while ((cmd = strsep(&buf, ","))) {
-		if (strlencmp(cmd, "up") == 0) {
+		if (strstarts(cmd, "up")) {
 			if (level < bright_maxlvl)
 				level++;
-		} else if (strlencmp(cmd, "down") == 0) {
+		} else if (strstarts(cmd, "down")) {
 			if (level > 0)
 				level--;
 		} else if (sscanf(cmd, "level %d", &level) == 1 &&
@@ -7959,13 +7759,13 @@ static int volume_write(char *buf)
 
 	while ((cmd = strsep(&buf, ","))) {
 		if (!tp_features.mixer_no_level_control) {
-			if (strlencmp(cmd, "up") == 0) {
+			if (strstarts(cmd, "up")) {
 				if (new_mute)
 					new_mute = 0;
 				else if (new_level < TP_EC_VOLUME_MAX)
 					new_level++;
 				continue;
-			} else if (strlencmp(cmd, "down") == 0) {
+			} else if (strstarts(cmd, "down")) {
 				if (new_mute)
 					new_mute = 0;
 				else if (new_level > 0)
@@ -7977,9 +7777,9 @@ static int volume_write(char *buf)
 				continue;
 			}
 		}
-		if (strlencmp(cmd, "mute") == 0)
+		if (strstarts(cmd, "mute"))
 			new_mute = TP_EC_AUDIO_MUTESW_MSK;
-		else if (strlencmp(cmd, "unmute") == 0)
+		else if (strstarts(cmd, "unmute"))
 			new_mute = 0;
 		else
 			return -EINVAL;
@@ -8161,7 +7961,6 @@ static struct ibm_struct volume_driver_data = {
 
 #define FAN_NS_CTRL_STATUS	BIT(2)		/* Bit which determines control is enabled or not */
 #define FAN_NS_CTRL		BIT(4)		/* Bit which determines control is by host or EC */
-#define FAN_CLOCK_TPM		(22500*60)	/* Ticks per minute for a 22.5 kHz clock */
 
 enum {					/* Fan control constants */
 	fan_status_offset = 0x2f,	/* EC register 0x2f */
@@ -8215,7 +8014,6 @@ static int fan_watchdog_maxinterval;
 
 static bool fan_with_ns_addr;
 static bool ecfw_with_fan_dec_rpm;
-static bool fan_speed_in_tpr;
 
 static struct mutex fan_mutex;
 
@@ -8302,11 +8100,10 @@ static bool fan_select_fan2(void)
 	return true;
 }
 
-/*
- * Call with fan_mutex held
- */
 static void fan_update_desired_level(u8 status)
 {
+	lockdep_assert_held(&fan_mutex);
+
 	if ((status &
 	     (TP_EC_FAN_AUTO | TP_EC_FAN_FULLSPEED)) == 0) {
 		if (status > 7)
@@ -8398,11 +8195,8 @@ static int fan_get_speed(unsigned int *speed)
 			     !acpi_ec_read(fan_rpm_offset + 1, &hi)))
 			return -EIO;
 
-		if (likely(speed)) {
+		if (likely(speed))
 			*speed = (hi << 8) | lo;
-			if (fan_speed_in_tpr && *speed != 0)
-				*speed = FAN_CLOCK_TPM / *speed;
-		}
 		break;
 	case TPACPI_FAN_RD_TPEC_NS:
 		if (!acpi_ec_read(fan_rpm_status_ns, &lo))
@@ -8435,11 +8229,8 @@ static int fan2_get_speed(unsigned int *speed)
 		if (rc)
 			return -EIO;
 
-		if (likely(speed)) {
+		if (likely(speed))
 			*speed = (hi << 8) | lo;
-			if (fan_speed_in_tpr && *speed != 0)
-				*speed = FAN_CLOCK_TPM / *speed;
-		}
 		break;
 
 	case TPACPI_FAN_RD_TPEC_NS:
@@ -8967,7 +8758,6 @@ static const struct attribute_group fan_driver_attr_group = {
 #define TPACPI_FAN_NOFAN	0x0008		/* no fan available */
 #define TPACPI_FAN_NS		0x0010		/* For EC with non-Standard register addresses */
 #define TPACPI_FAN_DECRPM	0x0020		/* For ECFW's with RPM in register as decimal */
-#define TPACPI_FAN_TPR		0x0040		/* Fan speed is in Ticks Per Revolution */
 
 static const struct tpacpi_quirk fan_quirk_table[] __initconst = {
 	TPACPI_QEC_IBM('1', 'Y', TPACPI_FAN_Q1),
@@ -8990,7 +8780,6 @@ static const struct tpacpi_quirk fan_quirk_table[] __initconst = {
 	TPACPI_Q_LNV3('N', '2', 'U', TPACPI_FAN_NS),	/* X13 Yoga Gen 2*/
 	TPACPI_Q_LNV3('N', '1', 'O', TPACPI_FAN_NOFAN),	/* X1 Tablet (2nd gen) */
 	TPACPI_Q_LNV3('R', '0', 'Q', TPACPI_FAN_DECRPM),/* L480 */
-	TPACPI_Q_LNV('8', 'F', TPACPI_FAN_TPR),		/* ThinkPad x120e */
 };
 
 static int __init fan_init(struct ibm_init_struct *iibm)
@@ -9054,8 +8843,6 @@ static int __init fan_init(struct ibm_init_struct *iibm)
 
 			if (quirks & TPACPI_FAN_Q1)
 				fan_quirk1_setup();
-			if (quirks & TPACPI_FAN_TPR)
-				fan_speed_in_tpr = true;
 			/* Try and probe the 2nd fan */
 			tp_features.second_fan = 1; /* needed for get_speed to work */
 			res = fan2_get_speed(&speed);
@@ -9308,10 +9095,9 @@ static int fan_write_cmd_level(const char *cmd, int *rc)
 {
 	int level;
 
-	if (strlencmp(cmd, "level auto") == 0)
+	if (strstarts(cmd, "level auto"))
 		level = TP_EC_FAN_AUTO;
-	else if ((strlencmp(cmd, "level disengaged") == 0) ||
-			(strlencmp(cmd, "level full-speed") == 0))
+	else if (strstarts(cmd, "level disengaged") || strstarts(cmd, "level full-speed"))
 		level = TP_EC_FAN_FULLSPEED;
 	else if (sscanf(cmd, "level %d", &level) != 1)
 		return 0;
@@ -9329,7 +9115,7 @@ static int fan_write_cmd_level(const char *cmd, int *rc)
 
 static int fan_write_cmd_enable(const char *cmd, int *rc)
 {
-	if (strlencmp(cmd, "enable") != 0)
+	if (!strstarts(cmd, "enable"))
 		return 0;
 
 	*rc = fan_set_enable();
@@ -9344,7 +9130,7 @@ static int fan_write_cmd_enable(const char *cmd, int *rc)
 
 static int fan_write_cmd_disable(const char *cmd, int *rc)
 {
-	if (strlencmp(cmd, "disable") != 0)
+	if (!strstarts(cmd, "disable"))
 		return 0;
 
 	*rc = fan_set_disable();
@@ -10095,7 +9881,7 @@ ATTRIBUTE_GROUPS(tpacpi_battery);
 
 /* ACPI battery hooking */
 
-static int tpacpi_battery_add(struct power_supply *battery)
+static int tpacpi_battery_add(struct power_supply *battery, struct acpi_battery_hook *hook)
 {
 	int batteryid = tpacpi_battery_get_id(battery->desc->name);
 
@@ -10106,7 +9892,7 @@ static int tpacpi_battery_add(struct power_supply *battery)
 	return 0;
 }
 
-static int tpacpi_battery_remove(struct power_supply *battery)
+static int tpacpi_battery_remove(struct power_supply *battery, struct acpi_battery_hook *hook)
 {
 	device_remove_groups(&battery->dev, tpacpi_battery_groups);
 	return 0;
@@ -10125,7 +9911,6 @@ static const struct tpacpi_quirk battery_quirk_table[] __initconst = {
 	 * Individual addressing is broken on models that expose the
 	 * primary battery as BAT1.
 	 */
-	TPACPI_Q_LNV('G', '8', true),       /* ThinkPad X131e */
 	TPACPI_Q_LNV('8', 'F', true),       /* Thinkpad X120e */
 	TPACPI_Q_LNV('J', '7', true),       /* B5400 */
 	TPACPI_Q_LNV('J', 'I', true),       /* Thinkpad 11e */
@@ -10485,10 +10270,6 @@ static struct ibm_struct proxsensor_driver_data = {
 #define DYTC_MODE_PSC_BALANCE  5  /* Default mode aka balanced */
 #define DYTC_MODE_PSC_PERFORM  7  /* High power mode aka performance */
 
-#define DYTC_MODE_PSCV9_LOWPOWER 1  /* Low power mode */
-#define DYTC_MODE_PSCV9_BALANCE  3  /* Default mode aka balanced */
-#define DYTC_MODE_PSCV9_PERFORM  4  /* High power mode aka performance */
-
 #define DYTC_ERR_MASK       0xF  /* Bits 0-3 in cmd result are the error result */
 #define DYTC_ERR_SUCCESS      1  /* CMD completed successful */
 
@@ -10508,10 +10289,6 @@ static DEFINE_MUTEX(dytc_mutex);
 static int dytc_capabilities;
 static bool dytc_mmc_get_available;
 static int profile_force;
-
-static int platform_psc_profile_lowpower = DYTC_MODE_PSC_LOWPOWER;
-static int platform_psc_profile_balanced = DYTC_MODE_PSC_BALANCE;
-static int platform_psc_profile_performance = DYTC_MODE_PSC_PERFORM;
 
 static int convert_dytc_to_profile(int funcmode, int dytcmode,
 		enum platform_profile_option *profile)
@@ -10534,15 +10311,19 @@ static int convert_dytc_to_profile(int funcmode, int dytcmode,
 		}
 		return 0;
 	case DYTC_FUNCTION_PSC:
-		if (dytcmode == platform_psc_profile_lowpower)
+		switch (dytcmode) {
+		case DYTC_MODE_PSC_LOWPOWER:
 			*profile = PLATFORM_PROFILE_LOW_POWER;
-		else if (dytcmode == platform_psc_profile_balanced)
+			break;
+		case DYTC_MODE_PSC_BALANCE:
 			*profile =  PLATFORM_PROFILE_BALANCED;
-		else if (dytcmode == platform_psc_profile_performance)
+			break;
+		case DYTC_MODE_PSC_PERFORM:
 			*profile =  PLATFORM_PROFILE_PERFORMANCE;
-		else
+			break;
+		default: /* Unknown mode */
 			return -EINVAL;
-
+		}
 		return 0;
 	case DYTC_FUNCTION_AMT:
 		/* For now return balanced. It's the closest we have to 'auto' */
@@ -10563,19 +10344,19 @@ static int convert_profile_to_dytc(enum platform_profile_option profile, int *pe
 		if (dytc_capabilities & BIT(DYTC_FC_MMC))
 			*perfmode = DYTC_MODE_MMC_LOWPOWER;
 		else if (dytc_capabilities & BIT(DYTC_FC_PSC))
-			*perfmode = platform_psc_profile_lowpower;
+			*perfmode = DYTC_MODE_PSC_LOWPOWER;
 		break;
 	case PLATFORM_PROFILE_BALANCED:
 		if (dytc_capabilities & BIT(DYTC_FC_MMC))
 			*perfmode = DYTC_MODE_MMC_BALANCE;
 		else if (dytc_capabilities & BIT(DYTC_FC_PSC))
-			*perfmode = platform_psc_profile_balanced;
+			*perfmode = DYTC_MODE_PSC_BALANCE;
 		break;
 	case PLATFORM_PROFILE_PERFORMANCE:
 		if (dytc_capabilities & BIT(DYTC_FC_MMC))
 			*perfmode = DYTC_MODE_MMC_PERFORM;
 		else if (dytc_capabilities & BIT(DYTC_FC_PSC))
-			*perfmode = platform_psc_profile_performance;
+			*perfmode = DYTC_MODE_PSC_PERFORM;
 		break;
 	default: /* Unknown profile */
 		return -EOPNOTSUPP;
@@ -10764,7 +10545,6 @@ static int tpacpi_dytc_profile_init(struct ibm_init_struct *iibm)
 	if (output & BIT(DYTC_QUERY_ENABLE_BIT))
 		dytc_version = (output >> DYTC_QUERY_REV_BIT) & 0xF;
 
-	dbg_printk(TPACPI_DBG_INIT, "DYTC version %d\n", dytc_version);
 	/* Check DYTC is enabled and supports mode setting */
 	if (dytc_version < 5)
 		return -ENODEV;
@@ -10803,11 +10583,6 @@ static int tpacpi_dytc_profile_init(struct ibm_init_struct *iibm)
 		}
 	} else if (dytc_capabilities & BIT(DYTC_FC_PSC)) { /* PSC MODE */
 		pr_debug("PSC is supported\n");
-		if (dytc_version >= 9) { /* update profiles for DYTC 9 and up */
-			platform_psc_profile_lowpower = DYTC_MODE_PSCV9_LOWPOWER;
-			platform_psc_profile_balanced = DYTC_MODE_PSCV9_BALANCE;
-			platform_psc_profile_performance = DYTC_MODE_PSCV9_PERFORM;
-		}
 	} else {
 		dbg_printk(TPACPI_DBG_INIT, "No DYTC support available\n");
 		return -ENODEV;
@@ -11864,10 +11639,6 @@ static void thinkpad_acpi_module_exit(void)
 
 	tpacpi_lifecycle = TPACPI_LIFE_EXITING;
 
-#ifdef CONFIG_SUSPEND
-	if (tp_features.quirks && tp_features.quirks->s2idle_bug_mmio)
-		acpi_unregister_lps0_dev(&thinkpad_acpi_s2idle_dev_ops);
-#endif
 	if (tpacpi_hwmon)
 		hwmon_device_unregister(tpacpi_hwmon);
 	if (tp_features.sensors_pdrv_registered)
@@ -11911,6 +11682,7 @@ static int __init thinkpad_acpi_module_init(void)
 {
 	const struct dmi_system_id *dmi_id;
 	int ret, i;
+	acpi_object_type obj_type;
 
 	tpacpi_lifecycle = TPACPI_LIFE_INIT;
 
@@ -11935,6 +11707,21 @@ static int __init thinkpad_acpi_module_init(void)
 
 	TPACPI_ACPIHANDLE_INIT(ecrd);
 	TPACPI_ACPIHANDLE_INIT(ecwr);
+
+	/*
+	 * Quirk: in some models (e.g. X380 Yoga), an object named ECRD
+	 * exists, but it is a register, not a method.
+	 */
+	if (ecrd_handle) {
+		acpi_get_type(ecrd_handle, &obj_type);
+		if (obj_type != ACPI_TYPE_METHOD)
+			ecrd_handle = NULL;
+	}
+	if (ecwr_handle) {
+		acpi_get_type(ecwr_handle, &obj_type);
+		if (obj_type != ACPI_TYPE_METHOD)
+			ecwr_handle = NULL;
+	}
 
 	tpacpi_wq = create_singlethread_workqueue(TPACPI_WORKQUEUE_NAME);
 	if (!tpacpi_wq) {
@@ -12041,13 +11828,6 @@ static int __init thinkpad_acpi_module_init(void)
 		tp_features.input_device_registered = 1;
 	}
 
-#ifdef CONFIG_SUSPEND
-	if (tp_features.quirks && tp_features.quirks->s2idle_bug_mmio) {
-		if (!acpi_register_lps0_dev(&thinkpad_acpi_s2idle_dev_ops))
-			pr_info("Using s2idle quirk to avoid %s platform firmware bug\n",
-				(dmi_id && dmi_id->ident) ? dmi_id->ident : "");
-	}
-#endif
 	return 0;
 }
 

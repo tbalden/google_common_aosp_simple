@@ -8,7 +8,6 @@
 #include <linux/init.h>
 #include <linux/pci.h>
 #include <linux/msi.h>
-#include <linux/of_device.h>
 #include <linux/of_pci.h>
 #include <linux/pci_hotplug.h>
 #include <linux/slab.h>
@@ -533,7 +532,7 @@ void pci_read_bridge_bases(struct pci_bus *child)
 	pci_read_bridge_mmio_pref(child);
 
 	if (dev->transparent) {
-		pci_bus_for_each_resource(child->parent, res, i) {
+		pci_bus_for_each_resource(child->parent, res) {
 			if (res && res->flags) {
 				pci_bus_add_resource(child, res,
 						     PCI_SUBTRACTIVE_DECODE);
@@ -596,6 +595,7 @@ static void pci_init_host_bridge(struct pci_host_bridge *bridge)
 	bridge->native_ltr = 1;
 	bridge->native_dpc = 1;
 	bridge->domain_nr = PCI_DOMAIN_NR_NOT_SET;
+	bridge->native_cxl_error = 1;
 
 	device_initialize(&bridge->dev);
 }
@@ -819,7 +819,6 @@ static void pci_set_bus_speed(struct pci_bus *bus)
 
 		pcie_capability_read_dword(bridge, PCI_EXP_LNKCAP, &linkcap);
 		bus->max_bus_speed = pcie_link_speed[linkcap & PCI_EXP_LNKCAP_SLS];
-		bridge->link_active_reporting = !!(linkcap & PCI_EXP_LNKCAP_DLLLARC);
 
 		pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &linksta);
 		pcie_update_link_speed(bus, linksta);
@@ -842,7 +841,6 @@ static struct irq_domain *pci_host_bridge_msi_domain(struct pci_bus *bus)
 	if (!d)
 		d = pci_host_bridge_acpi_msi_domain(bus);
 
-#ifdef CONFIG_PCI_MSI_IRQ_DOMAIN
 	/*
 	 * If no IRQ domain was found via the OF tree, try looking it up
 	 * directly through the fwnode_handle.
@@ -854,7 +852,6 @@ static struct irq_domain *pci_host_bridge_msi_domain(struct pci_bus *bus)
 			d = irq_find_matching_fwnode(fwnode,
 						     DOMAIN_BUS_PCI_MSI);
 	}
-#endif
 
 	return d;
 }
@@ -906,6 +903,10 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 		bus->domain_nr = pci_bus_find_domain_nr(bus, parent);
 	else
 		bus->domain_nr = bridge->domain_nr;
+	if (bus->domain_nr < 0) {
+		err = bus->domain_nr;
+		goto free;
+	}
 #endif
 
 	b = pci_find_bus(pci_domain_nr(bus), bridge->busnr);
@@ -926,9 +927,10 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 	/* Temporarily move resources off the list */
 	list_splice_init(&bridge->windows, &resources);
 	err = device_add(&bridge->dev);
-	if (err)
+	if (err) {
+		put_device(&bridge->dev);
 		goto free;
-
+	}
 	bus->bridge = get_device(&bridge->dev);
 	device_enable_async_suspend(bus->bridge);
 	pci_set_bus_of_node(bus);
@@ -1032,6 +1034,9 @@ unregister:
 	device_del(&bridge->dev);
 
 free:
+#ifdef CONFIG_PCI_DOMAINS_GENERIC
+	pci_bus_release_domain_nr(bus, parent);
+#endif
 	kfree(bus);
 	return err;
 }
@@ -1523,6 +1528,7 @@ void set_pcie_port_type(struct pci_dev *pdev)
 {
 	int pos;
 	u16 reg16;
+	u32 reg32;
 	int type;
 	struct pci_dev *parent;
 
@@ -1535,6 +1541,10 @@ void set_pcie_port_type(struct pci_dev *pdev)
 	pdev->pcie_flags_reg = reg16;
 	pci_read_config_dword(pdev, pos + PCI_EXP_DEVCAP, &pdev->devcap);
 	pdev->pcie_mpss = FIELD_GET(PCI_EXP_DEVCAP_PAYLOAD, pdev->devcap);
+
+	pcie_capability_read_dword(pdev, PCI_EXP_LNKCAP, &reg32);
+	if (reg32 & PCI_EXP_LNKCAP_DLLLARC)
+		pdev->link_active_reporting = 1;
 
 	parent = pci_upstream_bridge(pdev);
 	if (!parent)
@@ -1838,7 +1848,7 @@ int pci_setup_device(struct pci_dev *dev)
 	u32 class;
 	u16 cmd;
 	u8 hdr_type;
-	int pos = 0;
+	int err, pos = 0;
 	struct pci_bus_region region;
 	struct resource *res;
 
@@ -1852,7 +1862,9 @@ int pci_setup_device(struct pci_dev *dev)
 	dev->error_state = pci_channel_io_normal;
 	set_pcie_port_type(dev);
 
-	pci_set_of_node(dev);
+	err = pci_set_of_node(dev);
+	if (err)
+		return err;
 	pci_set_acpi_fwnode(dev);
 
 	pci_dev_assign_slot(dev);
@@ -2141,7 +2153,7 @@ static void pci_configure_relaxed_ordering(struct pci_dev *dev)
 {
 	struct pci_dev *root;
 
-	/* PCI_EXP_DEVICE_RELAX_EN is RsvdP in VFs */
+	/* PCI_EXP_DEVCTL_RELAX_EN is RsvdP in VFs */
 	if (dev->is_virtfn)
 		return;
 
@@ -2161,67 +2173,6 @@ static void pci_configure_relaxed_ordering(struct pci_dev *dev)
 					   PCI_EXP_DEVCTL_RELAX_EN);
 		pci_info(dev, "Relaxed Ordering disabled because the Root Port didn't support it\n");
 	}
-}
-
-static void pci_configure_ltr(struct pci_dev *dev)
-{
-#ifdef CONFIG_PCIEASPM
-	struct pci_host_bridge *host = pci_find_host_bridge(dev->bus);
-	struct pci_dev *bridge;
-	u32 cap, ctl;
-
-	if (!pci_is_pcie(dev))
-		return;
-
-	/* Read L1 PM substate capabilities */
-	dev->l1ss = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_L1SS);
-
-	pcie_capability_read_dword(dev, PCI_EXP_DEVCAP2, &cap);
-	if (!(cap & PCI_EXP_DEVCAP2_LTR))
-		return;
-
-	pcie_capability_read_dword(dev, PCI_EXP_DEVCTL2, &ctl);
-	if (ctl & PCI_EXP_DEVCTL2_LTR_EN) {
-		if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT) {
-			dev->ltr_path = 1;
-			return;
-		}
-
-		bridge = pci_upstream_bridge(dev);
-		if (bridge && bridge->ltr_path)
-			dev->ltr_path = 1;
-
-		return;
-	}
-
-	if (!host->native_ltr)
-		return;
-
-	/*
-	 * Software must not enable LTR in an Endpoint unless the Root
-	 * Complex and all intermediate Switches indicate support for LTR.
-	 * PCIe r4.0, sec 6.18.
-	 */
-	if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT) {
-		pcie_capability_set_word(dev, PCI_EXP_DEVCTL2,
-					 PCI_EXP_DEVCTL2_LTR_EN);
-		dev->ltr_path = 1;
-		return;
-	}
-
-	/*
-	 * If we're configuring a hot-added device, LTR was likely
-	 * disabled in the upstream bridge, so re-enable it before enabling
-	 * it in the new device.
-	 */
-	bridge = pci_upstream_bridge(dev);
-	if (bridge && bridge->ltr_path) {
-		pci_bridge_reconfigure_ltr(dev);
-		pcie_capability_set_word(dev, PCI_EXP_DEVCTL2,
-					 PCI_EXP_DEVCTL2_LTR_EN);
-		dev->ltr_path = 1;
-	}
-#endif
 }
 
 static void pci_configure_eetlp_prefix(struct pci_dev *dev)
@@ -2274,6 +2225,7 @@ static void pci_configure_device(struct pci_dev *dev)
 	pci_configure_extended_tags(dev, NULL);
 	pci_configure_relaxed_ordering(dev);
 	pci_configure_ltr(dev);
+	pci_configure_aspm_l1ss(dev);
 	pci_configure_eetlp_prefix(dev);
 	pci_configure_serr(dev);
 
@@ -2322,6 +2274,13 @@ struct pci_dev *pci_alloc_dev(struct pci_bus *bus)
 	INIT_LIST_HEAD(&dev->bus_list);
 	dev->dev.type = &pci_dev_type;
 	dev->bus = pci_bus_get(bus);
+	dev->driver_exclusive_resource = (struct resource) {
+		.name = "PCI Exclusive",
+		.start = 0,
+		.end = -1,
+	};
+
+	spin_lock_init(&dev->pcie_cap_lock);
 #ifdef CONFIG_PCI_MSI
 	raw_spin_lock_init(&dev->msi_lock);
 #endif
@@ -2483,6 +2442,7 @@ static void pci_init_capabilities(struct pci_dev *dev)
 	pci_aer_init(dev);		/* Advanced Error Reporting */
 	pci_dpc_init(dev);		/* Downstream Port Containment */
 	pci_rcec_init(dev);		/* Root Complex Event Collector */
+	pci_doe_init(dev);		/* Data Object Exchange */
 
 	pcie_report_downtraining(dev);
 	pci_init_reset_methods(dev);
@@ -2548,6 +2508,8 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 
 	dma_set_max_seg_size(&dev->dev, 65536);
 	dma_set_seg_boundary(&dev->dev, 0xffffffff);
+
+	pcie_failed_link_retrain(dev);
 
 	/* Fix up broken headers */
 	pci_fixup_device(pci_fixup_header, dev);
@@ -3090,6 +3052,17 @@ int pci_host_probe(struct pci_host_bridge *bridge)
 	}
 
 	pci_bus_add_devices(bus);
+
+	/*
+	 * Ensure pm_runtime_enable() is called for the controller drivers
+	 * before calling pci_host_probe(). The PM framework expects that
+	 * if the parent device supports runtime PM, it will be enabled
+	 * before child runtime PM is enabled.
+	 */
+	pm_runtime_set_active(&bridge->dev);
+	pm_runtime_no_callbacks(&bridge->dev);
+	devm_pm_runtime_enable(&bridge->dev);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(pci_host_probe);

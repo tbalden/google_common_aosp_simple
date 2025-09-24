@@ -105,8 +105,8 @@ struct inode *efs_iget(struct super_block *super, unsigned long ino)
 	inode->i_size  = be32_to_cpu(efs_inode->di_size);
 	inode->i_atime.tv_sec = be32_to_cpu(efs_inode->di_atime);
 	inode->i_mtime.tv_sec = be32_to_cpu(efs_inode->di_mtime);
-	inode->i_ctime.tv_sec = be32_to_cpu(efs_inode->di_ctime);
-	inode->i_atime.tv_nsec = inode->i_mtime.tv_nsec = inode->i_ctime.tv_nsec = 0;
+	inode_set_ctime(inode, be32_to_cpu(efs_inode->di_ctime), 0);
+	inode->i_atime.tv_nsec = inode->i_mtime.tv_nsec = 0;
 
 	/* this is the number of blocks in the file */
 	if (inode->i_size == 0) {
@@ -313,3 +313,4 @@ efs_block_t efs_map_block(struct inode *inode, efs_block_t block) {
 }  
 
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);

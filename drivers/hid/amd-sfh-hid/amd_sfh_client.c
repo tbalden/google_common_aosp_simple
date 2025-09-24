@@ -147,6 +147,7 @@ static const char *get_sensor_name(int idx)
 	case mag_idx:
 		return "magnetometer";
 	case als_idx:
+	case ACS_IDX: /* ambient color sensor */
 		return "ALS";
 	case HPD_IDX:
 		return "HPD";
@@ -308,10 +309,6 @@ int amd_sfh_hid_client_init(struct amd_mp2_dev *privdata)
 				goto cleanup;
 		} else {
 			cl_data->sensor_sts[i] = SENSOR_DISABLED;
-			dev_dbg(dev, "sid 0x%x (%s) status 0x%x\n",
-				cl_data->sensor_idx[i],
-				get_sensor_name(cl_data->sensor_idx[i]),
-				cl_data->sensor_sts[i]);
 		}
 		dev_dbg(dev, "sid 0x%x (%s) status 0x%x\n",
 			cl_data->sensor_idx[i], get_sensor_name(cl_data->sensor_idx[i]),

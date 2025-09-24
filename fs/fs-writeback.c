@@ -121,6 +121,7 @@ static bool inode_io_list_move_locked(struct inode *inode,
 {
 	assert_spin_locked(&wb->list_lock);
 	assert_spin_locked(&inode->i_lock);
+	WARN_ON_ONCE(inode->i_state & I_FREEING);
 
 	list_move(&inode->i_io_list, head);
 
@@ -236,7 +237,7 @@ void wb_wait_for_completion(struct wb_completion *done)
 static atomic_t isw_nr_in_flight = ATOMIC_INIT(0);
 static struct workqueue_struct *isw_wq;
 
-void __inode_attach_wb(struct inode *inode, struct page *page)
+void __inode_attach_wb(struct inode *inode, struct folio *folio)
 {
 	struct backing_dev_info *bdi = inode_to_bdi(inode);
 	struct bdi_writeback *wb = NULL;
@@ -244,8 +245,8 @@ void __inode_attach_wb(struct inode *inode, struct page *page)
 	if (inode_cgwb_enabled(inode)) {
 		struct cgroup_subsys_state *memcg_css;
 
-		if (page) {
-			memcg_css = mem_cgroup_css_from_page(page);
+		if (folio) {
+			memcg_css = mem_cgroup_css_from_folio(folio);
 			wb = wb_get_create(bdi, memcg_css, GFP_ATOMIC);
 		} else {
 			/* must pin memcg_css, see wb_get_create() */
@@ -280,6 +281,7 @@ static void inode_cgwb_move_to_attached(struct inode *inode,
 {
 	assert_spin_locked(&wb->list_lock);
 	assert_spin_locked(&inode->i_lock);
+	WARN_ON_ONCE(inode->i_state & I_FREEING);
 
 	inode->i_state &= ~I_SYNC_QUEUED;
 	if (wb != &wb->bdi->wb)
@@ -874,6 +876,7 @@ EXPORT_SYMBOL_GPL(wbc_detach_inode);
 void wbc_account_cgroup_owner(struct writeback_control *wbc, struct page *page,
 			      size_t bytes)
 {
+	struct folio *folio;
 	struct cgroup_subsys_state *css;
 	int id;
 
@@ -886,7 +889,8 @@ void wbc_account_cgroup_owner(struct writeback_control *wbc, struct page *page,
 	if (!wbc->wb || wbc->no_cgroup_owner)
 		return;
 
-	css = mem_cgroup_css_from_page(page);
+	folio = page_folio(page);
+	css = mem_cgroup_css_from_folio(folio);
 	/* dead cgroups shouldn't contribute to inode ownership arbitration */
 	if (!(css->flags & CSS_ONLINE))
 		return;
@@ -1149,6 +1153,7 @@ static void inode_cgwb_move_to_attached(struct inode *inode,
 {
 	assert_spin_locked(&wb->list_lock);
 	assert_spin_locked(&inode->i_lock);
+	WARN_ON_ONCE(inode->i_state & I_FREEING);
 
 	inode->i_state &= ~I_SYNC_QUEUED;
 	list_del_init(&inode->i_io_list);
@@ -1314,6 +1319,17 @@ static void redirty_tail_locked(struct inode *inode, struct bdi_writeback *wb)
 {
 	assert_spin_locked(&inode->i_lock);
 
+	inode->i_state &= ~I_SYNC_QUEUED;
+	/*
+	 * When the inode is being freed just don't bother with dirty list
+	 * tracking. Flush worker will ignore this inode anyway and it will
+	 * trigger assertions in inode_io_list_move_locked().
+	 */
+	if (inode->i_state & I_FREEING) {
+		list_del_init(&inode->i_io_list);
+		wb_io_lists_depopulated(wb);
+		return;
+	}
 	if (!list_empty(&wb->b_dirty)) {
 		struct inode *tail;
 
@@ -1322,7 +1338,6 @@ static void redirty_tail_locked(struct inode *inode, struct bdi_writeback *wb)
 			inode->dirtied_when = jiffies;
 	}
 	inode_io_list_move_locked(inode, wb, &wb->b_dirty);
-	inode->i_state &= ~I_SYNC_QUEUED;
 }
 
 static void redirty_tail(struct inode *inode, struct bdi_writeback *wb)
@@ -1364,8 +1379,6 @@ static bool inode_dirtied_after(struct inode *inode, unsigned long t)
 #endif
 	return ret;
 }
-
-#define EXPIRE_DIRTY_ATIME 0x0001
 
 /*
  * Move expired (dirtied before dirtied_before) dirty inodes from
@@ -1962,9 +1975,9 @@ static long __writeback_inodes_wb(struct bdi_writeback *wb,
 		struct inode *inode = wb_inode(wb->b_io.prev);
 		struct super_block *sb = inode->i_sb;
 
-		if (!trylock_super(sb)) {
+		if (!super_trylock_shared(sb)) {
 			/*
-			 * trylock_super() may fail consistently due to
+			 * super_trylock_shared() may fail consistently due to
 			 * s_umount being grabbed by someone else. Don't use
 			 * requeue_io() to avoid busy retrying the inode/sb.
 			 */
@@ -2031,6 +2044,7 @@ static long wb_writeback(struct bdi_writeback *wb,
 	struct inode *inode;
 	long progress;
 	struct blk_plug plug;
+	bool queued = false;
 
 	blk_start_plug(&plug);
 	for (;;) {
@@ -2073,8 +2087,10 @@ static long wb_writeback(struct bdi_writeback *wb,
 			dirtied_before = jiffies;
 
 		trace_writeback_start(wb, work);
-		if (list_empty(&wb->b_io))
+		if (list_empty(&wb->b_io)) {
 			queue_io(wb, work, dirtied_before);
+			queued = true;
+		}
 		if (work->sb)
 			progress = writeback_sb_inodes(work->sb, wb, work);
 		else
@@ -2089,7 +2105,7 @@ static long wb_writeback(struct bdi_writeback *wb,
 		 * mean the overall work is done. So we keep looping as long
 		 * as made some progress on cleaning pages or inodes.
 		 */
-		if (progress) {
+		if (progress || !queued) {
 			spin_unlock(&wb->list_lock);
 			continue;
 		}
@@ -2541,7 +2557,7 @@ out_unlock:
 		spin_unlock(&wb->list_lock);
 	spin_unlock(&inode->i_lock);
 }
-EXPORT_SYMBOL(__mark_inode_dirty);
+EXPORT_SYMBOL_NS(__mark_inode_dirty, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 /*
  * The @s_sync_lock is used to serialise concurrent sync operations
@@ -2707,7 +2723,7 @@ void try_to_writeback_inodes_sb(struct super_block *sb, enum wb_reason reason)
 	__writeback_inodes_sb_nr(sb, get_nr_dirty_pages(), reason, true);
 	up_read(&sb->s_umount);
 }
-EXPORT_SYMBOL(try_to_writeback_inodes_sb);
+EXPORT_SYMBOL_NS(try_to_writeback_inodes_sb, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 /**
  * sync_inodes_sb	-	sync sb inode pages
@@ -2774,7 +2790,7 @@ int write_inode_now(struct inode *inode, int sync)
 	might_sleep();
 	return writeback_single_inode(inode, &wbc);
 }
-EXPORT_SYMBOL(write_inode_now);
+EXPORT_SYMBOL_NS(write_inode_now, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 /**
  * sync_inode_metadata - write an inode to disk
@@ -2794,4 +2810,4 @@ int sync_inode_metadata(struct inode *inode, int wait)
 
 	return writeback_single_inode(inode, &wbc);
 }
-EXPORT_SYMBOL(sync_inode_metadata);
+EXPORT_SYMBOL_NS(sync_inode_metadata, ANDROID_GKI_VFS_EXPORT_ONLY);

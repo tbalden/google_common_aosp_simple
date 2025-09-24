@@ -25,6 +25,8 @@
 #include <linux/smp.h>
 #include <linux/delay.h>
 
+#include <trace/hooks/cpuinfo.h>
+
 /*
  * In case the boot CPU is hotpluggable, we record its initial state and
  * current state separately. Certain system registers may contain different
@@ -116,6 +118,17 @@ static const char *const hwcap_str[] = {
 	[KERNEL_HWCAP_WFXT]		= "wfxt",
 	[KERNEL_HWCAP_EBF16]		= "ebf16",
 	[KERNEL_HWCAP_SVE_EBF16]	= "sveebf16",
+	[KERNEL_HWCAP_CSSC]		= "cssc",
+	[KERNEL_HWCAP_RPRFM]		= "rprfm",
+	[KERNEL_HWCAP_SVE2P1]		= "sve2p1",
+	[KERNEL_HWCAP_SME2]		= "sme2",
+	[KERNEL_HWCAP_SME2P1]		= "sme2p1",
+	[KERNEL_HWCAP_SME_I16I32]	= "smei16i32",
+	[KERNEL_HWCAP_SME_BI32I32]	= "smebi32i32",
+	[KERNEL_HWCAP_SME_B16B16]	= "smeb16b16",
+	[KERNEL_HWCAP_SME_F16F16]	= "smef16f16",
+	[KERNEL_HWCAP_MOPS]		= "mops",
+	[KERNEL_HWCAP_HBC]		= "hbc",
 };
 
 #ifdef CONFIG_COMPAT
@@ -143,6 +156,12 @@ static const char *const compat_hwcap_str[] = {
 	[COMPAT_KERNEL_HWCAP(VFPD32)]	= NULL,	/* Not possible on arm64 */
 	[COMPAT_KERNEL_HWCAP(LPAE)]	= "lpae",
 	[COMPAT_KERNEL_HWCAP(EVTSTRM)]	= "evtstrm",
+	[COMPAT_KERNEL_HWCAP(FPHP)]	= "fphp",
+	[COMPAT_KERNEL_HWCAP(ASIMDHP)]	= "asimdhp",
+	[COMPAT_KERNEL_HWCAP(ASIMDDP)]	= "asimddp",
+	[COMPAT_KERNEL_HWCAP(ASIMDFHM)]	= "asimdfhm",
+	[COMPAT_KERNEL_HWCAP(ASIMDBF16)] = "asimdbf16",
+	[COMPAT_KERNEL_HWCAP(I8MM)]	= "i8mm",
 };
 
 #define COMPAT_KERNEL_HWCAP2(x)	const_ilog2(COMPAT_HWCAP2_ ## x)
@@ -152,6 +171,8 @@ static const char *const compat_hwcap2_str[] = {
 	[COMPAT_KERNEL_HWCAP2(SHA1)]	= "sha1",
 	[COMPAT_KERNEL_HWCAP2(SHA2)]	= "sha2",
 	[COMPAT_KERNEL_HWCAP2(CRC32)]	= "crc32",
+	[COMPAT_KERNEL_HWCAP2(SB)]	= "sb",
+	[COMPAT_KERNEL_HWCAP2(SSBS)]	= "ssbs",
 };
 #endif /* CONFIG_COMPAT */
 
@@ -218,6 +239,8 @@ static int c_show(struct seq_file *m, void *v)
 		seq_printf(m, "CPU part\t: 0x%03x\n", MIDR_PARTNUM(midr));
 		seq_printf(m, "CPU revision\t: %d\n\n", MIDR_REVISION(midr));
 	}
+
+	trace_android_rvh_cpuinfo_c_show(m);
 
 	return 0;
 }
@@ -429,6 +452,7 @@ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
 	info->reg_id_aa64mmfr0 = read_cpuid(ID_AA64MMFR0_EL1);
 	info->reg_id_aa64mmfr1 = read_cpuid(ID_AA64MMFR1_EL1);
 	info->reg_id_aa64mmfr2 = read_cpuid(ID_AA64MMFR2_EL1);
+	info->reg_id_aa64mmfr3 = read_cpuid(ID_AA64MMFR3_EL1);
 	info->reg_id_aa64pfr0 = read_cpuid(ID_AA64PFR0_EL1);
 	info->reg_id_aa64pfr1 = read_cpuid(ID_AA64PFR1_EL1);
 	info->reg_id_aa64zfr0 = read_cpuid(ID_AA64ZFR0_EL1);

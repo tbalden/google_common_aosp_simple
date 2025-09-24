@@ -20,30 +20,49 @@
 
 #include "common.h"
 
+/*
+ * The shmem address is split into 4K page and offset.
+ * This is to make sure the parameters fit in 32bit arguments of the
+ * smc/hvc call to keep it uniform across smc32/smc64 conventions.
+ * This however limits the shmem address to 44 bit.
+ *
+ * These optional parameters can be used to distinguish among multiple
+ * scmi instances that are using the same smc-id.
+ * The page parameter is passed in r1/x1/w1 register and the offset parameter
+ * is passed in r2/x2/w2 register.
+ */
+
+#define SHMEM_SIZE (SZ_4K)
+#define SHMEM_SHIFT 12
+#define SHMEM_PAGE(x) (_UL((x) >> SHMEM_SHIFT))
+#define SHMEM_OFFSET(x) ((x) & (SHMEM_SIZE - 1))
+
 /**
  * struct scmi_smc - Structure representing a SCMI smc transport
  *
  * @irq: An optional IRQ for completion
  * @cinfo: SCMI channel info
  * @shmem: Transmit/Receive shared memory area
- * @io_ops: Transport specific I/O operations
  * @shmem_lock: Lock to protect access to Tx/Rx shared memory area.
  *		Used when NOT operating in atomic mode.
  * @inflight: Atomic flag to protect access to Tx/Rx shared memory area.
  *	      Used when operating in atomic mode.
  * @func_id: smc/hvc call function id
+ * @param_page: 4K page number of the shmem channel
+ * @param_offset: Offset within the 4K page of the shmem channel
  */
 
 struct scmi_smc {
 	int irq;
 	struct scmi_chan_info *cinfo;
 	struct scmi_shared_mem __iomem *shmem;
-	struct scmi_shmem_io_ops *io_ops;
 	/* Protect access to shmem area */
 	struct mutex shmem_lock;
 #define INFLIGHT_NONE	MSG_TOKEN_MAX
 	atomic_t inflight;
 	u32 func_id;
+	u32 param_page;
+	u32 param_offset;
 };
 
 static irqreturn_t smc_msg_done_isr(int irq, void *data)
@@ -56,9 +75,9 @@ static irqreturn_t smc_msg_done_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static bool smc_chan_available(struct device *dev, int idx)
+static bool smc_chan_available(struct device_node *of_node, int idx)
 {
-	struct device_node *np = of_parse_phandle(dev->of_node, "shmem", 0);
+	struct device_node *np = of_parse_phandle(of_node, "shmem", 0);
 	if (!np)
 		return false;
 
@@ -143,6 +162,10 @@ static int smc_chan_setup(struct scmi_chan_info *cinfo, struct device *dev,
 	if (ret < 0)
 		return ret;
 
+	if (of_device_is_compatible(dev->of_node, "arm,scmi-smc-param")) {
+		scmi_info->param_page = SHMEM_PAGE(res.start);
+		scmi_info->param_offset = SHMEM_OFFSET(res.start);
+	}
 	/*
 	 * If there is an interrupt named "a2p", then the service and
 	 * completion of a message is signaled by an interrupt rather than by
@@ -159,8 +182,6 @@ static int smc_chan_setup(struct scmi_chan_info *cinfo, struct device *dev,
 	} else {
 		cinfo->no_completion_irq = true;
 	}
-
-	scmi_info->io_ops = shmem_get_io_ops(np);
 
 	scmi_info->func_id = func_id;
 	scmi_info->cinfo = cinfo;
@@ -189,8 +210,6 @@ static int smc_chan_free(int id, void *p, void *data)
 	cinfo->transport_info = NULL;
 	scmi_info->cinfo = NULL;
 
-	scmi_free_channel(cinfo, data, id);
-
 	return 0;
 }
 
@@ -199,6 +218,8 @@ static int smc_send_message(struct scmi_chan_info *cinfo,
 {
 	struct scmi_smc *scmi_info = cinfo->transport_info;
 	struct arm_smccc_res res;
+	unsigned long page = scmi_info->param_page;
+	unsigned long offset = scmi_info->param_offset;
 
 	/*
 	 * Channel will be released only once response has been
@@ -206,10 +227,10 @@ static int smc_send_message(struct scmi_chan_info *cinfo,
 	 */
 	smc_channel_lock_acquire(scmi_info, xfer);
 
-	shmem_tx_prepare(scmi_info->shmem, xfer, cinfo,
-			 scmi_info->io_ops->toio);
+	shmem_tx_prepare(scmi_info->shmem, xfer, cinfo);
 
-	arm_smccc_1_1_invoke(scmi_info->func_id, 0, 0, 0, 0, 0, 0, 0, &res);
+	arm_smccc_1_1_invoke(scmi_info->func_id, page, offset, 0, 0, 0, 0, 0,
+			     &res);
 
 	/* Only SMCCC_RET_NOT_SUPPORTED is valid error code */
 	if (res.a0) {
@@ -225,8 +246,7 @@ static void smc_fetch_response(struct scmi_chan_info *cinfo,
 {
 	struct scmi_smc *scmi_info = cinfo->transport_info;
 
-	shmem_fetch_response(scmi_info->shmem, xfer,
-			     scmi_info->io_ops->fromio);
+	shmem_fetch_response(scmi_info->shmem, xfer);
 }
 
 static void smc_mark_txdone(struct scmi_chan_info *cinfo, int ret,

@@ -6,16 +6,21 @@
 #include <asm/kvm_pgtable.h>
 #include <linux/android_kabi.h>
 #include <linux/export.h>
+#include <linux/android_kabi.h>
 
-typedef void (*dyn_hcall_t)(struct kvm_cpu_context *);
+typedef void (*dyn_hcall_t)(struct user_pt_regs *);
+struct kvm_hyp_iommu;
+struct iommu_iotlb_gather;
+struct kvm_hyp_iommu_domain;
+struct kvm_iommu_paddr_cache;
 
+#ifdef CONFIG_MODULES
 enum pkvm_psci_notification {
 	PKVM_PSCI_CPU_SUSPEND,
 	PKVM_PSCI_SYSTEM_SUSPEND,
 	PKVM_PSCI_CPU_ENTRY,
 };
 
-#ifdef CONFIG_MODULES
 /**
  * struct pkvm_module_ops - pKVM modules callbacks
  * @create_private_mapping:	Map a memory region into the hypervisor private
@@ -64,19 +69,29 @@ enum pkvm_psci_notification {
  * @register_host_perm_fault_handler:
  *				@cb is called whenever the host generates an
  *				abort with the fault status code Permission
- *				Fault. Returning -EPERM lets pKVM handle the
- *				abort. This is useful when a module changes the
+ *				Fault. This is useful when a module changes the
  *				host stage-2 permissions for certain pages.
+ *				Up-to 16 handlers can be registered. Returning
+ *				-EPERM lets pKVM handle the abort while on 0,
+ *				the next handler will be called. The handler
+ *				order depends on the registration order.
  * @host_stage2_mod_prot:	Apply @prot to the page @pfn. This requires a
  *				permission fault handler to be registered (see
  *				@register_host_perm_fault_handler), otherwise
  *				pKVM will be unable to handle this fault and the
- *				CPU will be stuck in an infinite loop.
- * @host_stage2_mod_prot_range:	Similar to @host_stage2_mod_prot, but takes a
- *				range as an argument (@nr_pages). This
- *				considerably speeds up the process for a
- *				contiguous memory region, compared to the
- *				per-page @host_stage2_mod_prot.
+ *				CPU will be stuck in an infinite loop. @nr_pages
+ *				allows to apply this prot on a range of
+ *				contiguous memory.
+ * @host_stage2_enable_lazy_pte:
+ * 				Unmap a range of memory from the host stage-2,
+ * 				leaving the pages host ownership intact. The
+ * 				pages will be remapped lazily (subject to the
+ * 				usual ownership checks) in response to a
+ * 				faulting access from the host.
+ * @host_stage2_disable_lazy_pte:
+ * 				This is the opposite function of
+ * 				host_stage2_enable_lazy_pte. Must be called once
+ * 				the module is done with the region.
  * @host_stage2_get_leaf:	Query the host's stage2 page-table entry for
  *				the page @phys.
  * @register_host_smc_handler:	@cb is called whenever the host issues an SMC
@@ -97,8 +112,16 @@ enum pkvm_psci_notification {
  * @register_hyp_panic_notifier:
  *				To notify the module of a pending hypervisor
  *				panic. On return from @cb, the panic will occur.
+ * @register_unmask_serror:	When @unmask returns true, the hypervisor will
+ * 				unmask SErrors at EL2. Although the hypervisor
+ *				cannot recover from an SError (and will panic if
+ *				one occurs), they can be useful for debugging in
+ *				some situations. @mask is the @unmask twin and
+ *				is called before remasking SErrors.
  * @host_donate_hyp:		The page @pfn is unmapped from the host and
  *				full control is given to the hypervisor.
+ * @host_donate_hyp_prot:	As host_donate_hyp_prot, but this variant sets
+ *				the prot of the hyp.
  * @hyp_donate_host:		The page @pfn whom control has previously been
  *				given to the hypervisor (@host_donate_hyp) is
  *				given back to the host.
@@ -121,6 +144,23 @@ enum pkvm_psci_notification {
  * @hyp_va:			Convert a physical address into a virtual one.
  * @kern_hyp_va:		Convert a kernel virtual address into an
  *				hypervisor virtual one.
+ * @hyp_alloc:			Allocate memory in hyp VA space.
+ * @hyp_alloc_errno:		Error in case hyp_alloc() returns NULL.
+ * @hyp_free:			Free memory allocated  from hyp_alloc().
+ * @iommu_donate_pages:		Allocate memory from IOMMU pool.
+ * @iommu_reclaim_pages:	Reclaim memory from iommu_donate_pages()
+ * @iommu_request:		Fill a request that is returned from the entry HVC (see hyp-main.c).
+ * @iommu_init_device:		Initialize common IOMMU fields.
+ * @udelay:			Delay in us.
+ * @hyp_alloc_missing_donations:
+				Missing donations if allocator returns NULL
+ * @__list_add_valid_or_report: Needed if the code uses linked lists.
+ * @__list_del_entry_valid_or_report:
+				Needed if the code uses linked lists.
+ * @iommu_iotlb_gather_add_page: Add a page to the iotlb_gather druing unmap for the IOMMU.
+ * @iommu_donate_pages_atomic:	Allocate memory from IOMMU identity pool.
+ * @iommu_reclaim_pages_atomic:	Reclaim memory from iommu_donate_pages_atomic()
+ * @hyp_smp_processor_id:	Current CPU id
  */
 struct pkvm_module_ops {
 	int (*create_private_mapping)(phys_addr_t phys, size_t size,
@@ -129,8 +169,9 @@ struct pkvm_module_ops {
 	void *(*alloc_module_va)(u64 nr_pages);
 	int (*map_module_page)(u64 pfn, void *va, enum kvm_pgtable_prot prot, bool is_protected);
 	int (*register_serial_driver)(void (*hyp_putc_cb)(char));
-	void (*puts)(const char *str);
-	void (*putx64)(u64 num);
+	void (*putc)(char c);
+	void (*puts)(const char *s);
+	void (*putx64)(u64 x);
 	void *(*fixmap_map)(phys_addr_t phys);
 	void (*fixmap_unmap)(void);
 	void *(*linear_map_early)(phys_addr_t phys, size_t size, enum kvm_pgtable_prot prot);
@@ -138,15 +179,17 @@ struct pkvm_module_ops {
 	void (*flush_dcache_to_poc)(void *addr, size_t size);
 	void (*update_hcr_el2)(unsigned long set_mask, unsigned long clear_mask);
 	void (*update_hfgwtr_el2)(unsigned long set_mask, unsigned long clear_mask);
-	int (*register_host_perm_fault_handler)(int (*cb)(struct kvm_cpu_context *ctxt, u64 esr, u64 addr));
-	int (*host_stage2_mod_prot)(u64 pfn, enum kvm_pgtable_prot prot);
+	int (*register_host_perm_fault_handler)(int (*cb)(struct user_pt_regs *regs, u64 esr, u64 addr));
+	int (*host_stage2_mod_prot)(u64 pfn, enum kvm_pgtable_prot prot, u64 nr_pages, bool update_iommu);
 	int (*host_stage2_get_leaf)(phys_addr_t phys, kvm_pte_t *ptep, u32 *level);
-	int (*register_host_smc_handler)(bool (*cb)(struct kvm_cpu_context *));
-	int (*register_default_trap_handler)(bool (*cb)(struct kvm_cpu_context *));
-	int (*register_illegal_abt_notifier)(void (*cb)(struct kvm_cpu_context *));
-	int (*register_psci_notifier)(void (*cb)(enum pkvm_psci_notification, struct kvm_cpu_context *));
-	int (*register_hyp_panic_notifier)(void (*cb)(struct kvm_cpu_context *host_ctxt));
-	int (*host_donate_hyp)(u64 pfn, u64 nr_pages);
+	int (*register_host_smc_handler)(bool (*cb)(struct user_pt_regs *));
+	int (*register_default_trap_handler)(bool (*cb)(struct user_pt_regs *));
+	int (*register_illegal_abt_notifier)(void (*cb)(struct user_pt_regs *));
+	int (*register_psci_notifier)(void (*cb)(enum pkvm_psci_notification, struct user_pt_regs *));
+	int (*register_hyp_panic_notifier)(void (*cb)(struct user_pt_regs *));
+	int (*register_unmask_serror)(bool (*unmask)(void), void (*mask)(void));
+	int (*host_donate_hyp)(u64 pfn, u64 nr_pages, bool accept_mmio);
+	int (*host_donate_hyp_prot)(u64 pfn, u64 nr_pages, bool accept_mmio, enum kvm_pgtable_prot prot);
 	int (*hyp_donate_host)(u64 pfn, u64 nr_pages);
 	int (*host_share_hyp)(u64 pfn);
 	int (*host_unshare_hyp)(u64 pfn);
@@ -157,11 +200,33 @@ struct pkvm_module_ops {
 	phys_addr_t (*hyp_pa)(void *x);
 	void* (*hyp_va)(phys_addr_t phys);
 	unsigned long (*kern_hyp_va)(unsigned long x);
-
-	ANDROID_KABI_USE(1, int (*host_stage2_mod_prot_range)(u64 pfn, enum kvm_pgtable_prot prot, u64 nr_pages));
-
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
+	void * (*hyp_alloc)(size_t size);
+	int (*hyp_alloc_errno)(void);
+	void (*hyp_free)(void *addr);
+	void * (*iommu_donate_pages)(u8 order, bool request);
+	void (*iommu_reclaim_pages)(void *p, u8 order);
+	int (*iommu_request)(struct kvm_hyp_req *req);
+	int (*iommu_init_device)(struct kvm_hyp_iommu *iommu);
+	void (*udelay)(unsigned long usecs);
+	u8 (*hyp_alloc_missing_donations)(void);
+#ifdef CONFIG_LIST_HARDENED
+	/* These 2 functions change calling convention based on CONFIG_DEBUG_LIST. */
+	typeof(__list_add_valid_or_report) *list_add_valid_or_report;
+	typeof(__list_del_entry_valid_or_report) *list_del_entry_valid_or_report;
+#endif
+	void (*iommu_iotlb_gather_add_page)(struct kvm_hyp_iommu_domain *domain,
+					    struct iommu_iotlb_gather *gather,
+					    unsigned long iova, size_t size);
+	int (*register_hyp_event_ids)(unsigned long start, unsigned long end);
+	void* (*tracing_reserve_entry)(unsigned long length);
+	void (*tracing_commit_entry)(void);
+	void * (*iommu_donate_pages_atomic)(u8 order);
+	void (*iommu_reclaim_pages_atomic)(void *p, u8 order);
+	int (*iommu_snapshot_host_stage2)(struct kvm_hyp_iommu_domain *domain);
+	int (*hyp_smp_processor_id)(void);
+	ANDROID_KABI_USE(1, void (*iommu_flush_unmap_cache)(struct kvm_iommu_paddr_cache *cache));
+	ANDROID_KABI_USE(2, int (*host_stage2_enable_lazy_pte)(u64 addr, u64 nr_pages));
+	ANDROID_KABI_USE(3, int (*host_stage2_disable_lazy_pte)(u64 addr, u64 nr_pages));
 	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 	ANDROID_KABI_RESERVE(6);
@@ -196,6 +261,8 @@ struct pkvm_module_ops {
 int __pkvm_load_el2_module(struct module *this, unsigned long *token);
 
 int __pkvm_register_el2_call(unsigned long hfn_hyp_va);
+
+unsigned long pkvm_el2_mod_kern_va(unsigned long addr);
 #else
 static inline int __pkvm_load_el2_module(struct module *this,
 					 unsigned long *token)
@@ -207,6 +274,11 @@ static inline int __pkvm_register_el2_call(unsigned long hfn_hyp_va)
 {
 	return -ENOSYS;
 }
+
+static inline unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
+{
+	return 0;
+}
 #endif /* CONFIG_MODULES */
 
 int pkvm_load_early_modules(void);
@@ -217,11 +289,11 @@ int pkvm_load_early_modules(void);
  */
 #define pkvm_el2_mod_va(kern_va, token)					\
 ({									\
-	unsigned long hyp_text_kern_va =				\
-		(unsigned long)THIS_MODULE->arch.hyp.text.start;	\
+	unsigned long hyp_mod_kern_va =				\
+		(unsigned long)THIS_MODULE->arch.hyp.sections.start;	\
 	unsigned long offset;						\
 									\
-	offset = (unsigned long)kern_va - hyp_text_kern_va;		\
+	offset = (unsigned long)kern_va - hyp_mod_kern_va;		\
 	token + offset;							\
 })
 
@@ -231,10 +303,11 @@ int pkvm_load_early_modules(void);
 	__pkvm_load_el2_module(THIS_MODULE, token);			\
 })
 
-#define pkvm_register_el2_mod_call(hfn, token)				\
-({									\
-	__pkvm_register_el2_call(pkvm_el2_mod_va(hfn, token));		\
-})
+static inline int pkvm_register_el2_mod_call(dyn_hcall_t hfn,
+					     unsigned long token)
+{
+	return __pkvm_register_el2_call(pkvm_el2_mod_va(hfn, token));
+}
 
 #define pkvm_el2_mod_call(id, ...)					\
 	({								\

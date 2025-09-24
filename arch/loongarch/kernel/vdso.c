@@ -40,8 +40,6 @@ static struct page *vdso_pages[] = { NULL };
 struct vdso_data *vdso_data = generic_vdso_data.data;
 struct vdso_pcpu_data *vdso_pdata = loongarch_vdso_data.vdata.pdata;
 
-static struct page *find_timens_vvar_page(struct vm_area_struct *vma);
-
 static int vdso_mremap(const struct vm_special_mapping *sm, struct vm_area_struct *new_vma)
 {
 	current->mm->context.vdso = (void *)(new_vma->vm_start);
@@ -141,36 +139,12 @@ int vdso_join_timens(struct task_struct *task, struct time_namespace *ns)
 
 	mmap_read_lock(mm);
 	for_each_vma(vmi, vma) {
-		unsigned long size = vma->vm_end - vma->vm_start;
-
 		if (vma_is_special_mapping(vma, &vdso_info.data_mapping))
-			zap_page_range(vma, vma->vm_start, size);
+			zap_vma_pages(vma);
 	}
 	mmap_read_unlock(mm);
 
 	return 0;
-}
-
-static struct page *find_timens_vvar_page(struct vm_area_struct *vma)
-{
-	if (likely(vma->vm_mm == current->mm))
-		return current->nsproxy->time_ns->vvar_page;
-
-	/*
-	 * VM_PFNMAP | VM_IO protect .fault() handler from being called
-	 * through interfaces like /proc/$pid/mem or
-	 * process_vm_{readv,writev}() as long as there's no .access()
-	 * in special_mapping_vmops.
-	 * For more details check_vma_flags() and __access_remote_vm()
-	 */
-	WARN(1, "vvar_page accessed remotely");
-
-	return NULL;
-}
-#else
-static struct page *find_timens_vvar_page(struct vm_area_struct *vma)
-{
-	return NULL;
 }
 #endif
 
@@ -179,7 +153,7 @@ static unsigned long vdso_base(void)
 	unsigned long base = STACK_TOP;
 
 	if (current->flags & PF_RANDOMIZE) {
-		base += prandom_u32_max(VDSO_RANDOMIZE_SIZE);
+		base += get_random_u32_below(VDSO_RANDOMIZE_SIZE);
 		base = PAGE_ALIGN(base);
 	}
 

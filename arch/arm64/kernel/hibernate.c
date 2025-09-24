@@ -33,7 +33,6 @@
 #include <asm/sysreg.h>
 #include <asm/trans_pgd.h>
 #include <asm/virt.h>
-#include <trace/hooks/bl_hib.h>
 
 /*
  * Hibernate core relies on this value being 0 on resume, and marks it
@@ -81,8 +80,6 @@ static struct arch_hibernate_hdr {
 	phys_addr_t	__hyp_stub_vectors;
 
 	u64		sleep_cpu_mpidr;
-
-	ANDROID_VENDOR_DATA(1);
 } resume_hdr;
 
 static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
@@ -102,7 +99,6 @@ int pfn_is_nosave(unsigned long pfn)
 
 void notrace save_processor_state(void)
 {
-	WARN_ON(num_online_cpus() != 1);
 }
 
 void notrace restore_processor_state(void)
@@ -119,11 +115,6 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 	arch_hdr_invariants(&hdr->invariants);
 	hdr->ttbr1_el1		= __pa_symbol(swapper_pg_dir);
 	hdr->reenter_kernel	= _cpu_resume;
-
-#ifdef CONFIG_ANDROID_VENDOR_OEM_DATA
-	trace_android_vh_save_cpu_resume(&hdr->android_vendor_data1,
-						__pa(cpu_resume));
-#endif
 
 	/* We can't use __hyp_get_vectors() because kvm may still be loaded */
 	if (el2_reset_needed())

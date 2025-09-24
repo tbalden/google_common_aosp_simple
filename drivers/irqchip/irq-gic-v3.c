@@ -12,20 +12,22 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>
+#include <linux/kstrtox.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/percpu.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
-#include <linux/syscore_ops.h>
 #include <trace/hooks/gic_v3.h>
-#include <trace/hooks/gic.h>
 
 #include <linux/irqchip.h>
 #include <linux/irqchip/arm-gic-common.h>
 #include <linux/irqchip/arm-gic-v3.h>
 #include <linux/irqchip/irq-partition-percpu.h>
+#include <linux/bitfield.h>
+#include <linux/bits.h>
+#include <linux/arm-smccc.h>
 
 #include <asm/cputype.h>
 #include <asm/exception.h>
@@ -49,10 +51,29 @@ struct redist_region {
 	bool			single_redist;
 };
 
-static struct gic_chip_data_v3 gic_data __read_mostly;
-static DEFINE_STATIC_KEY_TRUE(supports_deactivate_key);
+struct gic_chip_data {
+	struct fwnode_handle	*fwnode;
+	phys_addr_t		dist_phys_base;
+	void __iomem		*dist_base;
+	struct redist_region	*redist_regions;
+	struct rdists		rdists;
+	struct irq_domain	*domain;
+	u64			redist_stride;
+	u32			nr_redist_regions;
+	u64			flags;
+	bool			has_rss;
+	unsigned int		ppi_nr;
+	struct partition_desc	**ppi_descs;
+};
+
+#define T241_CHIPS_MAX		4
+static void __iomem *t241_dist_base_alias[T241_CHIPS_MAX] __read_mostly;
+static DEFINE_STATIC_KEY_FALSE(gic_nvidia_t241_erratum);
 
 static DEFINE_STATIC_KEY_FALSE(gic_arm64_2941627_erratum);
+
+static struct gic_chip_data gic_data __read_mostly;
+static DEFINE_STATIC_KEY_TRUE(supports_deactivate_key);
 
 #define GIC_ID_NR	(1U << GICD_TYPER_ID_BITS(gic_data.rdists.gicd_typer))
 #define GIC_LINE_NR	min(GICD_TYPER_SPIS(gic_data.rdists.gicd_typer), 1020U)
@@ -80,15 +101,6 @@ static DEFINE_STATIC_KEY_FALSE(gic_arm64_2941627_erratum);
  *   interrupt.
  */
 static DEFINE_STATIC_KEY_FALSE(supports_pseudo_nmis);
-
-/*
- * Global static key controlling whether an update to PMR allowing more
- * interrupts requires to be propagated to the redistributor (DSB SY).
- * And this needs to be exported for modules to be able to enable
- * interrupts...
- */
-DEFINE_STATIC_KEY_FALSE(gic_pmr_sync);
-EXPORT_SYMBOL(gic_pmr_sync);
 
 DEFINE_STATIC_KEY_FALSE(gic_nonsecure_priorities);
 EXPORT_SYMBOL(gic_nonsecure_priorities);
@@ -180,6 +192,39 @@ static inline bool gic_irq_in_rdist(struct irq_data *d)
 	}
 }
 
+static inline void __iomem *gic_dist_base_alias(struct irq_data *d)
+{
+	if (static_branch_unlikely(&gic_nvidia_t241_erratum)) {
+		irq_hw_number_t hwirq = irqd_to_hwirq(d);
+		u32 chip;
+
+		/*
+		 * For the erratum T241-FABRIC-4, read accesses to GICD_In{E}
+		 * registers are directed to the chip that owns the SPI. The
+		 * the alias region can also be used for writes to the
+		 * GICD_In{E} except GICD_ICENABLERn. Each chip has support
+		 * for 320 {E}SPIs. Mappings for all 4 chips:
+		 *    Chip0 = 32-351
+		 *    Chip1 = 352-671
+		 *    Chip2 = 672-991
+		 *    Chip3 = 4096-4415
+		 */
+		switch (__get_intid_range(hwirq)) {
+		case SPI_RANGE:
+			chip = (hwirq - 32) / 320;
+			break;
+		case ESPI_RANGE:
+			chip = 3;
+			break;
+		default:
+			unreachable();
+		}
+		return t241_dist_base_alias[chip];
+	}
+
+	return gic_data.dist_base;
+}
+
 static inline void __iomem *gic_dist_base(struct irq_data *d)
 {
 	switch (get_intid_range(d)) {
@@ -215,11 +260,10 @@ static void gic_do_wait_for_rwp(void __iomem *base, u32 bit)
 }
 
 /* Wait for completion of a distributor change */
-void gic_v3_dist_wait_for_rwp(void)
+static void gic_dist_wait_for_rwp(void)
 {
 	gic_do_wait_for_rwp(gic_data.dist_base, GICD_CTLR_RWP);
 }
-EXPORT_SYMBOL_GPL(gic_v3_dist_wait_for_rwp);
 
 /* Wait for completion of a redistributor change */
 static void gic_redist_wait_for_rwp(void)
@@ -339,7 +383,7 @@ static int gic_peek_irq(struct irq_data *d, u32 offset)
 	if (gic_irq_in_rdist(d))
 		base = gic_data_rdist_sgi_base();
 	else
-		base = gic_data.dist_base;
+		base = gic_dist_base_alias(d);
 
 	return !!(readl_relaxed(base + offset + (index / 32) * 4) & mask);
 }
@@ -366,7 +410,7 @@ static void gic_mask_irq(struct irq_data *d)
 	if (gic_irq_in_rdist(d))
 		gic_redist_wait_for_rwp();
 	else
-		gic_v3_dist_wait_for_rwp();
+		gic_dist_wait_for_rwp();
 }
 
 static void gic_eoimode1_mask_irq(struct irq_data *d)
@@ -630,7 +674,7 @@ static int gic_set_type(struct irq_data *d, unsigned int type)
 	if (gic_irq_in_rdist(d))
 		base = gic_data_rdist_sgi_base();
 	else
-		base = gic_data.dist_base;
+		base = gic_dist_base_alias(d);
 
 	offset = convert_offset_index(d, GICD_ICFGR, &index);
 
@@ -868,7 +912,7 @@ static bool gic_has_group0(void)
 	return val != 0;
 }
 
-void gic_v3_dist_init(void)
+static void __init gic_dist_init(void)
 {
 	unsigned int i;
 	u64 affinity;
@@ -877,7 +921,7 @@ void gic_v3_dist_init(void)
 
 	/* Disable the distributor */
 	writel_relaxed(0, base + GICD_CTLR);
-	gic_v3_dist_wait_for_rwp();
+	gic_dist_wait_for_rwp();
 
 	/*
 	 * Configure SPIs as non-secure Group-1. This will only matter
@@ -914,7 +958,7 @@ void gic_v3_dist_init(void)
 
 	/* Enable distributor with ARE, Group1, and wait for it to drain */
 	writel_relaxed(val, base + GICD_CTLR);
-	gic_v3_dist_wait_for_rwp();
+	gic_dist_wait_for_rwp();
 
 	/*
 	 * Set all global interrupts to the boot CPU only. ARE must be
@@ -931,7 +975,6 @@ void gic_v3_dist_init(void)
 		gic_write_irouter(affinity, base + GICD_IROUTERnE + i * 8);
 	}
 }
-EXPORT_SYMBOL_GPL(gic_v3_dist_init);
 
 static int gic_iterate_rdists(int (*fn)(struct redist_region *, void __iomem *))
 {
@@ -1218,7 +1261,7 @@ static bool gicv3_nolpi;
 
 static int __init gicv3_nolpi_cfg(char *buf)
 {
-	return strtobool(buf, &gicv3_nolpi);
+	return kstrtobool(buf, &gicv3_nolpi);
 }
 early_param("irqchip.gicv3_nolpi", gicv3_nolpi_cfg);
 
@@ -1229,7 +1272,7 @@ static int gic_dist_supports_lpis(void)
 		!gicv3_nolpi);
 }
 
-void gic_v3_cpu_init(void)
+static void gic_cpu_init(void)
 {
 	void __iomem *rbase;
 	int i;
@@ -1256,7 +1299,6 @@ void gic_v3_cpu_init(void)
 	/* initialise system registers */
 	gic_cpu_sys_reg_init();
 }
-EXPORT_SYMBOL_GPL(gic_v3_cpu_init);
 
 #ifdef CONFIG_SMP
 
@@ -1265,7 +1307,7 @@ EXPORT_SYMBOL_GPL(gic_v3_cpu_init);
 
 static int gic_starting_cpu(unsigned int cpu)
 {
-	gic_v3_cpu_init();
+	gic_cpu_init();
 
 	if (gic_dist_supports_lpis())
 		its_cpu_init();
@@ -1359,9 +1401,7 @@ static void __init gic_smp_init(void)
 				  gic_starting_cpu, NULL);
 
 	/* Register all 8 non-secure SGIs */
-	base_sgi = __irq_domain_alloc_irqs(gic_data.domain, -1, 8,
-					   NUMA_NO_NODE, &sgi_fwspec,
-					   false, NULL);
+	base_sgi = irq_domain_alloc_irqs(gic_data.domain, 8, NUMA_NO_NODE, &sgi_fwspec);
 	if (WARN_ON(base_sgi <= 0))
 		return;
 
@@ -1451,36 +1491,6 @@ static void gic_cpu_pm_init(void)
 #else
 static inline void gic_cpu_pm_init(void) { }
 #endif /* CONFIG_CPU_PM */
-
-#ifdef CONFIG_PM
-void gic_v3_resume(void)
-{
-	trace_android_vh_gic_resume(&gic_data);
-}
-EXPORT_SYMBOL_GPL(gic_v3_resume);
-
-static int gic_v3_suspend(void)
-{
-	trace_android_vh_gic_v3_suspend(&gic_data);
-	return 0;
-}
-
-static struct syscore_ops gic_syscore_ops = {
-	.resume = gic_v3_resume,
-	.suspend = gic_v3_suspend,
-};
-
-static void gic_syscore_init(void)
-{
-	register_syscore_ops(&gic_syscore_ops);
-}
-
-#else
-static inline void gic_syscore_init(void) { }
-void gic_v3_resume(void) { }
-static int gic_v3_suspend(void) { return 0; }
-#endif
-
 
 static struct irq_chip gic_chip = {
 	.name			= "GICv3",
@@ -1765,7 +1775,7 @@ static const struct irq_domain_ops partition_domain_ops = {
 
 static bool gic_enable_quirk_msm8996(void *data)
 {
-	struct gic_chip_data_v3 *d = data;
+	struct gic_chip_data *d = data;
 
 	d->flags |= FLAGS_WORKAROUND_GICR_WAKER_MSM8996;
 
@@ -1774,7 +1784,7 @@ static bool gic_enable_quirk_msm8996(void *data)
 
 static bool gic_enable_quirk_mtk_gicr(void *data)
 {
-	struct gic_chip_data_v3 *d = data;
+	struct gic_chip_data *d = data;
 
 	d->flags |= FLAGS_WORKAROUND_MTK_GICR_SAVE;
 
@@ -1783,7 +1793,7 @@ static bool gic_enable_quirk_mtk_gicr(void *data)
 
 static bool gic_enable_quirk_cavium_38539(void *data)
 {
-	struct gic_chip_data_v3 *d = data;
+	struct gic_chip_data *d = data;
 
 	d->flags |= FLAGS_WORKAROUND_CAVIUM_ERRATUM_38539;
 
@@ -1792,7 +1802,7 @@ static bool gic_enable_quirk_cavium_38539(void *data)
 
 static bool gic_enable_quirk_hip06_07(void *data)
 {
-	struct gic_chip_data_v3 *d = data;
+	struct gic_chip_data *d = data;
 
 	/*
 	 * HIP06 GICD_IIDR clashes with GIC-600 product number (despite
@@ -1810,18 +1820,63 @@ static bool gic_enable_quirk_hip06_07(void *data)
 	return false;
 }
 
+#define T241_CHIPN_MASK		GENMASK_ULL(45, 44)
+#define T241_CHIP_GICDA_OFFSET	0x1580000
+#define SMCCC_SOC_ID_T241	0x036b0241
+
+static bool gic_enable_quirk_nvidia_t241(void *data)
+{
+	s32 soc_id = arm_smccc_get_soc_id_version();
+	unsigned long chip_bmask = 0;
+	phys_addr_t phys;
+	u32 i;
+
+	/* Check JEP106 code for NVIDIA T241 chip (036b:0241) */
+	if ((soc_id < 0) || (soc_id != SMCCC_SOC_ID_T241))
+		return false;
+
+	/* Find the chips based on GICR regions PHYS addr */
+	for (i = 0; i < gic_data.nr_redist_regions; i++) {
+		chip_bmask |= BIT(FIELD_GET(T241_CHIPN_MASK,
+				  (u64)gic_data.redist_regions[i].phys_base));
+	}
+
+	if (hweight32(chip_bmask) < 3)
+		return false;
+
+	/* Setup GICD alias regions */
+	for (i = 0; i < ARRAY_SIZE(t241_dist_base_alias); i++) {
+		if (chip_bmask & BIT(i)) {
+			phys = gic_data.dist_phys_base + T241_CHIP_GICDA_OFFSET;
+			phys |= FIELD_PREP(T241_CHIPN_MASK, i);
+			t241_dist_base_alias[i] = ioremap(phys, SZ_64K);
+			WARN_ON_ONCE(!t241_dist_base_alias[i]);
+		}
+	}
+	static_branch_enable(&gic_nvidia_t241_erratum);
+	return true;
+}
+
+static bool gic_enable_quirk_asr8601(void *data)
+{
+	struct gic_chip_data *d = data;
+
+	d->flags |= FLAGS_WORKAROUND_ASR_ERRATUM_8601001;
+
+	return true;
+}
+
 static bool gic_enable_quirk_arm64_2941627(void *data)
 {
 	static_branch_enable(&gic_arm64_2941627_erratum);
 	return true;
 }
 
-static bool gic_enable_quirk_asr8601(void *data)
+static bool rd_set_non_coherent(void *data)
 {
-	struct gic_chip_data_v3 *d = data;
+	struct gic_chip_data *d = data;
 
-	d->flags |= FLAGS_WORKAROUND_ASR_ERRATUM_8601001;
-
+	d->rdists.flags |= RDIST_FLAGS_FORCE_NON_SHAREABLE;
 	return true;
 }
 
@@ -1832,14 +1887,14 @@ static const struct gic_quirk gic_quirks[] = {
 		.init	= gic_enable_quirk_msm8996,
 	},
 	{
-		.desc	= "GICv3: Mediatek Chromebook GICR save problem",
-		.property = "mediatek,broken-save-restore-fw",
-		.init	= gic_enable_quirk_mtk_gicr,
-	},
-	{
 		.desc	= "GICv3: ASR erratum 8601001",
 		.compatible = "asr,asr8601-gic-v3",
 		.init	= gic_enable_quirk_asr8601,
+	},
+	{
+		.desc	= "GICv3: Mediatek Chromebook GICR save problem",
+		.property = "mediatek,broken-save-restore-fw",
+		.init	= gic_enable_quirk_mtk_gicr,
 	},
 	{
 		.desc	= "GICv3: HIP06 erratum 161010803",
@@ -1867,6 +1922,12 @@ static const struct gic_quirk gic_quirks[] = {
 		.init	= gic_enable_quirk_cavium_38539,
 	},
 	{
+		.desc	= "GICv3: NVIDIA erratum T241-FABRIC-4",
+		.iidr	= 0x0402043b,
+		.mask	= 0xffffffff,
+		.init	= gic_enable_quirk_nvidia_t241,
+	},
+	{
 		/*
 		 * GIC-700: 2941627 workaround - IP variant [0,1]
 		 *
@@ -1884,6 +1945,11 @@ static const struct gic_quirk gic_quirks[] = {
 		.iidr	= 0x0402043b,
 		.mask	= 0xff0f0fff,
 		.init	= gic_enable_quirk_arm64_2941627,
+	},
+	{
+		.desc   = "GICv3: non-coherent attribute",
+		.property = "dma-noncoherent",
+		.init   = rd_set_non_coherent,
 	},
 	{
 	}
@@ -1908,16 +1974,8 @@ static void gic_enable_nmi_support(void)
 	for (i = 0; i < gic_data.ppi_nr; i++)
 		refcount_set(&ppi_nmi_refs[i], 0);
 
-	/*
-	 * Linux itself doesn't use 1:N distribution, so has no need to
-	 * set PMHE. The only reason to have it set is if EL3 requires it
-	 * (and we can't change it).
-	 */
-	if (gic_read_ctlr() & ICC_CTLR_EL1_PMHE_MASK)
-		static_branch_enable(&gic_pmr_sync);
-
 	pr_info("Pseudo-NMIs enabled using %s ICC_PMR_EL1 synchronisation\n",
-		static_branch_unlikely(&gic_pmr_sync) ? "forced" : "relaxed");
+		gic_has_relaxed_pmr_sync() ? "relaxed" : "forced");
 
 	/*
 	 * How priority values are used by the GIC depends on two things:
@@ -1957,7 +2015,8 @@ static void gic_enable_nmi_support(void)
 		gic_chip.flags |= IRQCHIP_SUPPORTS_NMI;
 }
 
-static int __init gic_init_bases(void __iomem *dist_base,
+static int __init gic_init_bases(phys_addr_t dist_phys_base,
+				 void __iomem *dist_base,
 				 struct redist_region *rdist_regs,
 				 u32 nr_redist_regions,
 				 u64 redist_stride,
@@ -1973,6 +2032,7 @@ static int __init gic_init_bases(void __iomem *dist_base,
 		pr_info("GIC: Using split EOI/Deactivate mode\n");
 
 	gic_data.fwnode = handle;
+	gic_data.dist_phys_base = dist_phys_base;
 	gic_data.dist_base = dist_base;
 	gic_data.redist_regions = rdist_regs;
 	gic_data.nr_redist_regions = nr_redist_regions;
@@ -2000,10 +2060,13 @@ static int __init gic_init_bases(void __iomem *dist_base,
 	gic_data.domain = irq_domain_create_tree(handle, &gic_irq_domain_ops,
 						 &gic_data);
 	gic_data.rdists.rdist = alloc_percpu(typeof(*gic_data.rdists.rdist));
-	gic_data.rdists.has_rvpeid = true;
-	gic_data.rdists.has_vlpis = true;
-	gic_data.rdists.has_direct_lpi = true;
-	gic_data.rdists.has_vpend_valid_dirty = true;
+	if (!static_branch_unlikely(&gic_nvidia_t241_erratum)) {
+		/* Disable GICv4.x features for the erratum T241-FABRIC-4 */
+		gic_data.rdists.has_rvpeid = true;
+		gic_data.rdists.has_vlpis = true;
+		gic_data.rdists.has_direct_lpi = true;
+		gic_data.rdists.has_vpend_valid_dirty = true;
+	}
 
 	if (WARN_ON(!gic_data.domain) || WARN_ON(!gic_data.rdists.rdist)) {
 		err = -ENOMEM;
@@ -2024,11 +2087,10 @@ static int __init gic_init_bases(void __iomem *dist_base,
 
 	gic_update_rdist_properties();
 
-	gic_v3_dist_init();
-	gic_v3_cpu_init();
+	gic_dist_init();
+	gic_cpu_init();
 	gic_smp_init();
 	gic_cpu_pm_init();
-	gic_syscore_init();
 
 	if (gic_dist_supports_lpis()) {
 		its_init(handle, &gic_data.rdists, gic_data.domain);
@@ -2210,6 +2272,7 @@ static void __iomem *gic_of_iomap(struct device_node *node, int idx,
 
 static int __init gic_of_init(struct device_node *node, struct device_node *parent)
 {
+	phys_addr_t dist_phys_base;
 	void __iomem *dist_base;
 	struct redist_region *rdist_regs;
 	struct resource res;
@@ -2222,6 +2285,8 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
 		pr_err("%pOF: unable to map gic dist registers\n", node);
 		return PTR_ERR(dist_base);
 	}
+
+	dist_phys_base = res.start;
 
 	err = gic_validate_dist_version(dist_base);
 	if (err) {
@@ -2254,8 +2319,8 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
 
 	gic_enable_of_quirks(node, gic_quirks, &gic_data);
 
-	err = gic_init_bases(dist_base, rdist_regs, nr_redist_regions,
-			     redist_stride, &node->fwnode);
+	err = gic_init_bases(dist_phys_base, dist_base, rdist_regs,
+			     nr_redist_regions, redist_stride, &node->fwnode);
 	if (err)
 		goto out_unmap_rdist;
 
@@ -2571,8 +2636,9 @@ gic_acpi_init(union acpi_subtable_headers *header, const unsigned long end)
 		goto out_redist_unmap;
 	}
 
-	err = gic_init_bases(acpi_data.dist_base, acpi_data.redist_regs,
-			     acpi_data.nr_redist_regions, 0, gsi_domain_handle);
+	err = gic_init_bases(dist->base_address, acpi_data.dist_base,
+			     acpi_data.redist_regs, acpi_data.nr_redist_regions,
+			     0, gsi_domain_handle);
 	if (err)
 		goto out_fwhandle_free;
 

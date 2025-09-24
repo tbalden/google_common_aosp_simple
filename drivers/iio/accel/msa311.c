@@ -351,7 +351,6 @@ static const struct regmap_config msa311_regmap_config = {
  * @chip_name: Chip name in the format "msa311-%02x" % partid
  * @new_data_trig: Optional NEW_DATA interrupt driven trigger used
  *                 to notify external consumers a new sample is ready
- * @vdd: Optional external voltage regulator for the device power supply
  */
 struct msa311_priv {
 	struct regmap *regs;
@@ -362,7 +361,6 @@ struct msa311_priv {
 	char *chip_name;
 
 	struct iio_trigger *new_data_trig;
-	struct regulator *vdd;
 };
 
 enum msa311_si {
@@ -595,24 +593,22 @@ static int msa311_read_raw_data(struct iio_dev *indio_dev,
 	__le16 axis;
 	int err;
 
-	err = iio_device_claim_direct_mode(indio_dev);
+	err = pm_runtime_resume_and_get(dev);
 	if (err)
 		return err;
 
-	err = pm_runtime_resume_and_get(dev);
-	if (err) {
-		iio_device_release_direct_mode(indio_dev);
+	err = iio_device_claim_direct_mode(indio_dev);
+	if (err)
 		return err;
-	}
 
 	mutex_lock(&msa311->lock);
 	err = msa311_get_axis(msa311, chan, &axis);
 	mutex_unlock(&msa311->lock);
 
+	iio_device_release_direct_mode(indio_dev);
+
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
-
-	iio_device_release_direct_mode(indio_dev);
 
 	if (err) {
 		dev_err(dev, "can't get axis %s (%pe)\n",
@@ -759,6 +755,10 @@ static int msa311_write_samp_freq(struct iio_dev *indio_dev, int val, int val2)
 	unsigned int odr;
 	int err;
 
+	err = pm_runtime_resume_and_get(dev);
+	if (err)
+		return err;
+
 	/*
 	 * Sampling frequency changing is prohibited when buffer mode is
 	 * enabled, because sometimes MSA311 chip returns outliers during
@@ -767,12 +767,6 @@ static int msa311_write_samp_freq(struct iio_dev *indio_dev, int val, int val2)
 	err = iio_device_claim_direct_mode(indio_dev);
 	if (err)
 		return err;
-
-	err = pm_runtime_resume_and_get(dev);
-	if (err) {
-		iio_device_release_direct_mode(indio_dev);
-		return err;
-	}
 
 	err = -EINVAL;
 	for (odr = 0; odr < ARRAY_SIZE(msa311_odr_table); odr++)
@@ -784,10 +778,10 @@ static int msa311_write_samp_freq(struct iio_dev *indio_dev, int val, int val2)
 			break;
 		}
 
+	iio_device_release_direct_mode(indio_dev);
+
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
-
-	iio_device_release_direct_mode(indio_dev);
 
 	if (err)
 		dev_err(dev, "can't update frequency (%pe)\n", ERR_PTR(err));
@@ -957,7 +951,7 @@ static irqreturn_t msa311_irq_thread(int irq, void *p)
 	}
 
 	if (new_data_int_enabled)
-		iio_trigger_poll_chained(msa311->new_data_trig);
+		iio_trigger_poll_nested(msa311->new_data_trig);
 
 	return IRQ_HANDLED;
 }
@@ -1150,11 +1144,6 @@ static void msa311_powerdown(void *msa311)
 	msa311_set_pwr_mode(msa311, MSA311_PWR_MODE_SUSPEND);
 }
 
-static void msa311_vdd_disable(void *vdd)
-{
-	regulator_disable(vdd);
-}
-
 static int msa311_probe(struct i2c_client *i2c)
 {
 	struct device *dev = &i2c->dev;
@@ -1177,19 +1166,9 @@ static int msa311_probe(struct i2c_client *i2c)
 
 	mutex_init(&msa311->lock);
 
-	msa311->vdd = devm_regulator_get(dev, "vdd");
-	if (IS_ERR(msa311->vdd))
-		return dev_err_probe(dev, PTR_ERR(msa311->vdd),
-				     "can't get vdd supply\n");
-
-	err = regulator_enable(msa311->vdd);
+	err = devm_regulator_get_enable(dev, "vdd");
 	if (err)
-		return dev_err_probe(dev, err, "can't enable vdd supply\n");
-
-	err = devm_add_action_or_reset(dev, msa311_vdd_disable, msa311->vdd);
-	if (err)
-		return dev_err_probe(dev, err,
-				     "can't add vdd disable action\n");
+		return dev_err_probe(dev, err, "can't get vdd supply\n");
 
 	err = msa311_check_partid(msa311);
 	if (err)
@@ -1315,7 +1294,7 @@ static struct i2c_driver msa311_driver = {
 		.of_match_table = msa311_of_match,
 		.pm = pm_ptr(&msa311_pm_ops),
 	},
-	.probe_new	= msa311_probe,
+	.probe		= msa311_probe,
 	.id_table	= msa311_i2c_id,
 };
 module_i2c_driver(msa311_driver);

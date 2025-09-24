@@ -17,7 +17,7 @@
 #include <linux/kexec.h>
 #include <linux/of_fdt.h>
 #include <linux/libfdt.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/memblock.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -26,6 +26,10 @@
 #include <asm/firmware.h>
 #include <asm/kexec_ranges.h>
 #include <asm/crashdump-ppc64.h>
+#include <asm/mmzone.h>
+#include <asm/iommu.h>
+#include <asm/prom.h>
+#include <asm/plpks.h>
 
 struct umem_info {
 	u64 *buf;		/* data buffer for usable-memory property */
@@ -35,7 +39,7 @@ struct umem_info {
 
 	/* usable memory ranges to look up */
 	unsigned int nr_ranges;
-	const struct crash_mem_range *ranges;
+	const struct range *ranges;
 };
 
 const struct kexec_file_ops * const kexec_file_loaders[] = {
@@ -687,7 +691,8 @@ static int update_usable_mem_fdt(void *fdt, struct crash_mem *usable_mem)
 		ret = fdt_setprop(fdt, node, "linux,drconf-usable-memory",
 				  um_info.buf, (um_info.idx * sizeof(u64)));
 		if (ret) {
-			pr_err("Failed to update fdt with linux,drconf-usable-memory property");
+			pr_err("Failed to update fdt with linux,drconf-usable-memory property: %s",
+			       fdt_strerror(ret));
 			goto out;
 		}
 	}
@@ -934,6 +939,45 @@ out:
 }
 
 /**
+ * cpu_node_size - Compute the size of a CPU node in the FDT.
+ *                 This should be done only once and the value is stored in
+ *                 a static variable.
+ * Returns the max size of a CPU node in the FDT.
+ */
+static unsigned int cpu_node_size(void)
+{
+	static unsigned int size;
+	struct device_node *dn;
+	struct property *pp;
+
+	/*
+	 * Don't compute it twice, we are assuming that the per CPU node size
+	 * doesn't change during the system's life.
+	 */
+	if (size)
+		return size;
+
+	dn = of_find_node_by_type(NULL, "cpu");
+	if (WARN_ON_ONCE(!dn)) {
+		// Unlikely to happen
+		return 0;
+	}
+
+	/*
+	 * We compute the sub node size for a CPU node, assuming it
+	 * will be the same for all.
+	 */
+	size += strlen(dn->name) + 5;
+	for_each_property_of_node(dn, pp) {
+		size += strlen(pp->name);
+		size += pp->length;
+	}
+
+	of_node_put(dn);
+	return size;
+}
+
+/**
  * kexec_extra_fdt_size_ppc64 - Return the estimated additional size needed to
  *                              setup FDT for kexec/kdump kernel.
  * @image:                      kexec image being loaded.
@@ -942,19 +986,129 @@ out:
  */
 unsigned int kexec_extra_fdt_size_ppc64(struct kimage *image)
 {
+	unsigned int cpu_nodes, extra_size = 0;
+	struct device_node *dn;
 	u64 usm_entries;
 
+	// Budget some space for the password blob. There's already extra space
+	// for the key name
+	if (plpks_is_available())
+		extra_size += (unsigned int)plpks_get_passwordlen();
+
 	if (image->type != KEXEC_TYPE_CRASH)
-		return 0;
+		return extra_size;
 
 	/*
 	 * For kdump kernel, account for linux,usable-memory and
 	 * linux,drconf-usable-memory properties. Get an approximate on the
 	 * number of usable memory entries and use for FDT size estimation.
 	 */
-	usm_entries = ((memblock_end_of_DRAM() / drmem_lmb_size()) +
-		       (2 * (resource_size(&crashk_res) / drmem_lmb_size())));
-	return (unsigned int)(usm_entries * sizeof(u64));
+	if (drmem_lmb_size()) {
+		usm_entries = ((memory_hotplug_max() / drmem_lmb_size()) +
+			       (2 * (resource_size(&crashk_res) / drmem_lmb_size())));
+		extra_size += (unsigned int)(usm_entries * sizeof(u64));
+	}
+
+	/*
+	 * Get the number of CPU nodes in the current DT. This allows to
+	 * reserve places for CPU nodes added since the boot time.
+	 */
+	cpu_nodes = 0;
+	for_each_node_by_type(dn, "cpu") {
+		cpu_nodes++;
+	}
+
+	if (cpu_nodes > boot_cpu_node_count)
+		extra_size += (cpu_nodes - boot_cpu_node_count) * cpu_node_size();
+
+	return extra_size;
+}
+
+/**
+ * add_node_props - Reads node properties from device node structure and add
+ *                  them to fdt.
+ * @fdt:            Flattened device tree of the kernel
+ * @node_offset:    offset of the node to add a property at
+ * @dn:             device node pointer
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+static int add_node_props(void *fdt, int node_offset, const struct device_node *dn)
+{
+	int ret = 0;
+	struct property *pp;
+
+	if (!dn)
+		return -EINVAL;
+
+	for_each_property_of_node(dn, pp) {
+		ret = fdt_setprop(fdt, node_offset, pp->name, pp->value, pp->length);
+		if (ret < 0) {
+			pr_err("Unable to add %s property: %s\n", pp->name, fdt_strerror(ret));
+			return ret;
+		}
+	}
+	return ret;
+}
+
+/**
+ * update_cpus_node - Update cpus node of flattened device tree using of_root
+ *                    device node.
+ * @fdt:              Flattened device tree of the kernel.
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+static int update_cpus_node(void *fdt)
+{
+	struct device_node *cpus_node, *dn;
+	int cpus_offset, cpus_subnode_offset, ret = 0;
+
+	cpus_offset = fdt_path_offset(fdt, "/cpus");
+	if (cpus_offset < 0 && cpus_offset != -FDT_ERR_NOTFOUND) {
+		pr_err("Malformed device tree: error reading /cpus node: %s\n",
+		       fdt_strerror(cpus_offset));
+		return cpus_offset;
+	}
+
+	if (cpus_offset > 0) {
+		ret = fdt_del_node(fdt, cpus_offset);
+		if (ret < 0) {
+			pr_err("Error deleting /cpus node: %s\n", fdt_strerror(ret));
+			return -EINVAL;
+		}
+	}
+
+	/* Add cpus node to fdt */
+	cpus_offset = fdt_add_subnode(fdt, fdt_path_offset(fdt, "/"), "cpus");
+	if (cpus_offset < 0) {
+		pr_err("Error creating /cpus node: %s\n", fdt_strerror(cpus_offset));
+		return -EINVAL;
+	}
+
+	/* Add cpus node properties */
+	cpus_node = of_find_node_by_path("/cpus");
+	ret = add_node_props(fdt, cpus_offset, cpus_node);
+	of_node_put(cpus_node);
+	if (ret < 0)
+		return ret;
+
+	/* Loop through all subnodes of cpus and add them to fdt */
+	for_each_node_by_type(dn, "cpu") {
+		cpus_subnode_offset = fdt_add_subnode(fdt, cpus_offset, dn->full_name);
+		if (cpus_subnode_offset < 0) {
+			pr_err("Unable to add %s subnode: %s\n", dn->full_name,
+			       fdt_strerror(cpus_subnode_offset));
+			ret = cpus_subnode_offset;
+			goto out;
+		}
+
+		ret = add_node_props(fdt, cpus_subnode_offset, dn);
+		if (ret < 0)
+			goto out;
+	}
+out:
+	of_node_put(dn);
+	return ret;
 }
 
 static int copy_property(void *fdt, int node_offset, const struct device_node *dn,
@@ -1060,8 +1214,6 @@ int setup_new_fdt_ppc64(const struct kimage *image, void *fdt,
 	if (ret < 0)
 		goto out;
 
-#define DIRECT64_PROPNAME "linux,direct64-ddr-window-info"
-#define DMA64_PROPNAME "linux,dma64-ddr-window-info"
 	ret = update_pci_dma_nodes(fdt, DIRECT64_PROPNAME);
 	if (ret < 0)
 		goto out;
@@ -1069,8 +1221,6 @@ int setup_new_fdt_ppc64(const struct kimage *image, void *fdt,
 	ret = update_pci_dma_nodes(fdt, DMA64_PROPNAME);
 	if (ret < 0)
 		goto out;
-#undef DMA64_PROPNAME
-#undef DIRECT64_PROPNAME
 
 	/* Update memory reserve map */
 	ret = get_reserved_memory_ranges(&rmem);
@@ -1090,6 +1240,10 @@ int setup_new_fdt_ppc64(const struct kimage *image, void *fdt,
 			goto out;
 		}
 	}
+
+	// If we have PLPKS active, we need to provide the password to the new kernel
+	if (plpks_is_available())
+		ret = plpks_populate_fdt(fdt);
 
 out:
 	kfree(rmem);

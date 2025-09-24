@@ -69,6 +69,20 @@ struct fuse_forget_link {
 	struct fuse_forget_link *next;
 };
 
+
+/* Submount lookup tracking */
+struct fuse_submount_lookup {
+	/** Refcount */
+	refcount_t count;
+
+	/** Unique ID, which identifies the inode between userspace
+	 * and kernel */
+	u64 nodeid;
+
+	/** The request used for sending the FORGET message */
+	struct fuse_forget_link *forget;
+};
+
 /** FUSE specific dentry data */
 #if BITS_PER_LONG < 64 || defined(CONFIG_FUSE_BPF)
 struct fuse_dentry {
@@ -106,19 +120,6 @@ static inline void get_fuse_backing_path(const struct dentry *d,
 	path_get(path);
 }
 #endif
-
-/* Submount lookup tracking */
-struct fuse_submount_lookup {
-	/** Refcount */
-	refcount_t count;
-
-	/** Unique ID, which identifies the inode between userspace
-	 * and kernel */
-	u64 nodeid;
-
-	/** The request used for sending the FORGET message */
-	struct fuse_forget_link *forget;
-};
 
 /** FUSE inode */
 struct fuse_inode {
@@ -158,6 +159,9 @@ struct fuse_inode {
 	/** The sticky bit in inode->i_mode may have been removed, so
 	    preserve the original mode */
 	umode_t orig_i_mode;
+
+	/* Cache birthtime */
+	struct timespec64 i_btime;
 
 	/** 64 bit inode number */
 	u64 orig_ino;
@@ -240,6 +244,8 @@ enum {
 	FUSE_I_SIZE_UNSTABLE,
 	/* Bad inode */
 	FUSE_I_BAD,
+	/* Has btime */
+	FUSE_I_BTIME,
 };
 
 struct fuse_conn;
@@ -814,9 +820,6 @@ struct fuse_conn {
 	/** Is bmap not implemented by fs? */
 	unsigned no_bmap:1;
 
-	/** Is dentry_canonical_path not implemented by fs? */
-	unsigned no_dentry_canonical_path:1;
-
 	/** Is poll not implemented by fs? */
 	unsigned no_poll:1;
 
@@ -889,11 +892,20 @@ struct fuse_conn {
 	/* Initialize security xattrs when creating a new inode */
 	unsigned int init_security:1;
 
+	/* Add supplementary group info when creating a new inode */
+	unsigned int create_supp_group:1;
+
 	/* Does the filesystem support per inode DAX? */
 	unsigned int inode_dax:1;
 
 	/* Is tmpfile not implemented by fs? */
 	unsigned int no_tmpfile:1;
+
+	/* Relax restrictions to allow shared mmap in FOPEN_DIRECT_IO mode */
+	unsigned int direct_io_allow_mmap:1;
+
+	/* Is statx not implemented by fs? */
+	unsigned int no_statx:1;
 
 	/** BPF Only, no Daemon running */
 	unsigned int no_daemon:1;
@@ -1173,9 +1185,11 @@ void fuse_init_symlink(struct inode *inode);
  * Change attributes of an inode
  */
 void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+			    struct fuse_statx *sx,
 			    u64 attr_valid, u64 attr_version);
 
 void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
+				   struct fuse_statx *sx,
 				   u64 attr_valid, u32 cache_mask);
 
 u32 fuse_get_cache_mask(struct inode *inode);
@@ -1226,8 +1240,14 @@ void fuse_invalidate_entry_cache(struct dentry *entry);
 
 void fuse_invalidate_atime(struct inode *inode);
 
+static u64 fuse_time_to_jiffies(u64 sec, u32 nsec);
+#define ATTR_TIMEOUT(o) \
+	fuse_time_to_jiffies((o)->attr_valid, (o)->attr_valid_nsec)
+
+
 u64 entry_attr_timeout(struct fuse_entry_out *o);
 void fuse_init_dentry_root(struct dentry *root, struct file *backing_dir);
+
 void fuse_change_entry_timeout(struct dentry *entry, struct fuse_entry_out *o);
 
 /**
@@ -1300,7 +1320,7 @@ bool fuse_invalid_attr(struct fuse_attr *attr);
 /**
  * Is current process allowed to perform filesystem operation?
  */
-int fuse_allow_current_process(struct fuse_conn *fc);
+bool fuse_allow_current_process(struct fuse_conn *fc);
 
 u64 fuse_lock_owner_id(struct fuse_conn *fc, fl_owner_t id);
 
@@ -1385,12 +1405,12 @@ ssize_t fuse_getxattr(struct inode *inode, const char *name, void *value,
 ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size);
 int fuse_removexattr(struct inode *inode, const char *name);
 extern const struct xattr_handler *fuse_xattr_handlers[];
-extern const struct xattr_handler *fuse_acl_xattr_handlers[];
-extern const struct xattr_handler *fuse_no_acl_xattr_handlers[];
 
 struct posix_acl;
-struct posix_acl *fuse_get_acl(struct inode *inode, int type, bool rcu);
-int fuse_set_acl(struct user_namespace *mnt_userns, struct inode *inode,
+struct posix_acl *fuse_get_inode_acl(struct inode *inode, int type, bool rcu);
+struct posix_acl *fuse_get_acl(struct mnt_idmap *idmap,
+			       struct dentry *dentry, int type);
+int fuse_set_acl(struct mnt_idmap *, struct dentry *dentry,
 		 struct posix_acl *acl, int type);
 
 /* readdir.c */
@@ -1430,7 +1450,7 @@ long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 long fuse_file_compat_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg);
 int fuse_fileattr_get(struct dentry *dentry, struct fileattr *fa);
-int fuse_fileattr_set(struct user_namespace *mnt_userns,
+int fuse_fileattr_set(struct mnt_idmap *idmap,
 		      struct dentry *dentry, struct fileattr *fa);
 
 /* file.c */
@@ -1448,6 +1468,11 @@ int fuse_passthrough_setup(struct fuse_conn *fc, struct fuse_file *ff,
 void fuse_passthrough_release(struct fuse_passthrough *passthrough);
 ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *to);
 ssize_t fuse_passthrough_write_iter(struct kiocb *iocb, struct iov_iter *from);
+ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
+				     struct pipe_inode_info *pipe,
+				     size_t len, unsigned int flags);
+ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
+		struct file *out, loff_t *ppos, size_t len, unsigned int flags);
 ssize_t fuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma);
 
 /* backing.c */
@@ -1690,6 +1715,11 @@ int fuse_file_write_iter_backing(struct fuse_bpf_args *fa,
 void *fuse_file_write_iter_finalize(struct fuse_bpf_args *fa,
 		struct kiocb *iocb, struct iov_iter *from);
 
+ssize_t fuse_splice_read_backing(struct file *in, loff_t *ppos,
+		struct pipe_inode_info *pipe, size_t len, unsigned long flags);
+ssize_t fuse_splice_write_backing(struct pipe_inode_info *pipe,
+		struct file *out, loff_t *ppos, size_t len, unsigned long flags);
+
 long fuse_backing_ioctl(struct file *file, unsigned int command, unsigned long arg, int flags);
 
 int fuse_file_flock_backing(struct file *file, int cmd, struct file_lock *fl);
@@ -1813,7 +1843,7 @@ void *fuse_access_finalize(struct fuse_bpf_args *fa, struct inode *inode, int ma
 /*
  * Calculate the time in jiffies until a dentry/attributes are valid
  */
-static inline u64 time_to_jiffies(u64 sec, u32 nsec)
+inline u64 fuse_time_to_jiffies(u64 sec, u32 nsec)
 {
 	if (sec || nsec) {
 		struct timespec64 ts = {
@@ -1828,7 +1858,7 @@ static inline u64 time_to_jiffies(u64 sec, u32 nsec)
 
 static inline u64 attr_timeout(struct fuse_attr_out *o)
 {
-	return time_to_jiffies(o->attr_valid, o->attr_valid_nsec);
+	return fuse_time_to_jiffies(o->attr_valid, o->attr_valid_nsec);
 }
 
 static inline bool update_mtime(unsigned int ivalid, bool trust_local_mtime)
@@ -1896,8 +1926,8 @@ static inline int finalize_attr(struct inode *inode, struct fuse_attr_out *outar
 		fuse_make_bad(inode);
 		err = -EIO;
 	} else {
-		fuse_change_attributes(inode, &outarg->attr,
-				       attr_timeout(outarg),
+		fuse_change_attributes(inode, &outarg->attr, NULL,
+				       ATTR_TIMEOUT(outarg),
 				       attr_version);
 		if (stat)
 			fuse_fillattr(inode, &outarg->attr, stat);

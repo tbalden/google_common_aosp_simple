@@ -22,6 +22,7 @@
 MODULE_AUTHOR("Tigran Aivazian <aivazian.tigran@gmail.com>");
 MODULE_DESCRIPTION("SCO UnixWare BFS filesystem for Linux");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
 
 #undef DEBUG
 
@@ -82,10 +83,9 @@ struct inode *bfs_iget(struct super_block *sb, unsigned long ino)
 	inode->i_blocks = BFS_FILEBLOCKS(di);
 	inode->i_atime.tv_sec =  le32_to_cpu(di->i_atime);
 	inode->i_mtime.tv_sec =  le32_to_cpu(di->i_mtime);
-	inode->i_ctime.tv_sec =  le32_to_cpu(di->i_ctime);
+	inode_set_ctime(inode, le32_to_cpu(di->i_ctime), 0);
 	inode->i_atime.tv_nsec = 0;
 	inode->i_mtime.tv_nsec = 0;
-	inode->i_ctime.tv_nsec = 0;
 
 	brelse(bh);
 	unlock_new_inode(inode);
@@ -143,7 +143,7 @@ static int bfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	di->i_nlink = cpu_to_le32(inode->i_nlink);
 	di->i_atime = cpu_to_le32(inode->i_atime.tv_sec);
 	di->i_mtime = cpu_to_le32(inode->i_mtime.tv_sec);
-	di->i_ctime = cpu_to_le32(inode->i_ctime.tv_sec);
+	di->i_ctime = cpu_to_le32(inode_get_ctime(inode).tv_sec);
 	i_sblock = BFS_I(inode)->i_sblock;
 	di->i_sblock = cpu_to_le32(i_sblock);
 	di->i_eblock = cpu_to_le32(BFS_I(inode)->i_eblock);

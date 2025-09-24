@@ -62,7 +62,7 @@ void chroot_fs_refs(const struct path *old_root, const struct path *new_root)
 	int count = 0;
 
 	read_lock(&tasklist_lock);
-	do_each_thread(g, p) {
+	for_each_process_thread(g, p) {
 		task_lock(p);
 		fs = p->fs;
 		if (fs) {
@@ -79,7 +79,7 @@ void chroot_fs_refs(const struct path *old_root, const struct path *new_root)
 			spin_unlock(&fs->lock);
 		}
 		task_unlock(p);
-	} while_each_thread(g, p);
+	}
 	read_unlock(&tasklist_lock);
 	while (count--)
 		path_put(old_root);
@@ -91,6 +91,7 @@ void free_fs_struct(struct fs_struct *fs)
 	path_put(&fs->pwd);
 	kmem_cache_free(fs_cachep, fs);
 }
+EXPORT_SYMBOL_NS_GPL(free_fs_struct, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 void exit_fs(struct task_struct *tsk)
 {
@@ -129,6 +130,7 @@ struct fs_struct *copy_fs_struct(struct fs_struct *old)
 	}
 	return fs;
 }
+EXPORT_SYMBOL_NS_GPL(copy_fs_struct, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 int unshare_fs_struct(void)
 {

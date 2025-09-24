@@ -13,7 +13,6 @@
 #include <linux/sizes.h>
 #include <linux/interrupt.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 
 #include "edac_module.h"
 

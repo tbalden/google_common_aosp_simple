@@ -11,6 +11,9 @@
 #include <linux/mm.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
+#include <linux/swap_cgroup.h>
 #include <linux/tracepoint-defs.h>
 
 struct folio_batch;
@@ -24,7 +27,7 @@ struct folio_batch;
 #define GFP_RECLAIM_MASK (__GFP_RECLAIM|__GFP_HIGH|__GFP_IO|__GFP_FS|\
 			__GFP_NOWARN|__GFP_RETRY_MAYFAIL|__GFP_NOFAIL|\
 			__GFP_NORETRY|__GFP_MEMALLOC|__GFP_NOMEMALLOC|\
-			__GFP_ATOMIC|__GFP_NOLOCKDEP)
+			__GFP_NOLOCKDEP)
 
 /* The GFP flags allowed during early boot */
 #define GFP_BOOT_MASK (__GFP_BITS_MASK & ~(__GFP_RECLAIM|__GFP_IO|__GFP_FS))
@@ -40,7 +43,7 @@ struct folio_batch;
  * when we specify __GFP_NOWARN.
  */
 #define WARN_ON_ONCE_GFP(cond, gfp)	({				\
-	static bool __section(".data.once") __warned;			\
+	static bool __section(".data..once") __warned;			\
 	int __ret_warn_once = !!(cond);					\
 									\
 	if (unlikely(!(gfp & __GFP_NOWARN) && __ret_warn_once && !__warned)) { \
@@ -53,6 +56,243 @@ struct folio_batch;
 void page_writeback_init(void);
 
 /*
+ * If a 16GB hugetlb folio were mapped by PTEs of all of its 4kB pages,
+ * its nr_pages_mapped would be 0x400000: choose the ENTIRELY_MAPPED bit
+ * above that range, instead of 2*(PMD_SIZE/PAGE_SIZE).  Hugetlb currently
+ * leaves nr_pages_mapped at 0, but avoid surprise if it participates later.
+ */
+#define ENTIRELY_MAPPED		0x800000
+#define FOLIO_PAGES_MAPPED	(ENTIRELY_MAPPED - 1)
+
+/*
+ * Flags passed to __show_mem() and show_free_areas() to suppress output in
+ * various contexts.
+ */
+#define SHOW_MEM_FILTER_NODES		(0x0001u)	/* disallowed nodes */
+
+/*
+ * How many individual pages have an elevated _mapcount.  Excludes
+ * the folio's entire_mapcount.
+ */
+static inline int folio_nr_pages_mapped(struct folio *folio)
+{
+	return atomic_read(&folio->_nr_pages_mapped) & FOLIO_PAGES_MAPPED;
+}
+
+/*
+ * Retrieve the first entry of a folio based on a provided entry within the
+ * folio. We cannot rely on folio->swap as there is no guarantee that it has
+ * been initialized. Used for calling arch_swap_restore()
+ */
+static inline swp_entry_t folio_swap(swp_entry_t entry, struct folio *folio)
+{
+	swp_entry_t swap = {
+		.val = ALIGN_DOWN(entry.val, folio_nr_pages(folio)),
+	};
+
+	return swap;
+}
+
+static inline void *folio_raw_mapping(struct folio *folio)
+{
+	unsigned long mapping = (unsigned long)folio->mapping;
+
+	return (void *)(mapping & ~PAGE_MAPPING_FLAGS);
+}
+
+#ifdef CONFIG_MMU
+
+/* Flags for folio_pte_batch(). */
+typedef int __bitwise fpb_t;
+
+/* Compare PTEs after pte_mkclean(), ignoring the dirty bit. */
+#define FPB_IGNORE_DIRTY		((__force fpb_t)BIT(0))
+
+/* Compare PTEs after pte_clear_soft_dirty(), ignoring the soft-dirty bit. */
+#define FPB_IGNORE_SOFT_DIRTY		((__force fpb_t)BIT(1))
+
+static inline pte_t __pte_batch_clear_ignored(pte_t pte, fpb_t flags)
+{
+	if (flags & FPB_IGNORE_DIRTY)
+		pte = pte_mkclean(pte);
+	if (likely(flags & FPB_IGNORE_SOFT_DIRTY))
+		pte = pte_clear_soft_dirty(pte);
+	return pte_wrprotect(pte_mkold(pte));
+}
+
+/**
+ * folio_pte_batch - detect a PTE batch for a large folio
+ * @folio: The large folio to detect a PTE batch for.
+ * @addr: The user virtual address the first page is mapped at.
+ * @start_ptep: Page table pointer for the first entry.
+ * @pte: Page table entry for the first page.
+ * @max_nr: The maximum number of table entries to consider.
+ * @flags: Flags to modify the PTE batch semantics.
+ * @any_writable: Optional pointer to indicate whether any entry except the
+ *		  first one is writable.
+ * @any_young: Optional pointer to indicate whether any entry except the
+ *		  first one is young.
+ * @any_dirty: Optional pointer to indicate whether any entry except the
+ *		  first one is dirty.
+ *
+ * Detect a PTE batch: consecutive (present) PTEs that map consecutive
+ * pages of the same large folio.
+ *
+ * All PTEs inside a PTE batch have the same PTE bits set, excluding the PFN,
+ * the accessed bit, writable bit, dirty bit (with FPB_IGNORE_DIRTY) and
+ * soft-dirty bit (with FPB_IGNORE_SOFT_DIRTY).
+ *
+ * start_ptep must map any page of the folio. max_nr must be at least one and
+ * must be limited by the caller so scanning cannot exceed a single page table.
+ *
+ * Return: the number of table entries in the batch.
+ */
+static inline int folio_pte_batch(struct folio *folio, unsigned long addr,
+		pte_t *start_ptep, pte_t pte, int max_nr, fpb_t flags,
+		bool *any_writable, bool *any_young, bool *any_dirty)
+{
+	unsigned long folio_end_pfn = folio_pfn(folio) + folio_nr_pages(folio);
+	const pte_t *end_ptep = start_ptep + max_nr;
+	pte_t expected_pte, *ptep;
+	bool writable, young, dirty;
+	int nr;
+
+	if (any_writable)
+		*any_writable = false;
+	if (any_young)
+		*any_young = false;
+	if (any_dirty)
+		*any_dirty = false;
+
+	VM_WARN_ON_FOLIO(!pte_present(pte), folio);
+	VM_WARN_ON_FOLIO(!folio_test_large(folio) || max_nr < 1, folio);
+	VM_WARN_ON_FOLIO(page_folio(pfn_to_page(pte_pfn(pte))) != folio, folio);
+
+	nr = pte_batch_hint(start_ptep, pte);
+	expected_pte = __pte_batch_clear_ignored(pte_advance_pfn(pte, nr), flags);
+	ptep = start_ptep + nr;
+
+	while (ptep < end_ptep) {
+		pte = ptep_get(ptep);
+		if (any_writable)
+			writable = !!pte_write(pte);
+		if (any_young)
+			young = !!pte_young(pte);
+		if (any_dirty)
+			dirty = !!pte_dirty(pte);
+		pte = __pte_batch_clear_ignored(pte, flags);
+
+		if (!pte_same(pte, expected_pte))
+			break;
+
+		/*
+		 * Stop immediately once we reached the end of the folio. In
+		 * corner cases the next PFN might fall into a different
+		 * folio.
+		 */
+		if (pte_pfn(pte) >= folio_end_pfn)
+			break;
+
+		if (any_writable)
+			*any_writable |= writable;
+		if (any_young)
+			*any_young |= young;
+		if (any_dirty)
+			*any_dirty |= dirty;
+
+		nr = pte_batch_hint(ptep, pte);
+		expected_pte = pte_advance_pfn(expected_pte, nr);
+		ptep += nr;
+	}
+
+	return min(ptep - start_ptep, max_nr);
+}
+
+/**
+ * pte_move_swp_offset - Move the swap entry offset field of a swap pte
+ *	 forward or backward by delta
+ * @pte: The initial pte state; is_swap_pte(pte) must be true and
+ *	 non_swap_entry() must be false.
+ * @delta: The direction and the offset we are moving; forward if delta
+ *	 is positive; backward if delta is negative
+ *
+ * Moves the swap offset, while maintaining all other fields, including
+ * swap type, and any swp pte bits. The resulting pte is returned.
+ */
+static inline pte_t pte_move_swp_offset(pte_t pte, long delta)
+{
+	swp_entry_t entry = pte_to_swp_entry(pte);
+	pte_t new = __swp_entry_to_pte(__swp_entry(swp_type(entry),
+						   (swp_offset(entry) + delta)));
+
+	if (pte_swp_soft_dirty(pte))
+		new = pte_swp_mksoft_dirty(new);
+	if (pte_swp_exclusive(pte))
+		new = pte_swp_mkexclusive(new);
+	if (pte_swp_uffd_wp(pte))
+		new = pte_swp_mkuffd_wp(new);
+
+	return new;
+}
+
+
+/**
+ * pte_next_swp_offset - Increment the swap entry offset field of a swap pte.
+ * @pte: The initial pte state; is_swap_pte(pte) must be true and
+ *	 non_swap_entry() must be false.
+ *
+ * Increments the swap offset, while maintaining all other fields, including
+ * swap type, and any swp pte bits. The resulting pte is returned.
+ */
+static inline pte_t pte_next_swp_offset(pte_t pte)
+{
+	return pte_move_swp_offset(pte, 1);
+}
+
+/**
+ * swap_pte_batch - detect a PTE batch for a set of contiguous swap entries
+ * @start_ptep: Page table pointer for the first entry.
+ * @max_nr: The maximum number of table entries to consider.
+ * @pte: Page table entry for the first entry.
+ *
+ * Detect a batch of contiguous swap entries: consecutive (non-present) PTEs
+ * containing swap entries all with consecutive offsets and targeting the same
+ * swap type, all with matching swp pte bits.
+ *
+ * max_nr must be at least one and must be limited by the caller so scanning
+ * cannot exceed a single page table.
+ *
+ * Return: the number of table entries in the batch.
+ */
+static inline int swap_pte_batch(pte_t *start_ptep, int max_nr, pte_t pte)
+{
+	pte_t expected_pte = pte_next_swp_offset(pte);
+	const pte_t *end_ptep = start_ptep + max_nr;
+	swp_entry_t entry = pte_to_swp_entry(pte);
+	pte_t *ptep = start_ptep + 1;
+	unsigned short cgroup_id;
+
+	VM_WARN_ON(max_nr < 1);
+	VM_WARN_ON(!is_swap_pte(pte));
+	VM_WARN_ON(non_swap_entry(entry));
+
+	cgroup_id = lookup_swap_cgroup_id(entry);
+	while (ptep < end_ptep) {
+		pte = ptep_get(ptep);
+
+		if (!pte_same(pte, expected_pte))
+			break;
+		if (lookup_swap_cgroup_id(pte_to_swp_entry(pte)) != cgroup_id)
+			break;
+		expected_pte = pte_next_swp_offset(expected_pte);
+		ptep++;
+	}
+
+	return ptep - start_ptep;
+}
+#endif /* CONFIG_MMU */
+
+/*
  * This is a file-backed mapping, and is about to be memory mapped - invoke its
  * mmap hook and safely handle error conditions. On error, VMA hooks will be
  * mutated.
@@ -62,20 +302,39 @@ void page_writeback_init(void);
  *
  * Returns: 0 if success, error otherwise.
  */
-int mmap_file(struct file *file, struct vm_area_struct *vma);
+static inline int mmap_file(struct file *file, struct vm_area_struct *vma)
+{
+	int err = call_mmap(file, vma);
+
+	if (likely(!err))
+		return 0;
+
+	/*
+	 * OK, we tried to call the file hook for mmap(), but an error
+	 * arose. The mapping is in an inconsistent state and we most not invoke
+	 * any further hooks on it.
+	 */
+	vma->vm_ops = &vma_dummy_vm_ops;
+
+	return err;
+}
 
 /*
  * If the VMA has a close hook then close it, and since closing it might leave
  * it in an inconsistent state which makes the use of any hooks suspect, clear
  * them down by installing dummy empty hooks.
  */
-void vma_close(struct vm_area_struct *vma);
-
-static inline void *folio_raw_mapping(struct folio *folio)
+static inline void vma_close(struct vm_area_struct *vma)
 {
-	unsigned long mapping = (unsigned long)folio->mapping;
+	if (vma->vm_ops && vma->vm_ops->close) {
+		vma->vm_ops->close(vma);
 
-	return (void *)(mapping & ~PAGE_MAPPING_FLAGS);
+		/*
+		 * The mapping is in an inconsistent state, and no further hooks
+		 * may be invoked upon it.
+		 */
+		vma->vm_ops = &vma_dummy_vm_ops;
+	}
 }
 
 void __acct_reclaim_writeback(pg_data_t *pgdat, struct folio *folio,
@@ -98,16 +357,16 @@ static inline void wake_throttle_isolated(pg_data_t *pgdat)
 		wake_up(wqh);
 }
 
+vm_fault_t vmf_anon_prepare(struct vm_fault *vmf);
 vm_fault_t do_swap_page(struct vm_fault *vmf);
 void folio_rotate_reclaimable(struct folio *folio);
 bool __folio_end_writeback(struct folio *folio);
 void deactivate_file_folio(struct folio *folio);
 void folio_activate(struct folio *folio);
 
-void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
+void free_pgtables(struct mmu_gather *tlb, struct ma_state *mas,
 		   struct vm_area_struct *start_vma, unsigned long floor,
-		   unsigned long ceiling, unsigned long start_t,
-		   bool mm_wr_locked);
+		   unsigned long ceiling, bool mm_wr_locked);
 void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte);
 
 struct zap_details;
@@ -126,17 +385,17 @@ static inline void force_page_cache_readahead(struct address_space *mapping,
 	force_page_cache_ra(&ractl, nr_to_read);
 }
 
-unsigned find_lock_entries(struct address_space *mapping, pgoff_t start,
+unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
 		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices);
-unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
+unsigned find_get_entries(struct address_space *mapping, pgoff_t *start,
 		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices);
 void filemap_free_folio(struct address_space *mapping, struct folio *folio);
 int truncate_inode_folio(struct address_space *mapping, struct folio *folio);
 bool truncate_inode_partial_folio(struct folio *folio, loff_t start,
 		loff_t end);
 long invalidate_inode_page(struct page *page);
-unsigned long invalidate_mapping_pagevec(struct address_space *mapping,
-		pgoff_t start, pgoff_t end, unsigned long *nr_pagevec);
+unsigned long mapping_try_invalidate(struct address_space *mapping,
+		pgoff_t start, pgoff_t end, unsigned long *nr_failed);
 
 /**
  * folio_evictable - Test whether a folio is evictable.
@@ -157,17 +416,6 @@ static inline bool folio_evictable(struct folio *folio)
 	rcu_read_lock();
 	ret = !mapping_unevictable(folio_mapping(folio)) &&
 			!folio_test_mlocked(folio);
-	rcu_read_unlock();
-	return ret;
-}
-
-static inline bool page_evictable(struct page *page)
-{
-	bool ret;
-
-	/* Prevent address_space of inode and swap cache from being freed */
-	rcu_read_lock();
-	ret = !mapping_unevictable(page_mapping(page)) && !PageMlocked(page);
 	rcu_read_unlock();
 	return ret;
 }
@@ -203,16 +451,10 @@ extern unsigned long highest_memmap_pfn;
 #define MAX_RECLAIM_RETRIES 16
 
 /*
- * in mm/early_ioremap.c
- */
-pgprot_t __init early_memremap_pgprot_adjust(resource_size_t phys_addr,
-					unsigned long size, pgprot_t prot);
-
-/*
  * in mm/vmscan.c:
  */
-int isolate_lru_page(struct page *page);
-int folio_isolate_lru(struct folio *folio);
+bool isolate_lru_page(struct page *page);
+bool folio_isolate_lru(struct folio *folio);
 void putback_lru_page(struct page *page);
 void folio_putback_lru(struct folio *folio);
 extern void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason);
@@ -225,6 +467,19 @@ pmd_t *mm_find_pmd(struct mm_struct *mm, unsigned long address);
 /*
  * in mm/page_alloc.c
  */
+#define K(x) ((x) << (PAGE_SHIFT-10))
+
+extern char * const zone_names[MAX_NR_ZONES];
+
+/* perform sanity checks on struct pages being allocated or freed */
+DECLARE_STATIC_KEY_MAYBE(CONFIG_DEBUG_VM, check_pages_enabled);
+
+extern int min_free_kbytes;
+
+void setup_per_zone_wmarks(void);
+void calculate_min_free_kbytes(void);
+int __meminit init_per_zone_wmark_min(void);
+void page_alloc_sysctl_init(void);
 
 /*
  * Structure for holding the mostly immutable allocation parameters passed
@@ -384,13 +639,83 @@ static inline struct page *pageblock_pfn_to_page(unsigned long start_pfn,
 	return __pageblock_pfn_to_page(start_pfn, end_pfn, zone);
 }
 
+void set_zone_contiguous(struct zone *zone);
+
+static inline void clear_zone_contiguous(struct zone *zone)
+{
+	zone->contiguous = false;
+}
+
 extern int __isolate_free_page(struct page *page, unsigned int order);
 extern void __putback_isolated_page(struct page *page, unsigned int order,
 				    int mt);
 extern void memblock_free_pages(struct page *page, unsigned long pfn,
 					unsigned int order);
 extern void __free_pages_core(struct page *page, unsigned int order);
+
+/*
+ * This will have no effect, other than possibly generating a warning, if the
+ * caller passes in a non-large folio.
+ */
+static inline void folio_set_order(struct folio *folio, unsigned int order)
+{
+	if (WARN_ON_ONCE(!order || !folio_test_large(folio)))
+		return;
+
+	folio->_flags_1 = (folio->_flags_1 & ~0xffUL) | order;
+#ifdef CONFIG_64BIT
+	folio->_folio_nr_pages = 1U << order;
+#endif
+}
+
+bool __folio_unqueue_deferred_split(struct folio *folio);
+static inline bool folio_unqueue_deferred_split(struct folio *folio)
+{
+	if (folio_order(folio) <= 1 || !folio_test_large_rmappable(folio))
+		return false;
+
+	/*
+	 * At this point, there is no one trying to add the folio to
+	 * deferred_list. If folio is not in deferred_list, it's safe
+	 * to check without acquiring the split_queue_lock.
+	 */
+	if (data_race(list_empty(&folio->_deferred_list)))
+		return false;
+
+	return __folio_unqueue_deferred_split(folio);
+}
+
+static inline struct folio *page_rmappable_folio(struct page *page)
+{
+	struct folio *folio = (struct folio *)page;
+
+	folio_prep_large_rmappable(folio);
+	return folio;
+}
+
+static inline void prep_compound_head(struct page *page, unsigned int order)
+{
+	struct folio *folio = (struct folio *)page;
+
+	folio_set_order(folio, order);
+	atomic_set(&folio->_entire_mapcount, -1);
+	atomic_set(&folio->_nr_pages_mapped, 0);
+	atomic_set(&folio->_pincount, 0);
+	if (order > 1)
+		INIT_LIST_HEAD(&folio->_deferred_list);
+}
+
+static inline void prep_compound_tail(struct page *head, int tail_idx)
+{
+	struct page *p = head + tail_idx;
+
+	p->mapping = TAIL_MAPPING;
+	set_compound_head(p, head);
+	set_page_private(p, 0);
+}
+
 extern void prep_compound_page(struct page *page, unsigned int order);
+
 extern void post_alloc_hook(struct page *page, unsigned int order,
 					gfp_t gfp_flags);
 extern int user_min_free_kbytes;
@@ -401,10 +726,15 @@ extern void free_unref_page_list(struct list_head *list);
 extern void zone_pcp_reset(struct zone *zone);
 extern void zone_pcp_disable(struct zone *zone);
 extern void zone_pcp_enable(struct zone *zone);
+extern void zone_pcp_init(struct zone *zone);
 
 extern void *memmap_alloc(phys_addr_t size, phys_addr_t align,
 			  phys_addr_t min_addr,
 			  int nid, bool exact_nid);
+
+void memmap_init_range(unsigned long, int, unsigned long, unsigned long,
+		unsigned long, enum meminit_context, struct vmem_altmap *, int);
+
 
 int split_free_page(struct page *free_page,
 			unsigned int order, unsigned long split_pfn_offset);
@@ -453,7 +783,11 @@ struct compact_control {
 	bool proactive_compaction;	/* kcompactd proactive compaction */
 	bool whole_zone;		/* Whole zone should/has been scanned */
 	bool contended;			/* Signal lock contention */
-	bool rescan;			/* Rescanning the same pageblock */
+	bool finish_pageblock;		/* Scan the remainder of a pageblock. Used
+					 * when there are potentially transient
+					 * isolation or migration failures to
+					 * ensure forward progress.
+					 */
 	bool alloc_contig;		/* alloc_contig_range allocation */
 };
 
@@ -477,9 +811,18 @@ int __alloc_contig_migrate_range(struct compact_control *cc,
 					unsigned long start, unsigned long end,
 					int migratetype);
 
-#endif
+/* Free whole pageblock and set its migration type to MIGRATE_CMA. */
+void init_cma_reserved_pageblock(struct page *page);
+
+#endif /* CONFIG_COMPACTION || CONFIG_CMA */
+
 int find_suitable_fallback(struct free_area *area, unsigned int order,
 			int migratetype, bool only_stealable, bool *can_steal);
+
+static inline bool free_area_empty(struct free_area *area, int migratetype)
+{
+	return list_empty(&area->free_list[migratetype]);
+}
 
 /*
  * These three helpers classifies VMAs for virtual memory accounting.
@@ -494,14 +837,14 @@ static inline bool is_exec_mapping(vm_flags_t flags)
 }
 
 /*
- * Stack area - automatically grows in one direction
+ * Stack area (including shadow stacks)
  *
  * VM_GROWSUP / VM_GROWSDOWN VMAs are always private anonymous:
  * do_mmap() forbids all other combinations.
  */
 static inline bool is_stack_mapping(vm_flags_t flags)
 {
-	return (flags & VM_STACK) == VM_STACK;
+	return ((flags & VM_STACK) == VM_STACK) || (flags & VM_SHADOW_STACK);
 }
 
 /*
@@ -519,28 +862,72 @@ struct anon_vma *folio_anon_vma(struct folio *folio);
 void unmap_mapping_folio(struct folio *folio);
 extern long populate_vma_page_range(struct vm_area_struct *vma,
 		unsigned long start, unsigned long end, int *locked);
-extern long faultin_vma_page_range(struct vm_area_struct *vma,
-				   unsigned long start, unsigned long end,
-				   bool write, int *locked);
-extern int mlock_future_check(struct mm_struct *mm, unsigned long flags,
-			      unsigned long len);
+extern long faultin_page_range(struct mm_struct *mm, unsigned long start,
+		unsigned long end, bool write, int *locked);
+extern bool mlock_future_ok(struct mm_struct *mm, unsigned long flags,
+			       unsigned long bytes);
+
 /*
- * mlock_vma_page() and munlock_vma_page():
+ * NOTE: This function can't tell whether the folio is "fully mapped" in the
+ * range.
+ * "fully mapped" means all the pages of folio is associated with the page
+ * table of range while this function just check whether the folio range is
+ * within the range [start, end). Funcation caller nees to do page table
+ * check if it cares about the page table association.
+ *
+ * Typical usage (like mlock or madvise) is:
+ * Caller knows at least 1 page of folio is associated with page table of VMA
+ * and the range [start, end) is intersect with the VMA range. Caller wants
+ * to know whether the folio is fully associated with the range. It calls
+ * this function to check whether the folio is in the range first. Then checks
+ * the page table to know whether the folio is fully mapped to the range.
+ */
+static inline bool
+folio_within_range(struct folio *folio, struct vm_area_struct *vma,
+		unsigned long start, unsigned long end)
+{
+	pgoff_t pgoff, addr;
+	unsigned long vma_pglen = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
+
+	VM_WARN_ON_FOLIO(folio_test_ksm(folio), folio);
+	if (start > end)
+		return false;
+
+	if (start < vma->vm_start)
+		start = vma->vm_start;
+
+	if (end > vma->vm_end)
+		end = vma->vm_end;
+
+	pgoff = folio_pgoff(folio);
+
+	/* if folio start address is not in vma range */
+	if (!in_range(pgoff, vma->vm_pgoff, vma_pglen))
+		return false;
+
+	addr = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+
+	return !(addr < start || end - addr < folio_size(folio));
+}
+
+static inline bool
+folio_within_vma(struct folio *folio, struct vm_area_struct *vma)
+{
+	return folio_within_range(folio, vma, vma->vm_start, vma->vm_end);
+}
+
+/*
+ * mlock_vma_folio() and munlock_vma_folio():
  * should be called with vma's mmap_lock held for read or write,
  * under page table lock for the pte/pmd being added or removed.
  *
- * mlock is usually called at the end of page_add_*_rmap(),
- * munlock at the end of page_remove_rmap(); but new anon
- * pages are managed by lru_cache_add_inactive_or_unevictable()
- * calling mlock_new_page().
- *
- * @compound is used to include pmd mappings of THPs, but filter out
- * pte mappings of THPs, which cannot be consistently counted: a pte
- * mapping of the THP head cannot be distinguished by the page alone.
+ * mlock is usually called at the end of folio_add_*_rmap_*(), munlock at
+ * the end of folio_remove_rmap_*(); but new anon folios are managed by
+ * folio_add_lru_vma() calling mlock_new_folio().
  */
 void mlock_folio(struct folio *folio);
 static inline void mlock_vma_folio(struct folio *folio,
-			struct vm_area_struct *vma, bool compound)
+				struct vm_area_struct *vma)
 {
 	/*
 	 * The VM_SPECIAL check here serves two purposes.
@@ -550,29 +937,31 @@ static inline void mlock_vma_folio(struct folio *folio,
 	 *    file->f_op->mmap() is using vm_insert_page(s), when VM_LOCKED may
 	 *    still be set while VM_SPECIAL bits are added: so ignore it then.
 	 */
-	if (unlikely((vma->vm_flags & (VM_LOCKED|VM_SPECIAL)) == VM_LOCKED) &&
-	    (compound || !folio_test_large(folio)))
+	if (unlikely((vma->vm_flags & (VM_LOCKED|VM_SPECIAL)) == VM_LOCKED))
 		mlock_folio(folio);
 }
 
-static inline void mlock_vma_page(struct page *page,
-			struct vm_area_struct *vma, bool compound)
+void munlock_folio(struct folio *folio);
+static inline void munlock_vma_folio(struct folio *folio,
+					struct vm_area_struct *vma)
 {
-	mlock_vma_folio(page_folio(page), vma, compound);
+	/*
+	 * munlock if the function is called. Ideally, we should only
+	 * do munlock if any page of folio is unmapped from VMA and
+	 * cause folio not fully mapped to VMA.
+	 *
+	 * But it's not easy to confirm that's the situation. So we
+	 * always munlock the folio and page reclaim will correct it
+	 * if it's wrong.
+	 */
+	if (unlikely(vma->vm_flags & VM_LOCKED))
+		munlock_folio(folio);
 }
 
-void munlock_page(struct page *page);
-static inline void munlock_vma_page(struct page *page,
-			struct vm_area_struct *vma, bool compound)
-{
-	if (unlikely(vma->vm_flags & VM_LOCKED) &&
-	    (compound || !PageTransCompound(page)))
-		munlock_page(page);
-}
-void mlock_new_page(struct page *page);
-bool need_mlock_page_drain(int cpu);
-void mlock_page_drain_local(void);
-void mlock_page_drain_remote(int cpu);
+void mlock_new_folio(struct folio *folio);
+bool need_mlock_drain(int cpu);
+void mlock_drain_local(void);
+void mlock_drain_remote(int cpu);
 
 extern pmd_t maybe_pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma);
 
@@ -657,20 +1046,22 @@ static inline struct file *maybe_unlock_mmap_for_io(struct vm_fault *vmf,
 }
 #else /* !CONFIG_MMU */
 static inline void unmap_mapping_folio(struct folio *folio) { }
-static inline void mlock_vma_page(struct page *page,
-			struct vm_area_struct *vma, bool compound) { }
-static inline void munlock_vma_page(struct page *page,
-			struct vm_area_struct *vma, bool compound) { }
-static inline void mlock_new_page(struct page *page) { }
-static inline bool need_mlock_page_drain(int cpu) { return false; }
-static inline void mlock_page_drain_local(void) { }
-static inline void mlock_page_drain_remote(int cpu) { }
+static inline void mlock_new_folio(struct folio *folio) { }
+static inline bool need_mlock_drain(int cpu) { return false; }
+static inline void mlock_drain_local(void) { }
+static inline void mlock_drain_remote(int cpu) { }
 static inline void vunmap_range_noflush(unsigned long start, unsigned long end)
 {
 }
 #endif /* !CONFIG_MMU */
 
 /* Memory initialisation debug and verification */
+#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+DECLARE_STATIC_KEY_TRUE(deferred_pages);
+
+bool __init deferred_grow_zone(struct zone *zone, unsigned int order);
+#endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
+
 enum mminit_level {
 	MMINIT_WARNING,
 	MMINIT_VERIFY,
@@ -741,21 +1132,14 @@ extern u64 hwpoison_filter_flags_value;
 extern u64 hwpoison_filter_memcg;
 extern u32 hwpoison_filter_enable;
 
-#ifdef CONFIG_MEMORY_FAILURE
-void clear_hwpoisoned_pages(struct page *memmap, int nr_pages);
-#else
-static inline void clear_hwpoisoned_pages(struct page *memmap, int nr_pages)
-{
-}
-#endif
-
 extern unsigned long  __must_check vm_mmap_pgoff(struct file *, unsigned long,
         unsigned long, unsigned long,
         unsigned long, unsigned long);
 
 extern void set_pageblock_order(void);
+unsigned long reclaim_pages(struct list_head *folio_list, bool ignore_references);
 unsigned int reclaim_clean_pages_from_list(struct zone *zone,
-					    struct list_head *page_list);
+					    struct list_head *folio_list);
 /* The ALLOC_WMARK bits are used as an index to zone->watermark */
 #define ALLOC_WMARK_MIN		WMARK_MIN
 #define ALLOC_WMARK_LOW		WMARK_LOW
@@ -823,6 +1207,7 @@ static inline void flush_tlb_batched_pending(struct mm_struct *mm)
 #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
 
 extern const struct trace_print_flags pageflag_names[];
+extern const struct trace_print_flags pagetype_names[];
 extern const struct trace_print_flags vmaflag_names[];
 extern const struct trace_print_flags gfpflag_names[];
 
@@ -845,29 +1230,40 @@ struct migration_target_control {
 };
 
 /*
+ * mm/filemap.c
+ */
+size_t splice_folio_into_pipe(struct pipe_inode_info *pipe,
+			      struct folio *folio, loff_t fpos, size_t size);
+
+/*
  * mm/vmalloc.c
  */
 #ifdef CONFIG_MMU
-int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
+void __init vmalloc_init(void);
+int __must_check vmap_pages_range_noflush(unsigned long addr, unsigned long end,
                 pgprot_t prot, struct page **pages, unsigned int page_shift);
 #else
+static inline void vmalloc_init(void)
+{
+}
+
 static inline
-int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
+int __must_check vmap_pages_range_noflush(unsigned long addr, unsigned long end,
                 pgprot_t prot, struct page **pages, unsigned int page_shift)
 {
 	return -EINVAL;
 }
 #endif
 
-int __vmap_pages_range_noflush(unsigned long addr, unsigned long end,
-			       pgprot_t prot, struct page **pages,
-			       unsigned int page_shift);
+int __must_check __vmap_pages_range_noflush(unsigned long addr,
+			       unsigned long end, pgprot_t prot,
+			       struct page **pages, unsigned int page_shift);
 
 void vunmap_range_noflush(unsigned long start, unsigned long end);
 
 void __vunmap_range_noflush(unsigned long start, unsigned long end);
 
-int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
+int numa_migrate_prep(struct folio *folio, struct vm_area_struct *vma,
 		      unsigned long addr, int page_nid, int *flags);
 
 void free_zone_device_page(struct page *page);
@@ -876,9 +1272,114 @@ int migrate_device_coherent_page(struct page *page);
 /*
  * mm/gup.c
  */
-struct folio *try_grab_folio(struct page *page, int refs, unsigned int flags);
+int __must_check try_grab_folio(struct folio *folio, int refs,
+				unsigned int flags);
+
+/*
+ * mm/huge_memory.c
+ */
+struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
+				   unsigned long addr, pmd_t *pmd,
+				   unsigned int flags);
+
+enum {
+	/* mark page accessed */
+	FOLL_TOUCH = 1 << 16,
+	/* a retry, previous pass started an IO */
+	FOLL_TRIED = 1 << 17,
+	/* we are working on non-current tsk/mm */
+	FOLL_REMOTE = 1 << 18,
+	/* pages must be released via unpin_user_page */
+	FOLL_PIN = 1 << 19,
+	/* gup_fast: prevent fall-back to slow gup */
+	FOLL_FAST_ONLY = 1 << 20,
+	/* allow unlocking the mmap lock */
+	FOLL_UNLOCKABLE = 1 << 21,
+	/* VMA lookup+checks compatible with MADV_POPULATE_(READ|WRITE) */
+	FOLL_MADV_POPULATE = 1 << 22,
+};
+
+#define INTERNAL_GUP_FLAGS (FOLL_TOUCH | FOLL_TRIED | FOLL_REMOTE | FOLL_PIN | \
+			    FOLL_FAST_ONLY | FOLL_UNLOCKABLE | \
+			    FOLL_MADV_POPULATE)
+
+/*
+ * Indicates for which pages that are write-protected in the page table,
+ * whether GUP has to trigger unsharing via FAULT_FLAG_UNSHARE such that the
+ * GUP pin will remain consistent with the pages mapped into the page tables
+ * of the MM.
+ *
+ * Temporary unmapping of PageAnonExclusive() pages or clearing of
+ * PageAnonExclusive() has to protect against concurrent GUP:
+ * * Ordinary GUP: Using the PT lock
+ * * GUP-fast and fork(): mm->write_protect_seq
+ * * GUP-fast and KSM or temporary unmapping (swap, migration): see
+ *    folio_try_share_anon_rmap_*()
+ *
+ * Must be called with the (sub)page that's actually referenced via the
+ * page table entry, which might not necessarily be the head page for a
+ * PTE-mapped THP.
+ *
+ * If the vma is NULL, we're coming from the GUP-fast path and might have
+ * to fallback to the slow path just to lookup the vma.
+ */
+static inline bool gup_must_unshare(struct vm_area_struct *vma,
+				    unsigned int flags, struct page *page)
+{
+	/*
+	 * FOLL_WRITE is implicitly handled correctly as the page table entry
+	 * has to be writable -- and if it references (part of) an anonymous
+	 * folio, that part is required to be marked exclusive.
+	 */
+	if ((flags & (FOLL_WRITE | FOLL_PIN)) != FOLL_PIN)
+		return false;
+	/*
+	 * Note: PageAnon(page) is stable until the page is actually getting
+	 * freed.
+	 */
+	if (!PageAnon(page)) {
+		/*
+		 * We only care about R/O long-term pining: R/O short-term
+		 * pinning does not have the semantics to observe successive
+		 * changes through the process page tables.
+		 */
+		if (!(flags & FOLL_LONGTERM))
+			return false;
+
+		/* We really need the vma ... */
+		if (!vma)
+			return true;
+
+		/*
+		 * ... because we only care about writable private ("COW")
+		 * mappings where we have to break COW early.
+		 */
+		return is_cow_mapping(vma->vm_flags);
+	}
+
+	/* Paired with a memory barrier in folio_try_share_anon_rmap_*(). */
+	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP))
+		smp_rmb();
+
+	/*
+	 * During GUP-fast we might not get called on the head page for a
+	 * hugetlb page that is mapped using cont-PTE, because GUP-fast does
+	 * not work with the abstracted hugetlb PTEs that always point at the
+	 * head page. For hugetlb, PageAnonExclusive only applies on the head
+	 * page (as it cannot be partially COW-shared), so lookup the head page.
+	 */
+	if (unlikely(!PageHead(page) && PageHuge(page)))
+		page = compound_head(page);
+
+	/*
+	 * Note that PageKsm() pages cannot be exclusive, and consequently,
+	 * cannot get pinned.
+	 */
+	return !PageAnonExclusive(page);
+}
 
 extern bool mirrored_kernelcore;
+extern bool memblock_has_mirror(void);
 
 static inline bool vma_soft_dirty_enabled(struct vm_area_struct *vma)
 {
@@ -898,4 +1399,198 @@ static inline bool vma_soft_dirty_enabled(struct vm_area_struct *vma)
 	return !(vma->vm_flags & VM_SOFTDIRTY);
 }
 
+static inline bool pmd_needs_soft_dirty_wp(struct vm_area_struct *vma, pmd_t pmd)
+{
+	return vma_soft_dirty_enabled(vma) && !pmd_soft_dirty(pmd);
+}
+
+static inline bool pte_needs_soft_dirty_wp(struct vm_area_struct *vma, pte_t pte)
+{
+	return vma_soft_dirty_enabled(vma) && !pte_soft_dirty(pte);
+}
+
+static inline void vma_iter_config(struct vma_iterator *vmi,
+		unsigned long index, unsigned long last)
+{
+	MAS_BUG_ON(&vmi->mas, vmi->mas.node != MAS_START &&
+		   (vmi->mas.index > index || vmi->mas.last < index));
+	__mas_set_range(&vmi->mas, index, last - 1);
+}
+
+/*
+ * VMA Iterator functions shared between nommu and mmap
+ */
+static inline int vma_iter_prealloc(struct vma_iterator *vmi,
+		struct vm_area_struct *vma)
+{
+	return mas_preallocate(&vmi->mas, vma, GFP_KERNEL);
+}
+
+static inline void vma_iter_clear(struct vma_iterator *vmi)
+{
+	mas_store_prealloc(&vmi->mas, NULL);
+}
+
+static inline struct vm_area_struct *vma_iter_load(struct vma_iterator *vmi)
+{
+	return mas_walk(&vmi->mas);
+}
+
+/* Store a VMA with preallocated memory */
+static inline void vma_iter_store(struct vma_iterator *vmi,
+				  struct vm_area_struct *vma)
+{
+
+#if defined(CONFIG_DEBUG_VM_MAPLE_TREE)
+	if (MAS_WARN_ON(&vmi->mas, vmi->mas.node != MAS_START &&
+			vmi->mas.index > vma->vm_start)) {
+		pr_warn("%lx > %lx\n store vma %lx-%lx\n into slot %lx-%lx\n",
+			vmi->mas.index, vma->vm_start, vma->vm_start,
+			vma->vm_end, vmi->mas.index, vmi->mas.last);
+	}
+	if (MAS_WARN_ON(&vmi->mas, vmi->mas.node != MAS_START &&
+			vmi->mas.last <  vma->vm_start)) {
+		pr_warn("%lx < %lx\nstore vma %lx-%lx\ninto slot %lx-%lx\n",
+		       vmi->mas.last, vma->vm_start, vma->vm_start, vma->vm_end,
+		       vmi->mas.index, vmi->mas.last);
+	}
+#endif
+
+	if (vmi->mas.node != MAS_START &&
+	    ((vmi->mas.index > vma->vm_start) || (vmi->mas.last < vma->vm_start)))
+		vma_iter_invalidate(vmi);
+
+	__mas_set_range(&vmi->mas, vma->vm_start, vma->vm_end - 1);
+	mas_store_prealloc(&vmi->mas, vma);
+}
+
+static inline int vma_iter_store_gfp(struct vma_iterator *vmi,
+			struct vm_area_struct *vma, gfp_t gfp)
+{
+	if (vmi->mas.node != MAS_START &&
+	    ((vmi->mas.index > vma->vm_start) || (vmi->mas.last < vma->vm_start)))
+		vma_iter_invalidate(vmi);
+
+	__mas_set_range(&vmi->mas, vma->vm_start, vma->vm_end - 1);
+	mas_store_gfp(&vmi->mas, vma, gfp);
+	if (unlikely(mas_is_err(&vmi->mas)))
+		return -ENOMEM;
+
+	return 0;
+}
+
+/*
+ * VMA lock generalization
+ */
+struct vma_prepare {
+	struct vm_area_struct *vma;
+	struct vm_area_struct *adj_next;
+	struct file *file;
+	struct address_space *mapping;
+	struct anon_vma *anon_vma;
+	struct vm_area_struct *insert;
+	struct vm_area_struct *remove;
+	struct vm_area_struct *remove2;
+};
+
+#define SRC_PAGE_MAPPED		BIT(0)
+#define SRC_PAGE_MLOCKED	BIT(1)
+#define SRC_PAGE_CLEAN		BIT(2)
+#define SRC_PAGE_USAGE_MASK	(BIT(3) - 1)
+
+static inline unsigned long src_page_usage(struct page *page)
+{
+	struct folio *src = page_folio(page);
+	int i = folio_page_idx(src, page);
+
+	if (folio_can_split(src) || !src->_dst_ul)
+		return 0;
+
+	return src->_dst_ul[i] & SRC_PAGE_USAGE_MASK;
+}
+
+static inline bool can_discard_src(struct page *page)
+{
+	return src_page_usage(page) & SRC_PAGE_CLEAN;
+}
+
+static inline void set_src_usage(struct page *page, unsigned long usage)
+{
+	struct folio *src = page_folio(page);
+	int i = folio_page_idx(src, page);
+
+	if (!folio_can_split(src) && src->_dst_ul)
+		src->_dst_ul[i] |= usage;
+}
+
+static inline struct page *folio_dst_page(struct folio *src, int i)
+{
+	if (folio_can_split(src) || !src->_dst_ul)
+		return folio_page(src, i);
+
+	return (void *)(src->_dst_ul[i] & ~SRC_PAGE_USAGE_MASK);
+}
+
+#ifdef CONFIG_64BIT
+static inline int can_do_mseal(unsigned long flags)
+{
+	if (flags)
+		return -EINVAL;
+
+	return 0;
+}
+
+bool can_modify_mm(struct mm_struct *mm, unsigned long start,
+		unsigned long end);
+bool can_modify_mm_madv(struct mm_struct *mm, unsigned long start,
+		unsigned long end, int behavior);
+
+static inline bool vma_is_sealed(struct vm_area_struct *vma)
+{
+	return (vma->vm_flags & VM_SEALED);
+}
+
+/*
+ * check if a vma is sealed for modification.
+ * return true, if modification is allowed.
+ */
+static inline bool can_modify_vma(struct vm_area_struct *vma)
+{
+	if (unlikely(vma_is_sealed(vma)))
+		return false;
+
+	return true;
+}
+
+bool can_modify_vma_madv(struct vm_area_struct *vma, int behavior);
+
+#else
+static inline int can_do_mseal(unsigned long flags)
+{
+	return -EPERM;
+}
+
+static inline bool can_modify_mm(struct mm_struct *mm, unsigned long start,
+		unsigned long end)
+{
+	return true;
+}
+
+static inline bool can_modify_mm_madv(struct mm_struct *mm, unsigned long start,
+		unsigned long end, int behavior)
+{
+	return true;
+}
+
+static inline bool can_modify_vma(struct vm_area_struct *vma)
+{
+	return true;
+}
+
+static inline bool can_modify_vma_madv(struct vm_area_struct *vma, int behavior)
+{
+	return true;
+}
+
+#endif
 #endif	/* __MM_INTERNAL_H */

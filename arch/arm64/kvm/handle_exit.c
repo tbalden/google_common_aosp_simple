@@ -16,6 +16,8 @@
 #include <asm/kvm_asm.h>
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_mmu.h>
+#include <asm/kvm_nested.h>
+#include <asm/kvm_pkvm.h>
 #include <asm/debug-monitors.h>
 #include <asm/stacktrace/nvhe.h>
 #include <asm/traps.h>
@@ -35,19 +37,21 @@ static void kvm_handle_guest_serror(struct kvm_vcpu *vcpu, u64 esr)
 
 static int handle_hvc(struct kvm_vcpu *vcpu)
 {
-	int ret;
-
 	trace_kvm_hvc_arm64(*vcpu_pc(vcpu), vcpu_get_reg(vcpu, 0),
 			    kvm_vcpu_hvc_get_imm(vcpu));
 	vcpu->stat.hvc_exit_stat++;
 
-	ret = kvm_hvc_call_handler(vcpu);
-	if (ret < 0) {
-		vcpu_set_reg(vcpu, 0, ~0UL);
+	/* Forward hvc instructions to the virtual EL2 if the guest has EL2. */
+	if (vcpu_has_nv(vcpu)) {
+		if (vcpu_read_sys_reg(vcpu, HCR_EL2) & HCR_HCD)
+			kvm_inject_undefined(vcpu);
+		else
+			kvm_inject_nested_sync(vcpu, kvm_vcpu_get_esr(vcpu));
+
 		return 1;
 	}
 
-	return ret;
+	return kvm_smccc_call_handler(vcpu);
 }
 
 static int handle_smc(struct kvm_vcpu *vcpu)
@@ -58,11 +62,29 @@ static int handle_smc(struct kvm_vcpu *vcpu)
 	 * Trap exception, not a Secure Monitor Call exception [...]"
 	 *
 	 * We need to advance the PC after the trap, as it would
-	 * otherwise return to the same address...
+	 * otherwise return to the same address. Furthermore, pre-incrementing
+	 * the PC before potentially exiting to userspace maintains the same
+	 * abstraction for both SMCs and HVCs.
 	 */
-	vcpu_set_reg(vcpu, 0, ~0UL);
 	kvm_incr_pc(vcpu);
-	return 1;
+
+	/*
+	 * SMCs with a nonzero immediate are reserved according to DEN0028E 2.9
+	 * "SMC and HVC immediate value".
+	 */
+	if (kvm_vcpu_hvc_get_imm(vcpu)) {
+		vcpu_set_reg(vcpu, 0, ~0UL);
+		return 1;
+	}
+
+	/*
+	 * If imm is zero then it is likely an SMCCC call.
+	 *
+	 * Note that on ARMv8.3, even if EL3 is not implemented, SMC executed
+	 * at Non-secure EL1 is trapped to EL2 if HCR_EL2.TSC==1, rather than
+	 * being treated as UNDEFINED.
+	 */
+	return kvm_smccc_call_handler(vcpu);
 }
 
 /*
@@ -196,6 +218,41 @@ static int kvm_handle_ptrauth(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int kvm_handle_eret(struct kvm_vcpu *vcpu)
+{
+	if (kvm_vcpu_get_esr(vcpu) & ESR_ELx_ERET_ISS_ERET)
+		return kvm_handle_ptrauth(vcpu);
+
+	/*
+	 * If we got here, two possibilities:
+	 *
+	 * - the guest is in EL2, and we need to fully emulate ERET
+	 *
+	 * - the guest is in EL1, and we need to reinject the
+         *   exception into the L1 hypervisor.
+	 *
+	 * If KVM ever traps ERET for its own use, we'll have to
+	 * revisit this.
+	 */
+	if (is_hyp_ctxt(vcpu))
+		kvm_emulate_nested_eret(vcpu);
+	else
+		kvm_inject_nested_sync(vcpu, kvm_vcpu_get_esr(vcpu));
+
+	return 1;
+}
+
+static int handle_svc(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * So far, SVC traps only for NV via HFGITR_EL2. A SVC from a
+	 * 32bit guest would be caught by vpcu_mode_is_bad_32bit(), so
+	 * we should only have to deal with a 64 bit exception.
+	 */
+	kvm_inject_nested_sync(vcpu, kvm_vcpu_get_esr(vcpu));
+	return 1;
+}
+
 static exit_handle_fn arm_exit_handlers[] = {
 	[0 ... ESR_ELx_EC_MAX]	= kvm_handle_unknown_ec,
 	[ESR_ELx_EC_WFx]	= kvm_handle_wfx,
@@ -209,8 +266,10 @@ static exit_handle_fn arm_exit_handlers[] = {
 	[ESR_ELx_EC_SMC32]	= handle_smc,
 	[ESR_ELx_EC_HVC64]	= handle_hvc,
 	[ESR_ELx_EC_SMC64]	= handle_smc,
+	[ESR_ELx_EC_SVC64]	= handle_svc,
 	[ESR_ELx_EC_SYS64]	= kvm_handle_sys_reg,
 	[ESR_ELx_EC_SVE]	= handle_sve,
+	[ESR_ELx_EC_ERET]	= kvm_handle_eret,
 	[ESR_ELx_EC_IABT_LOW]	= kvm_handle_guest_abort,
 	[ESR_ELx_EC_DABT_LOW]	= kvm_handle_guest_abort,
 	[ESR_ELx_EC_SOFTSTP_LOW]= kvm_handle_guest_debug,
@@ -272,6 +331,75 @@ static int handle_trap_exceptions(struct kvm_vcpu *vcpu)
 	return handled;
 }
 
+static int handle_hyp_req_mem(struct kvm_vcpu *vcpu,
+			   struct kvm_hyp_req *req)
+{
+	struct kvm *kvm = vcpu->kvm;
+	unsigned long nr_pages;
+	int ret;
+
+	switch (req->mem.dest) {
+	case REQ_MEM_DEST_HYP_ALLOC:
+		return __pkvm_topup_hyp_alloc(req->mem.nr_pages);
+	case REQ_MEM_DEST_VCPU_MEMCACHE:
+		nr_pages = vcpu->arch.stage2_mc.nr_pages;
+		ret = topup_hyp_memcache(&vcpu->arch.stage2_mc,
+					 req->mem.nr_pages, 0);
+		nr_pages = vcpu->arch.stage2_mc.nr_pages - nr_pages;
+		atomic64_add(nr_pages << PAGE_SHIFT, &kvm->stat.protected_hyp_mem);
+		atomic64_add(nr_pages << PAGE_SHIFT, &kvm->stat.protected_pgtable_mem);
+
+		return ret;
+	};
+
+	pr_warn("Unknown kvm_hyp_req mem dest: %d\n", req->mem.dest);
+
+	return -EINVAL;
+}
+
+static int handle_hyp_req_map(struct kvm_vcpu *vcpu,
+			      struct kvm_hyp_req *req)
+{
+	return pkvm_mem_abort_range(vcpu, req->map.guest_ipa, req->map.size);
+}
+
+static int handle_hyp_req_split(struct kvm_vcpu *vcpu, struct kvm_hyp_req *req)
+{
+	return __pkvm_pgtable_stage2_split(vcpu, req->split.guest_ipa, req->split.size);
+}
+
+static int handle_hyp_req(struct kvm_vcpu *vcpu)
+{
+	struct kvm_hyp_req *hyp_req = vcpu->arch.hyp_reqs;
+	int i, ret;
+
+	for (i = 0; i < KVM_HYP_REQ_MAX; i++, hyp_req++) {
+		if (hyp_req->type == KVM_HYP_LAST_REQ)
+			break;
+
+		switch (hyp_req->type) {
+		case KVM_HYP_REQ_TYPE_MEM:
+			ret = handle_hyp_req_mem(vcpu, hyp_req);
+			break;
+		case KVM_HYP_REQ_TYPE_MAP:
+			ret = handle_hyp_req_map(vcpu, hyp_req);
+			break;
+		case KVM_HYP_REQ_TYPE_SPLIT:
+			ret = handle_hyp_req_split(vcpu, hyp_req);
+			break;
+		default:
+			pr_warn("Unknown kvm_hyp_req type: %d\n", hyp_req->type);
+			ret = -EINVAL;
+		}
+
+		if (ret)
+			return ret;
+	}
+
+	/* handled */
+	return 1;
+}
+
 /*
  * Return > 0 to return to guest, < 0 on error, 0 (and set exit_reason) on
  * proper exit to userspace.
@@ -311,6 +439,8 @@ int handle_exit(struct kvm_vcpu *vcpu, int exception_index)
 		 */
 		run->exit_reason = KVM_EXIT_FAIL_ENTRY;
 		return -EINVAL;
+	case ARM_EXCEPTION_HYP_REQ:
+		return handle_hyp_req(vcpu);
 	default:
 		kvm_pr_unimpl("Unsupported exception type: %d",
 			      exception_index);
@@ -347,19 +477,35 @@ void handle_exit_early(struct kvm_vcpu *vcpu, int exception_index)
 		kvm_handle_guest_serror(vcpu, kvm_vcpu_get_esr(vcpu));
 }
 
+static void print_nvhe_hyp_panic(const char *name, u64 panic_addr)
+{
+	kvm_err("nVHE hyp %s at: [<%016llx>] %pB!\n", name, panic_addr,
+		(void *)(panic_addr + kaslr_offset()));
+}
+
+static void kvm_nvhe_report_cfi_failure(u64 panic_addr)
+{
+	print_nvhe_hyp_panic("CFI failure", panic_addr);
+
+	if (IS_ENABLED(CONFIG_CFI_PERMISSIVE))
+		kvm_err(" (CONFIG_CFI_PERMISSIVE ignored for hyp failures)\n");
+}
+
 void __noreturn __cold nvhe_hyp_panic_handler(u64 esr, u64 spsr,
 					      u64 elr_virt, u64 elr_phys,
 					      u64 par, uintptr_t vcpu,
-					      u64 far, u64 hpfar) {
+					      u64 far, u64 hpfar)
+{
 	u64 elr_in_kimg = __phys_to_kimg(elr_phys);
 	u64 hyp_offset = elr_in_kimg - kaslr_offset() - elr_virt;
 	u64 mode = spsr & PSR_MODE_MASK;
 	u64 panic_addr = elr_virt + hyp_offset;
+	u64 mod_addr = pkvm_el2_mod_kern_va(elr_virt);
 
 	if (mode != PSR_MODE_EL2t && mode != PSR_MODE_EL2h) {
 		kvm_err("Invalid host exception to nVHE hyp!\n");
 	} else if (ESR_ELx_EC(esr) == ESR_ELx_EC_BRK64 &&
-		   (esr & ESR_ELx_BRK64_ISS_COMMENT_MASK) == BUG_BRK_IMM) {
+		   esr_brk_comment(esr) == BUG_BRK_IMM) {
 		const char *file = NULL;
 		unsigned int line = 0;
 
@@ -374,12 +520,18 @@ void __noreturn __cold nvhe_hyp_panic_handler(u64 esr, u64 spsr,
 
 		if (file)
 			kvm_err("nVHE hyp BUG at: %s:%u!\n", file, line);
+		else if (mod_addr)
+			kvm_err("nVHE hyp BUG at: [<%016llx>] %pB!\n", mod_addr,
+					(void *)mod_addr);
 		else
-			kvm_err("nVHE hyp BUG at: [<%016llx>] %pB!\n", panic_addr,
-					(void *)(panic_addr + kaslr_offset()));
+			print_nvhe_hyp_panic("BUG", panic_addr);
+	} else if (IS_ENABLED(CONFIG_CFI_CLANG) && esr_is_cfi_brk(esr)) {
+		kvm_nvhe_report_cfi_failure(panic_addr);
+	} else if (mod_addr) {
+		kvm_err("nVHE hyp panic at: [<%016llx>] %pB!\n", mod_addr,
+				(void *)mod_addr);
 	} else {
-		kvm_err("nVHE hyp panic at: [<%016llx>] %pB!\n", panic_addr,
-				(void *)(panic_addr + kaslr_offset()));
+		print_nvhe_hyp_panic("panic", panic_addr);
 	}
 
 	/* Dump the nVHE hypervisor backtrace */

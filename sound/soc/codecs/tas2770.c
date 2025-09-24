@@ -508,7 +508,7 @@ static int tas2770_codec_probe(struct snd_soc_component *component)
 }
 
 static DECLARE_TLV_DB_SCALE(tas2770_digital_tlv, 1100, 50, 0);
-static DECLARE_TLV_DB_SCALE(tas2770_playback_volume, -10050, 50, 0);
+static DECLARE_TLV_DB_SCALE(tas2770_playback_volume, -12750, 50, 0);
 
 static const struct snd_kcontrol_new tas2770_snd_controls[] = {
 	SOC_SINGLE_TLV("Speaker Playback Volume", TAS2770_PLAY_CFG_REG2,
@@ -720,7 +720,7 @@ static struct i2c_driver tas2770_i2c_driver = {
 		.name   = "tas2770",
 		.of_match_table = of_match_ptr(tas2770_of_match),
 	},
-	.probe_new  = tas2770_i2c_probe,
+	.probe      = tas2770_i2c_probe,
 	.id_table   = tas2770_i2c_id,
 };
 module_i2c_driver(tas2770_i2c_driver);

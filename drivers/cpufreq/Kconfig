@@ -3,7 +3,6 @@ menu "CPU Frequency scaling"
 
 config CPU_FREQ
 	bool "CPU Frequency scaling"
-	select SRCU
 	help
 	  CPU Frequency scaling allows you to change the clock speed of 
 	  CPUs on the fly. This is a nice method to save power, because 
@@ -44,9 +43,9 @@ config CPU_FREQ_TIMES
 
 choice
 	prompt "Default CPUFreq governor"
-	default CPU_FREQ_DEFAULT_GOV_USERSPACE if ARM_SA1100_CPUFREQ || ARM_SA1110_CPUFREQ
+	default CPU_FREQ_DEFAULT_GOV_USERSPACE if ARM_SA1110_CPUFREQ
 	default CPU_FREQ_DEFAULT_GOV_SCHEDUTIL if ARM64 || ARM
-	default CPU_FREQ_DEFAULT_GOV_SCHEDUTIL if X86_INTEL_PSTATE && SMP
+	default CPU_FREQ_DEFAULT_GOV_SCHEDUTIL if (X86_INTEL_PSTATE || X86_AMD_PSTATE) && SMP
 	default CPU_FREQ_DEFAULT_GOV_PERFORMANCE
 	help
 	  This option sets which CPUFreq governor shall be loaded at
@@ -225,8 +224,38 @@ config CPUFREQ_DT
 
 	  If in doubt, say N.
 
+config ANDROID_V_CPUFREQ_VIRT
+	tristate "Android-V Virtual cpufreq driver"
+	depends on OF && GENERIC_ARCH_TOPOLOGY
+	select PM_OPP
+	help
+	  This adds a virtualized cpufreq driver for guest kernels that
+	  read/writes to a MMIO region for a virtualized cpufreq device to
+	  communicate with the host. It sends frequency updates to the host
+	  which gets used as a hint to schedule vCPU threads and select CPU
+	  frequency. If a VM does not support a virtualized FIE such as AMUs,
+	  it updates the frequency scaling factor by polling host CPU frequency
+	  to enable accurate Per-Entity Load Tracking for tasks running in the guest.
+
+	  If in doubt, say N.
+
+config CPUFREQ_VIRT
+	tristate "Virtual cpufreq driver"
+	depends on GENERIC_ARCH_TOPOLOGY
+	help
+	  This adds a virtualized cpufreq driver for guest kernels that
+	  read/writes to a MMIO region for a virtualized cpufreq device to
+	  communicate with the host. It sends performance requests to the host
+	  which gets used as a hint to schedule vCPU threads and select CPU
+	  frequency. If a VM does not support a virtualized FIE such as AMUs,
+	  it updates the frequency scaling factor by polling host CPU frequency
+	  to enable accurate Per-Entity Load Tracking for tasks running in the guest.
+
+	  If in doubt, say N.
+
 config CPUFREQ_DT_PLATDEV
-	bool
+	tristate "Generic DT based cpufreq platdev driver"
+	depends on OF
 	help
 	  This adds a generic DT based cpufreq platdev driver for frequency
 	  management.  This creates a 'cpufreq-dt' platform device, on the
@@ -285,15 +314,6 @@ config LOONGSON2_CPUFREQ
 	  support software configurable cpu frequency.
 
 	  Loongson2F and its successors support this feature.
-
-	  If in doubt, say N.
-
-config LOONGSON1_CPUFREQ
-	tristate "Loongson1 CPUFreq Driver"
-	depends on LOONGSON1_LS1B
-	help
-	  This option adds a CPUFreq driver for loongson1 processors which
-	  support software configurable cpu frequency.
 
 	  If in doubt, say N.
 endif

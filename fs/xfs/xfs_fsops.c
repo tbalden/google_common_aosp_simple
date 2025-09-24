@@ -87,14 +87,14 @@ xfs_growfs_data_private(
 	struct xfs_mount	*mp,		/* mount point for filesystem */
 	struct xfs_growfs_data	*in)		/* growfs data input struct */
 {
+	xfs_agnumber_t		oagcount = mp->m_sb.sb_agcount;
 	struct xfs_buf		*bp;
 	int			error;
 	xfs_agnumber_t		nagcount;
 	xfs_agnumber_t		nagimax = 0;
 	xfs_rfsblock_t		nb, nb_div, nb_mod;
 	int64_t			delta;
-	bool			lastag_extended;
-	xfs_agnumber_t		oagcount;
+	bool			lastag_extended = false;
 	struct xfs_trans	*tp;
 	struct aghdr_init_data	id = {};
 	struct xfs_perag	*last_pag;
@@ -138,20 +138,22 @@ xfs_growfs_data_private(
 	if (delta == 0)
 		return 0;
 
-	oagcount = mp->m_sb.sb_agcount;
-	/* allocate the new per-ag structures */
-	if (nagcount > oagcount) {
-		error = xfs_initialize_perag(mp, nagcount, nb, &nagimax);
-		if (error)
-			return error;
-	} else if (nagcount < oagcount) {
-		/* TODO: shrinking the entire AGs hasn't yet completed */
+	/* TODO: shrinking the entire AGs hasn't yet completed */
+	if (nagcount < oagcount)
 		return -EINVAL;
-	}
 
-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_growdata,
-			(delta > 0 ? XFS_GROWFS_SPACE_RES(mp) : -delta), 0,
-			XFS_TRANS_RESERVE, &tp);
+	/* allocate the new per-ag structures */
+	error = xfs_initialize_perag(mp, oagcount, nagcount, nb, &nagimax);
+	if (error)
+		return error;
+
+	if (delta > 0)
+		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_growdata,
+				XFS_GROWFS_SPACE_RES(mp), 0, XFS_TRANS_RESERVE,
+				&tp);
+	else
+		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_growdata, -delta, 0,
+				0, &tp);
 	if (error)
 		goto out_free_unused_perag;
 
@@ -546,6 +548,9 @@ xfs_do_force_shutdown(
 	} else if (flags & SHUTDOWN_CORRUPT_ONDISK) {
 		tag = XFS_PTAG_SHUTDOWN_CORRUPT;
 		why = "Corruption of on-disk metadata";
+	} else if (flags & SHUTDOWN_DEVICE_REMOVED) {
+		tag = XFS_PTAG_SHUTDOWN_IOERROR;
+		why = "Block device removal";
 	} else {
 		tag = XFS_PTAG_SHUTDOWN_IOERROR;
 		why = "Metadata I/O Error";

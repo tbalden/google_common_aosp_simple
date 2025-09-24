@@ -16,6 +16,7 @@
 #include <linux/bpf.h>
 #include <linux/bpf_trace.h>
 #include <linux/bitfield.h>
+#include <net/page_pool/types.h>
 
 #include "otx2_reg.h"
 #include "otx2_common.h"
@@ -1149,6 +1150,23 @@ static int otx2_cgx_config_linkevents(struct otx2_nic *pf, bool enable)
 	return err;
 }
 
+int otx2_reset_mac_stats(struct otx2_nic *pfvf)
+{
+	struct msg_req *req;
+	int err;
+
+	mutex_lock(&pfvf->mbox.lock);
+	req = otx2_mbox_alloc_msg_cgx_stats_rst(&pfvf->mbox);
+	if (!req) {
+		mutex_unlock(&pfvf->mbox.lock);
+		return -ENOMEM;
+	}
+
+	err = otx2_sync_mbox_msg(&pfvf->mbox);
+	mutex_unlock(&pfvf->mbox.lock);
+	return err;
+}
+
 static int otx2_cgx_config_loopback(struct otx2_nic *pf, bool enable)
 {
 	struct msg_req *msg;
@@ -1425,6 +1443,9 @@ static void otx2_free_sq_res(struct otx2_nic *pf)
 	otx2_sq_free_sqbs(pf);
 	for (qidx = 0; qidx < otx2_get_total_tx_queues(pf); qidx++) {
 		sq = &qset->sq[qidx];
+		/* Skip freeing Qos queues if they are not initialized */
+		if (!sq->sqe)
+			continue;
 		qmem_free(pf->dev, sq->sqe);
 		qmem_free(pf->dev, sq->tso_hdrs);
 		kfree(sq->sg);
@@ -1591,7 +1612,9 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
 	struct nix_lf_free_req *free_req;
 	struct mbox *mbox = &pf->mbox;
 	struct otx2_cq_queue *cq;
+	struct otx2_pool *pool;
 	struct msg_req *req;
+	int pool_id;
 	int qidx;
 
 	/* Ensure all SQE are processed */
@@ -1604,6 +1627,8 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
 	if (pf->pfc_en)
 		otx2_pfc_txschq_stop(pf);
 #endif
+
+	otx2_clean_qos_queues(pf);
 
 	mutex_lock(&mbox->lock);
 	/* Disable backpressure */
@@ -1618,7 +1643,7 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
 	for (qidx = 0; qidx < qset->cq_cnt; qidx++) {
 		cq = &qset->cq[qidx];
 		if (cq->cq_type == CQ_RX)
-			otx2_cleanup_rx_cqes(pf, cq);
+			otx2_cleanup_rx_cqes(pf, cq, qidx);
 		else
 			otx2_cleanup_tx_cqes(pf, cq);
 	}
@@ -1628,6 +1653,13 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
 
 	/* Free RQ buffer pointers*/
 	otx2_free_aura_ptr(pf, AURA_NIX_RQ);
+
+	for (qidx = 0; qidx < pf->hw.rx_queues; qidx++) {
+		pool_id = otx2_get_pool_idx(pf, AURA_NIX_RQ, qidx);
+		pool = &pf->qset.pool[pool_id];
+		page_pool_destroy(pool->page_pool);
+		pool->page_pool = NULL;
+	}
 
 	otx2_free_cq_res(pf);
 
@@ -1755,6 +1787,7 @@ int otx2_open(struct net_device *netdev)
 	/* RQ and SQs are mapped to different CQs,
 	 * so find out max CQ IRQs (i.e CINTs) needed.
 	 */
+	pf->hw.non_qos_queues =  pf->hw.tx_queues + pf->hw.xdp_queues;
 	pf->hw.cint_cnt = max3(pf->hw.rx_queues, pf->hw.tx_queues,
 			       pf->hw.tc_tx_queues);
 
@@ -1775,7 +1808,7 @@ int otx2_open(struct net_device *netdev)
 	if (!qset->cq)
 		goto err_free_mem;
 
-	qset->sq = kcalloc(pf->hw.non_qos_queues,
+	qset->sq = kcalloc(otx2_get_total_tx_queues(pf),
 			   sizeof(struct otx2_snd_queue), GFP_KERNEL);
 	if (!qset->sq)
 		goto err_free_mem;
@@ -1898,6 +1931,9 @@ int otx2_open(struct net_device *netdev)
 	/* 'intf_down' may be checked on any cpu */
 	smp_wmb();
 
+	/* Enable QoS configuration before starting tx queues */
+	otx2_qos_config_txschq(pf);
+
 	/* we have already received link status notification */
 	if (pf->linfo.link_up && !(pf->pcifunc & RVU_PFVF_FUNC_MASK))
 		otx2_handle_link_event(pf);
@@ -1996,6 +2032,10 @@ int otx2_stop(struct net_device *netdev)
 
 	netif_tx_disable(netdev);
 
+	for (wrk = 0; wrk < pf->qset.cq_cnt; wrk++)
+		cancel_delayed_work_sync(&pf->refill_wrk[wrk].pool_refill_work);
+	devm_kfree(pf->dev, pf->refill_wrk);
+
 	otx2_free_hw_resources(pf);
 	otx2_free_cints(pf, pf->hw.cint_cnt);
 	otx2_disable_napi(pf);
@@ -2003,9 +2043,6 @@ int otx2_stop(struct net_device *netdev)
 	for (qidx = 0; qidx < netdev->num_tx_queues; qidx++)
 		netdev_tx_reset_queue(netdev_get_tx_queue(netdev, qidx));
 
-	for (wrk = 0; wrk < pf->qset.cq_cnt; wrk++)
-		cancel_delayed_work_sync(&pf->refill_wrk[wrk].pool_refill_work);
-	devm_kfree(pf->dev, pf->refill_wrk);
 
 	kfree(qset->sq);
 	kfree(qset->cq);
@@ -2055,16 +2092,50 @@ static netdev_tx_t otx2_xmit(struct sk_buff *skb, struct net_device *netdev)
 	return NETDEV_TX_OK;
 }
 
+static int otx2_qos_select_htb_queue(struct otx2_nic *pf, struct sk_buff *skb,
+				     u16 htb_maj_id)
+{
+	u16 classid;
+
+	if ((TC_H_MAJ(skb->priority) >> 16) == htb_maj_id)
+		classid = TC_H_MIN(skb->priority);
+	else
+		classid = READ_ONCE(pf->qos.defcls);
+
+	if (!classid)
+		return 0;
+
+	return otx2_get_txq_by_classid(pf, classid);
+}
+
 u16 otx2_select_queue(struct net_device *netdev, struct sk_buff *skb,
 		      struct net_device *sb_dev)
 {
-#ifdef CONFIG_DCB
 	struct otx2_nic *pf = netdev_priv(netdev);
+	bool qos_enabled;
+#ifdef CONFIG_DCB
 	u8 vlan_prio;
 #endif
+	int txq;
 
+	qos_enabled = netdev->real_num_tx_queues > pf->hw.tx_queues;
+	if (unlikely(qos_enabled)) {
+		/* This smp_load_acquire() pairs with smp_store_release() in
+		 * otx2_qos_root_add() called from htb offload root creation
+		 */
+		u16 htb_maj_id = smp_load_acquire(&pf->qos.maj_id);
+
+		if (unlikely(htb_maj_id)) {
+			txq = otx2_qos_select_htb_queue(pf, skb, htb_maj_id);
+			if (txq > 0)
+				return txq;
+			goto process_pfc;
+		}
+	}
+
+process_pfc:
 #ifdef CONFIG_DCB
-	if (!skb->vlan_present)
+	if (!skb_vlan_tag_present(skb))
 		goto pick_tx;
 
 	vlan_prio = skb->vlan_tci >> 13;
@@ -2076,7 +2147,11 @@ u16 otx2_select_queue(struct net_device *netdev, struct sk_buff *skb,
 
 pick_tx:
 #endif
-	return netdev_pick_tx(netdev, skb, NULL);
+	txq = netdev_pick_tx(netdev, skb, NULL);
+	if (unlikely(qos_enabled))
+		return txq % pf->hw.tx_queues;
+
+	return txq;
 }
 EXPORT_SYMBOL(otx2_select_queue);
 
@@ -2604,12 +2679,13 @@ static int otx2_xdp_setup(struct otx2_nic *pf, struct bpf_prog *prog)
 	/* Network stack and XDP shared same rx queues.
 	 * Use separate tx queues for XDP and network stack.
 	 */
-	if (pf->xdp_prog)
+	if (pf->xdp_prog) {
 		pf->hw.xdp_queues = pf->hw.rx_queues;
-	else
+		xdp_features_set_redirect_target(dev, false);
+	} else {
 		pf->hw.xdp_queues = 0;
-
-	pf->hw.non_qos_queues += pf->hw.xdp_queues;
+		xdp_features_clear_redirect_target(dev);
+	}
 
 	if (if_up)
 		otx2_open(pf->netdev);
@@ -2974,9 +3050,13 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	netdev->watchdog_timeo = OTX2_TX_TIMEOUT;
 
 	netdev->netdev_ops = &otx2_netdev_ops;
+	netdev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT;
 
 	netdev->min_mtu = OTX2_MIN_MTU;
 	netdev->max_mtu = otx2_get_max_mtu(pf);
+
+	/* reset CGX/RPM MAC stats */
+	otx2_reset_mac_stats(pf);
 
 	err = register_netdev(netdev);
 	if (err) {
@@ -3208,6 +3288,7 @@ static void otx2_remove(struct pci_dev *pdev)
 	otx2_ptp_destroy(pf);
 	otx2_mcam_flow_del(pf);
 	otx2_shutdown_tc(pf);
+	otx2_shutdown_qos(pf);
 	otx2_detach_resources(&pf->mbox);
 	if (pf->hw.lmt_info)
 		free_percpu(pf->hw.lmt_info);

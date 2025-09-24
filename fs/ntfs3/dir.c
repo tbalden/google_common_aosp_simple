@@ -26,8 +26,8 @@ int ntfs_utf16_to_nls(struct ntfs_sb_info *sbi, const __le16 *name, u32 len,
 
 	if (!nls) {
 		/* UTF-16 -> UTF-8 */
-		ret = utf16s_to_utf8s(name, len, UTF16_LITTLE_ENDIAN, buf,
-				      buf_len);
+		ret = utf16s_to_utf8s((wchar_t *)name, len, UTF16_LITTLE_ENDIAN,
+				      buf, buf_len);
 		buf[ret] = '\0';
 		return ret;
 	}
@@ -531,7 +531,7 @@ static int ntfs_dir_count(struct inode *dir, bool *is_empty, size_t *dirs,
 	u32 e_size, off, end;
 	size_t drs = 0, fles = 0, bit = 0;
 	struct indx_node *node = NULL;
-	size_t max_indx = ni->vfs_inode.i_size >> ni->dir.index_bits;
+	size_t max_indx = i_size_read(&ni->vfs_inode) >> ni->dir.index_bits;
 
 	if (is_empty)
 		*is_empty = true;

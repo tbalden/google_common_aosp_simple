@@ -44,10 +44,11 @@ SYSSEG		= 0x1000		/* historical load address >> 4 */
 #ifdef CONFIG_EFI_STUB
 	# "MZ", MS-DOS header
 	.word	MZ_MAGIC
-	.org	0x3c
+	.org	0x38
 	#
 	# Offset to the PE header.
 	#
+	.long	LINUX_PE_MAGIC
 	.long	pe_header
 pe_header:
 	.long	PE_MAGIC
@@ -257,7 +258,7 @@ start_sys_seg:	.word	SYSSEG		# obsolete and meaningless, but just
 
 type_of_loader:	.byte	0		# 0 means ancient bootloader, newer
 					# bootloaders know to change this.
-					# See Documentation/x86/boot.rst for
+					# See Documentation/arch/x86/boot.rst for
 					# assigned ids
 
 # flags, unused bits must be zero (RFU) bit within loadflags

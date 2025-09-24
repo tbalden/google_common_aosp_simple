@@ -218,9 +218,8 @@ static void dbc_tty_close(struct tty_struct *tty, struct file *file)
 	tty_port_close(&port->port, tty, file);
 }
 
-static int dbc_tty_write(struct tty_struct *tty,
-			 const unsigned char *buf,
-			 int count)
+static ssize_t dbc_tty_write(struct tty_struct *tty, const u8 *buf,
+			     size_t count)
 {
 	struct dbc_port		*port = tty->driver_data;
 	unsigned long		flags;
@@ -252,7 +251,7 @@ static int dbc_tty_write(struct tty_struct *tty,
 	return written;
 }
 
-static int dbc_tty_put_char(struct tty_struct *tty, unsigned char ch)
+static int dbc_tty_put_char(struct tty_struct *tty, u8 ch)
 {
 	struct dbc_port		*port = tty->driver_data;
 	unsigned long		flags;

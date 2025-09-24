@@ -174,7 +174,7 @@ static __always_inline bool __mutex_trylock_fast(struct mutex *lock)
 	unsigned long zero = 0UL;
 
 	if (atomic_long_try_cmpxchg_acquire(&lock->owner, &zero, curr)) {
-		trace_android_vh_record_mutex_lock_starttime(current, jiffies);
+		trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
 		return true;
 	}
 
@@ -558,12 +558,12 @@ void __sched mutex_unlock(struct mutex *lock)
 {
 #ifndef CONFIG_DEBUG_LOCK_ALLOC
 	if (__mutex_unlock_fast(lock)) {
-		trace_android_vh_record_mutex_lock_starttime(current, 0);
+		trace_android_vh_record_mutex_lock_starttime(lock, 0);
 		return;
 	}
 #endif
 	__mutex_unlock_slowpath(lock, _RET_IP_);
-	trace_android_vh_record_mutex_lock_starttime(current, 0);
+	trace_android_vh_record_mutex_lock_starttime(lock, 0);
 }
 EXPORT_SYMBOL(mutex_unlock);
 
@@ -633,7 +633,7 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		if (ww_ctx)
 			ww_mutex_set_context_fastpath(ww, ww_ctx);
 		trace_contention_end(lock, 0);
-		trace_android_vh_record_mutex_lock_starttime(current, jiffies);
+		trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
 		preempt_enable();
 		return 0;
 	}
@@ -752,7 +752,7 @@ skip_wait:
 
 	raw_spin_unlock(&lock->wait_lock);
 	preempt_enable();
-	trace_android_vh_record_mutex_lock_starttime(current, jiffies);
+	trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
 	return 0;
 
 err:
@@ -974,10 +974,11 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 	if (owner & MUTEX_FLAG_HANDOFF)
 		__mutex_handoff(lock, next);
 
-	trace_android_vh_mutex_unlock_slowpath(lock);
+	trace_android_vh_mutex_unlock_slowpath_bf_wakeq(lock);
 	raw_spin_unlock(&lock->wait_lock);
 
 	wake_up_q(&wake_q);
+	trace_android_vh_mutex_unlock_slowpath(lock);
 }
 
 #ifndef CONFIG_DEBUG_LOCK_ALLOC
@@ -1115,7 +1116,7 @@ int __sched mutex_trylock(struct mutex *lock)
 
 	locked = __mutex_trylock(lock);
 	if (locked) {
-		trace_android_vh_record_mutex_lock_starttime(current, jiffies);
+		trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
 	}
 

@@ -24,13 +24,12 @@
 #include <linux/sched/sysctl.h>
 
 #include <trace/events/sched.h>
-#undef CREATE_TRACE_POINTS
 #include <trace/hooks/hung_task.h>
 
 /*
  * The number of tasks checked:
  */
-int __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
+static int __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
 
 /*
  * Limit number of tasks checked in a batch.
@@ -49,9 +48,9 @@ unsigned long __read_mostly sysctl_hung_task_timeout_secs = CONFIG_DEFAULT_HUNG_
 /*
  * Zero (default value) means use sysctl_hung_task_timeout_secs:
  */
-unsigned long __read_mostly sysctl_hung_task_check_interval_secs;
+static unsigned long __read_mostly sysctl_hung_task_check_interval_secs;
 
-int __read_mostly sysctl_hung_task_warnings = 10;
+static int __read_mostly sysctl_hung_task_warnings = 10;
 
 static int __read_mostly did_panic;
 static bool hung_task_show_lock;
@@ -74,8 +73,8 @@ static unsigned int __read_mostly sysctl_hung_task_all_cpu_backtrace;
  * Should we panic (and reboot, if panic_timeout= is set) when a
  * hung task is detected:
  */
-unsigned int __read_mostly sysctl_hung_task_panic =
-				IS_ENABLED(CONFIG_BOOTPARAM_HUNG_TASK_PANIC);
+static unsigned int __read_mostly sysctl_hung_task_panic =
+	IS_ENABLED(CONFIG_BOOTPARAM_HUNG_TASK_PANIC);
 
 static int
 hung_task_panic(struct notifier_block *this, unsigned long event, void *ptr)
@@ -144,6 +143,8 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
 
 		if (sysctl_hung_task_all_cpu_backtrace)
 			hung_task_show_all_bt = true;
+		if (!sysctl_hung_task_warnings)
+			pr_info("Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings\n");
 	}
 
 	touch_nmi_watchdog();
@@ -207,7 +208,7 @@ static void check_hung_uninterruptible_tasks(unsigned long timeout)
 		 * skip the TASK_KILLABLE tasks -- these can be killed
 		 * skip the TASK_IDLE tasks -- those are genuinely idle
 		 */
-		trace_android_vh_check_uninterrupt_tasks(t, timeout, &need_check);
+		trace_android_vh_check_uninterruptible_tasks(t, timeout, &need_check);
 		if (need_check) {
 			state = READ_ONCE(t->__state);
 			if ((state & TASK_UNINTERRUPTIBLE) &&
@@ -216,7 +217,7 @@ static void check_hung_uninterruptible_tasks(unsigned long timeout)
 				check_hung_task(t, timeout);
 		}
 	}
-	trace_android_vh_check_uninterrupt_tasks_done(NULL);
+	trace_android_vh_check_uninterruptible_tasks_dn(NULL);
  unlock:
 	rcu_read_unlock();
 	if (hung_task_show_lock)

@@ -322,8 +322,7 @@ static struct inode *romfs_iget(struct super_block *sb, unsigned long pos)
 
 	set_nlink(i, 1);		/* Hard to decide.. */
 	i->i_size = be32_to_cpu(ri.size);
-	i->i_mtime.tv_sec = i->i_atime.tv_sec = i->i_ctime.tv_sec = 0;
-	i->i_mtime.tv_nsec = i->i_atime.tv_nsec = i->i_ctime.tv_nsec = 0;
+	i->i_mtime = i->i_atime = inode_set_ctime(i, 0, 0);
 
 	/* set up mode and ops */
 	mode = romfs_modemap[nextfh & ROMFH_TYPE];
@@ -583,16 +582,18 @@ static int romfs_init_fs_context(struct fs_context *fc)
  */
 static void romfs_kill_sb(struct super_block *sb)
 {
+	generic_shutdown_super(sb);
+
 #ifdef CONFIG_ROMFS_ON_MTD
 	if (sb->s_mtd) {
-		kill_mtd_super(sb);
-		return;
+		put_mtd_device(sb->s_mtd);
+		sb->s_mtd = NULL;
 	}
 #endif
 #ifdef CONFIG_ROMFS_ON_BLOCK
 	if (sb->s_bdev) {
-		kill_block_super(sb);
-		return;
+		sync_blockdev(sb->s_bdev);
+		blkdev_put(sb->s_bdev, sb);
 	}
 #endif
 }
@@ -667,3 +668,4 @@ module_exit(exit_romfs_fs);
 MODULE_DESCRIPTION("Direct-MTD Capable RomFS");
 MODULE_AUTHOR("Red Hat, Inc.");
 MODULE_LICENSE("GPL"); /* Actually dual-licensed, but it doesn't matter for */
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);

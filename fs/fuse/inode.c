@@ -28,6 +28,7 @@
 MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
 MODULE_DESCRIPTION("Filesystem in Userspace");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
 
 static struct kmem_cache *fuse_inode_cachep;
 struct list_head fuse_conn_list;
@@ -95,11 +96,12 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
 		return NULL;
 
 	fi->i_time = 0;
-	fi->inval_mask = 0;
+	fi->inval_mask = ~0;
 #ifdef CONFIG_FUSE_BPF
 	fi->backing_inode = NULL;
 	fi->bpf = NULL;
 #endif
+
 	fi->nodeid = 0;
 	fi->nlookup = 0;
 	fi->attr_version = 0;
@@ -214,28 +216,31 @@ static ino_t fuse_squash_ino(u64 ino64)
 }
 
 static void fuse_fill_attr_from_inode(struct fuse_attr *attr,
-				      const struct inode *inode)
+				      const struct fuse_inode *fi)
 {
+	struct timespec64 ctime = inode_get_ctime(&fi->inode);
+
 	*attr = (struct fuse_attr){
-		.ino		= inode->i_ino,
-		.size		= inode->i_size,
-		.blocks		= inode->i_blocks,
-		.atime		= inode->i_atime.tv_sec,
-		.mtime		= inode->i_mtime.tv_sec,
-		.ctime		= inode->i_ctime.tv_sec,
-		.atimensec	= inode->i_atime.tv_nsec,
-		.mtimensec	= inode->i_mtime.tv_nsec,
-		.ctimensec	= inode->i_ctime.tv_nsec,
-		.mode		= inode->i_mode,
-		.nlink		= inode->i_nlink,
-		.uid		= inode->i_uid.val,
-		.gid		= inode->i_gid.val,
-		.rdev		= inode->i_rdev,
-		.blksize	= 1u << inode->i_blkbits,
+		.ino		= fi->inode.i_ino,
+		.size		= fi->inode.i_size,
+		.blocks		= fi->inode.i_blocks,
+		.atime		= fi->inode.i_atime.tv_sec,
+		.mtime		= fi->inode.i_mtime.tv_sec,
+		.ctime		= ctime.tv_sec,
+		.atimensec	= fi->inode.i_atime.tv_nsec,
+		.mtimensec	= fi->inode.i_mtime.tv_nsec,
+		.ctimensec	= ctime.tv_nsec,
+		.mode		= fi->inode.i_mode,
+		.nlink		= fi->inode.i_nlink,
+		.uid		= fi->inode.i_uid.val,
+		.gid		= fi->inode.i_gid.val,
+		.rdev		= fi->inode.i_rdev,
+		.blksize	= 1u << fi->inode.i_blkbits,
 	};
 }
 
 void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
+				   struct fuse_statx *sx,
 				   u64 attr_valid, u32 cache_mask)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -245,7 +250,8 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	fi->i_time = attr_valid;
-	WRITE_ONCE(fi->inval_mask, 0);
+	/* Clear basic stats from invalid mask */
+	set_mask_bits(&fi->inval_mask, STATX_BASIC_STATS, 0);
 
 	inode->i_ino     = fuse_squash_ino(attr->ino);
 	inode->i_mode    = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
@@ -267,8 +273,26 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 		inode->i_mtime.tv_nsec  = attr->mtimensec;
 	}
 	if (!(cache_mask & STATX_CTIME)) {
-		inode->i_ctime.tv_sec   = attr->ctime;
-		inode->i_ctime.tv_nsec  = attr->ctimensec;
+		inode_set_ctime(inode, attr->ctime, attr->ctimensec);
+	}
+	if (sx) {
+		/* Sanitize nsecs */
+		sx->btime.tv_nsec =
+			min_t(u32, sx->btime.tv_nsec, NSEC_PER_SEC - 1);
+
+		/*
+		 * Btime has been queried, cache is valid (whether or not btime
+		 * is available or not) so clear STATX_BTIME from inval_mask.
+		 *
+		 * Availability of the btime attribute is indicated in
+		 * FUSE_I_BTIME
+		 */
+		set_mask_bits(&fi->inval_mask, STATX_BTIME, 0);
+		if (sx->mask & STATX_BTIME) {
+			set_bit(FUSE_I_BTIME, &fi->state);
+			fi->i_btime.tv_sec = sx->btime.tv_sec;
+			fi->i_btime.tv_nsec = sx->btime.tv_nsec;
+		}
 	}
 
 	if (attr->blksize != 0)
@@ -309,6 +333,7 @@ u32 fuse_get_cache_mask(struct inode *inode)
 }
 
 void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
+			    struct fuse_statx *sx,
 			    u64 attr_valid, u64 attr_version)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -332,8 +357,8 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
 		attr->mtimensec = inode->i_mtime.tv_nsec;
 	}
 	if (cache_mask & STATX_CTIME) {
-		attr->ctime = inode->i_ctime.tv_sec;
-		attr->ctimensec = inode->i_ctime.tv_nsec;
+		attr->ctime = inode_get_ctime(inode).tv_sec;
+		attr->ctimensec = inode_get_ctime(inode).tv_nsec;
 	}
 
 	if ((attr_version != 0 && fi->attr_version > attr_version) ||
@@ -343,7 +368,7 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
 	}
 
 	old_mtime = inode->i_mtime;
-	fuse_change_attributes_common(inode, attr, attr_valid, cache_mask);
+	fuse_change_attributes_common(inode, attr, sx, attr_valid, cache_mask);
 
 	oldsize = inode->i_size;
 	/*
@@ -391,14 +416,14 @@ static void fuse_init_submount_lookup(struct fuse_submount_lookup *sl,
 	refcount_set(&sl->count, 1);
 }
 
-static void fuse_init_inode(struct inode *inode, struct fuse_attr *attr)
+static void fuse_init_inode(struct inode *inode, struct fuse_attr *attr,
+			    struct fuse_conn *fc)
 {
 	inode->i_mode = attr->mode & S_IFMT;
 	inode->i_size = attr->size;
 	inode->i_mtime.tv_sec  = attr->mtime;
 	inode->i_mtime.tv_nsec = attr->mtimensec;
-	inode->i_ctime.tv_sec  = attr->ctime;
-	inode->i_ctime.tv_nsec = attr->ctimensec;
+	inode_set_ctime(inode, attr->ctime, attr->ctimensec);
 	if (S_ISREG(inode->i_mode)) {
 		fuse_init_common(inode);
 		fuse_init_file_inode(inode, attr->flags);
@@ -412,6 +437,12 @@ static void fuse_init_inode(struct inode *inode, struct fuse_attr *attr)
 		init_special_inode(inode, inode->i_mode, attr->rdev);
 	} else
 		BUG();
+	/*
+	 * Ensure that we don't cache acls for daemons without FUSE_POSIX_ACL
+	 * so they see the exact same behavior as before.
+	 */
+	if (!fc->posix_acl)
+		inode->i_acl = inode->i_default_acl = ACL_DONT_CACHE;
 }
 
 struct fuse_inode_identifier {
@@ -484,7 +515,7 @@ struct inode *fuse_iget_backing(struct super_block *sb, u64 nodeid,
 	if (nodeid)
 		hash = nodeid;
 
-	fuse_fill_attr_from_inode(&attr, backing_inode);
+	fuse_fill_attr_from_inode(&attr, get_fuse_inode(backing_inode));
 	inode = iget5_locked(sb, hash, fuse_inode_backing_eq,
 			     fuse_inode_backing_set, &fii);
 	if (!inode)
@@ -499,7 +530,7 @@ struct inode *fuse_iget_backing(struct super_block *sb, u64 nodeid,
 	}
 
 	fi = get_fuse_inode(inode);
-	fuse_init_inode(inode, &attr);
+	fuse_init_inode(inode, &attr, fc);
 	spin_lock(&fi->lock);
 	fi->nlookup++;
 	spin_unlock(&fi->lock);
@@ -533,7 +564,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
 		if (!inode)
 			return NULL;
 
-		fuse_init_inode(inode, attr);
+		fuse_init_inode(inode, attr, fc);
 		fi = get_fuse_inode(inode);
 		fi->nodeid = nodeid;
 		fi->submount_lookup = fuse_alloc_submount_lookup();
@@ -557,7 +588,7 @@ retry:
 		if (!fc->writeback_cache || !S_ISREG(attr->mode))
 			inode->i_flags |= S_NOCMTIME;
 		inode->i_generation = generation;
-		fuse_init_inode(inode, attr);
+		fuse_init_inode(inode, attr, fc);
 		unlock_new_inode(inode);
 	} else if (fuse_stale_inode(inode, generation, attr)) {
 		/* nodeid was reused, any I/O on the old inode should fail */
@@ -573,7 +604,7 @@ retry:
 	fi->nlookup++;
 	spin_unlock(&fi->lock);
 done:
-	fuse_change_attributes(inode, attr, attr_valid, attr_version);
+	fuse_change_attributes(inode, attr, NULL, attr_valid, attr_version);
 
 	return inode;
 }
@@ -1428,7 +1459,6 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			if ((flags & FUSE_POSIX_ACL)) {
 				fc->default_permissions = 1;
 				fc->posix_acl = 1;
-				fm->sb->s_xattr = fuse_acl_xattr_handlers;
 			}
 			if (flags & FUSE_CACHE_SYMLINKS)
 				fc->cache_symlinks = 1;
@@ -1461,6 +1491,10 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->setxattr_ext = 1;
 			if (flags & FUSE_SECURITY_CTX)
 				fc->init_security = 1;
+			if (flags & FUSE_CREATE_SUPP_GROUP)
+				fc->create_supp_group = 1;
+			if (flags & FUSE_DIRECT_IO_ALLOW_MMAP)
+				fc->direct_io_allow_mmap = 1;
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1506,8 +1540,8 @@ void fuse_send_init(struct fuse_mount *fm)
 		FUSE_ABORT_ERROR | FUSE_MAX_PAGES | FUSE_CACHE_SYMLINKS |
 		FUSE_NO_OPENDIR_SUPPORT | FUSE_EXPLICIT_INVAL_DATA |
 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
-		FUSE_SECURITY_CTX |
-		FUSE_HAS_EXPIRE_ONLY;
+		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
+		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;
@@ -1673,13 +1707,6 @@ static void fuse_sb_defaults(struct super_block *sb)
 	if (sb->s_user_ns != &init_user_ns)
 		sb->s_iflags |= SB_I_UNTRUSTED_MOUNTER;
 	sb->s_flags &= ~(SB_NOSEC | SB_I_VERSION);
-
-	/*
-	 * If we are not in the initial user namespace posix
-	 * acls must be translated.
-	 */
-	if (sb->s_user_ns != &init_user_ns)
-		sb->s_xattr = fuse_no_acl_xattr_handlers;
 }
 
 static int fuse_fill_super_submount(struct super_block *sb,
@@ -1706,7 +1733,7 @@ static int fuse_fill_super_submount(struct super_block *sb,
 	if (parent_sb->s_subtype && !sb->s_subtype)
 		return -ENOMEM;
 
-	fuse_fill_attr_from_inode(&root_attr, &parent_fi->inode);
+	fuse_fill_attr_from_inode(&root_attr, parent_fi);
 	root = fuse_iget(sb, parent_fi->nodeid, 0, &root_attr, 0, 0);
 	/*
 	 * This inode is just a duplicate, so it is not looked up and

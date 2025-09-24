@@ -3,7 +3,7 @@
 */
 
 //#define DEBUG_K_PERM
-static bool kernel_permissive_check(struct selinux_state *state, u32 ssid, u32 tsid, u16 tclass) {
+static bool kernel_permissive_check(u32 ssid, u32 tsid, u16 tclass) {
         int rc1,rc2;
         char *scontext;
         char *tcontext;
@@ -12,12 +12,10 @@ static bool kernel_permissive_check(struct selinux_state *state, u32 ssid, u32 t
 
         if (!kernel_permissive) return false;
 
-        if (state==NULL) return false;
-
-        rc1 = security_sid_to_context(state, ssid, &scontext, &scontext_len);
+        rc1 = security_sid_to_context(ssid, &scontext, &scontext_len);
         if (!rc1 && !strcmp(scontext, KERNEL_SOURCE) ) {
                 int i;
-                rc2 = security_sid_to_context(state, tsid, &tcontext, &scontext_len);
+                rc2 = security_sid_to_context(tsid, &tcontext, &scontext_len);
                 if (!rc2) {
 #ifdef DEBUG_K_PERM
                         pr_err("%s kernel permissive scontext match %s - checking in list for tcontext: %s \n",__func__,scontext,tcontext);
@@ -34,7 +32,7 @@ static bool kernel_permissive_check(struct selinux_state *state, u32 ssid, u32 t
         }
 #ifdef DEBUG_K_PERM
 	else {
-                rc2 = security_sid_to_context(state, tsid, &tcontext, &scontext_len);
+                rc2 = security_sid_to_context(tsid, &tcontext, &scontext_len);
                 if (!rc1 && !rc2) {
                         pr_err("%s kernel permissive scontext NO match | scontext: %s - tcontext: %s \n",__func__,scontext,tcontext);
                 } else {

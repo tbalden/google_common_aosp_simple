@@ -608,6 +608,7 @@ DEFINE_TEST_ALLOC(devm_kzalloc,  devm_kfree, 1, 1, 0);
 
 static void overflow_allocation_test(struct kunit *test)
 {
+	const char device_name[] = "overflow-test";
 	struct device *dev;
 	int count = 0;
 
@@ -617,7 +618,7 @@ static void overflow_allocation_test(struct kunit *test)
 } while (0)
 
 	/* Create dummy device for devm_kmalloc()-family tests. */
-	dev = root_device_register("overflow-test");
+	dev = root_device_register(device_name);
 	KUNIT_ASSERT_FALSE_MSG(test, IS_ERR(dev),
 			       "Cannot register test device\n");
 
@@ -648,7 +649,7 @@ struct __test_flex_array {
 static void overflow_size_helpers_test(struct kunit *test)
 {
 	/* Make sure struct_size() can be used in a constant expression. */
-	u8 ce_array[struct_size((struct __test_flex_array *)0, data, 55)];
+	u8 ce_array[struct_size_t(struct __test_flex_array, data, 55)];
 	struct __test_flex_array *obj;
 	int count = 0;
 	int var;

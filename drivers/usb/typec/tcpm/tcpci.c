@@ -16,7 +16,6 @@
 #include <linux/usb/tcpci.h>
 #include <linux/usb/tcpm.h>
 #include <linux/usb/typec.h>
-#include <trace/hooks/typec.h>
 
 #define	PD_RETRY_COUNT_DEFAULT			3
 #define	PD_RETRY_COUNT_3_0_OR_HIGHER		2
@@ -35,6 +34,7 @@ struct tcpci {
 	struct tcpm_port *port;
 
 	struct regmap *regmap;
+	unsigned int alert_mask;
 
 	bool controls_vbus;
 
@@ -181,11 +181,8 @@ static int tcpci_start_toggling(struct tcpc_dev *tcpc,
 
 	/* Handle vendor drp toggling */
 	if (tcpci->data->start_drp_toggling) {
-		int override_toggling = 0;
-		trace_android_vh_typec_tcpci_override_toggling(tcpci, tcpci->data,
-							       &override_toggling);
 		ret = tcpci->data->start_drp_toggling(tcpci, tcpci->data, cc);
-		if (ret < 0 || override_toggling)
+		if (ret < 0)
 			return ret;
 	}
 
@@ -465,11 +462,7 @@ static int tcpci_get_vbus(struct tcpc_dev *tcpc)
 {
 	struct tcpci *tcpci = tcpc_to_tcpci(tcpc);
 	unsigned int reg;
-	int ret, vbus, bypass = 0;
-
-	trace_android_rvh_typec_tcpci_get_vbus(tcpci, tcpci->data, &vbus, &bypass);
-	if (bypass)
-		return vbus;
+	int ret;
 
 	ret = regmap_read(tcpci->regmap, TCPC_POWER_STATUS, &reg);
 	if (ret < 0)
@@ -656,6 +649,9 @@ static int tcpci_init(struct tcpc_dev *tcpc)
 		if (ret < 0)
 			return ret;
 	}
+
+	tcpci->alert_mask = reg;
+
 	return tcpci_write16(tcpci, TCPC_ALERT_MASK, reg);
 }
 
@@ -739,7 +735,7 @@ irqreturn_t tcpci_irq(struct tcpci *tcpci)
 	else if (status & TCPC_ALERT_TX_FAILED)
 		tcpm_pd_transmit_complete(tcpci->port, TCPC_TX_FAILED);
 
-	return IRQ_HANDLED;
+	return IRQ_RETVAL(status & tcpci->alert_mask);
 }
 EXPORT_SYMBOL_GPL(tcpci_irq);
 
@@ -837,8 +833,7 @@ void tcpci_unregister_port(struct tcpci *tcpci)
 }
 EXPORT_SYMBOL_GPL(tcpci_unregister_port);
 
-static int tcpci_probe(struct i2c_client *client,
-		       const struct i2c_device_id *i2c_id)
+static int tcpci_probe(struct i2c_client *client)
 {
 	struct tcpci_chip *chip;
 	int err;
@@ -866,7 +861,7 @@ static int tcpci_probe(struct i2c_client *client,
 
 	err = devm_request_threaded_irq(&client->dev, client->irq, NULL,
 					_tcpci_irq,
-					IRQF_ONESHOT | IRQF_TRIGGER_LOW,
+					IRQF_SHARED | IRQF_ONESHOT | IRQF_TRIGGER_LOW,
 					dev_name(&client->dev), chip);
 	if (err < 0) {
 		tcpci_unregister_port(chip->tcpci);

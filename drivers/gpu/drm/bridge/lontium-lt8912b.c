@@ -413,26 +413,24 @@ static const struct drm_connector_funcs lt8912_connector_funcs = {
 
 static int lt8912_connector_get_modes(struct drm_connector *connector)
 {
-	struct edid *edid;
-	int ret = -1;
-	int num = 0;
+	const struct drm_edid *drm_edid;
 	struct lt8912 *lt = connector_to_lt8912(connector);
 	u32 bus_format = MEDIA_BUS_FMT_RGB888_1X24;
+	int ret, num;
 
-	edid = drm_bridge_get_edid(lt->hdmi_port, connector);
-	if (edid) {
-		drm_connector_update_edid_property(connector, edid);
-		num = drm_add_edid_modes(connector, edid);
-	} else {
-		return ret;
-	}
+	drm_edid = drm_bridge_edid_read(lt->hdmi_port, connector);
+	drm_edid_connector_update(connector, drm_edid);
+	if (!drm_edid)
+		return 0;
+
+	num = drm_edid_connector_add_modes(connector);
 
 	ret = drm_display_info_set_bus_formats(&connector->display_info,
 					       &bus_format, 1);
-	if (ret)
-		num = ret;
+	if (ret < 0)
+		num = 0;
 
-	kfree(edid);
+	drm_edid_free(drm_edid);
 	return num;
 }
 
@@ -699,8 +697,7 @@ static int lt8912_put_dt(struct lt8912 *lt)
 	return 0;
 }
 
-static int lt8912_probe(struct i2c_client *client,
-			const struct i2c_device_id *id)
+static int lt8912_probe(struct i2c_client *client)
 {
 	static struct lt8912 *lt;
 	int ret = 0;

@@ -43,8 +43,7 @@ ieee80211_get_response_rate(struct ieee80211_supported_band *sband,
 }
 EXPORT_SYMBOL(ieee80211_get_response_rate);
 
-u32 ieee80211_mandatory_rates(struct ieee80211_supported_band *sband,
-			      enum nl80211_bss_scan_width scan_width)
+u32 ieee80211_mandatory_rates(struct ieee80211_supported_band *sband)
 {
 	struct ieee80211_rate *bitrates;
 	u32 mandatory_rates = 0;
@@ -54,15 +53,10 @@ u32 ieee80211_mandatory_rates(struct ieee80211_supported_band *sband,
 	if (WARN_ON(!sband))
 		return 1;
 
-	if (sband->band == NL80211_BAND_2GHZ) {
-		if (scan_width == NL80211_BSS_CHAN_WIDTH_5 ||
-		    scan_width == NL80211_BSS_CHAN_WIDTH_10)
-			mandatory_flag = IEEE80211_RATE_MANDATORY_G;
-		else
-			mandatory_flag = IEEE80211_RATE_MANDATORY_B;
-	} else {
+	if (sband->band == NL80211_BAND_2GHZ)
+		mandatory_flag = IEEE80211_RATE_MANDATORY_B;
+	else
 		mandatory_flag = IEEE80211_RATE_MANDATORY_A;
-	}
 
 	bitrates = sband->bitrates;
 	for (i = 0; i < sband->n_bitrates; i++)
@@ -778,7 +772,24 @@ __ieee80211_amsdu_copy(struct sk_buff *skb, unsigned int hlen,
 	return frame;
 }
 
-bool ieee80211_is_valid_amsdu(struct sk_buff *skb, bool mesh_hdr)
+static u16
+ieee80211_amsdu_subframe_length(void *field, u8 mesh_flags, u8 hdr_type)
+{
+	__le16 *field_le = field;
+	__be16 *field_be = field;
+	u16 len;
+
+	if (hdr_type >= 2)
+		len = le16_to_cpu(*field_le);
+	else
+		len = be16_to_cpu(*field_be);
+	if (hdr_type)
+		len += __ieee80211_get_mesh_hdrlen(mesh_flags);
+
+	return len;
+}
+
+bool ieee80211_is_valid_amsdu(struct sk_buff *skb, u8 mesh_hdr)
 {
 	int offset = 0, subframe_len, padding;
 
@@ -796,12 +807,8 @@ bool ieee80211_is_valid_amsdu(struct sk_buff *skb, bool mesh_hdr)
 		if (skb_copy_bits(skb, offset + 2 * ETH_ALEN, &hdr, sizeof(hdr)) < 0)
 			return false;
 
-		if (mesh_hdr)
-			len = le16_to_cpu(*(__le16 *)&hdr.len) +
-			      __ieee80211_get_mesh_hdrlen(hdr.mesh_flags);
-		else
-			len = ntohs(hdr.len);
-
+		len = ieee80211_amsdu_subframe_length(&hdr.len, hdr.mesh_flags,
+						      mesh_hdr);
 		subframe_len = sizeof(struct ethhdr) + len;
 		padding = (4 - subframe_len) & 0x3;
 
@@ -817,7 +824,7 @@ void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
 			      const u8 *addr, enum nl80211_iftype iftype,
 			      const unsigned int extra_headroom,
 			      const u8 *check_da, const u8 *check_sa,
-			      bool mesh_control)
+			      u8 mesh_control)
 {
 	unsigned int hlen = ALIGN(extra_headroom, 4);
 	struct sk_buff *frame = NULL;
@@ -846,11 +853,8 @@ void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
 		skb_copy_bits(skb, offset, &hdr, copy_len);
 		if (iftype == NL80211_IFTYPE_MESH_POINT)
 			mesh_len = __ieee80211_get_mesh_hdrlen(hdr.flags);
-		if (mesh_control)
-			len = le16_to_cpu(*(__le16 *)&hdr.eth.h_proto) + mesh_len;
-		else
-			len = ntohs(hdr.eth.h_proto);
-
+		len = ieee80211_amsdu_subframe_length(&hdr.eth.h_proto, hdr.flags,
+						      mesh_control);
 		subframe_len = sizeof(struct ethhdr) + len;
 		padding = (4 - subframe_len) & 0x3;
 
@@ -1009,7 +1013,7 @@ void cfg80211_upload_connect_keys(struct wireless_dev *wdev)
 	if (!wdev->connect_keys)
 		return;
 
-	for (i = 0; i < CFG80211_MAX_WEP_KEYS; i++) {
+	for (i = 0; i < 4; i++) {
 		if (!wdev->connect_keys->params[i].cipher)
 			continue;
 		if (rdev_add_key(rdev, dev, -1, i, false, NULL,
@@ -1646,6 +1650,114 @@ static u32 cfg80211_calculate_bitrate_eht(struct rate_info *rate)
 	return result / 10000;
 }
 
+static u32 cfg80211_calculate_bitrate_s1g(struct rate_info *rate)
+{
+	/* For 1, 2, 4, 8 and 16 MHz channels */
+	static const u32 base[5][11] = {
+		{  300000,
+		   600000,
+		   900000,
+		  1200000,
+		  1800000,
+		  2400000,
+		  2700000,
+		  3000000,
+		  3600000,
+		  4000000,
+		  /* MCS 10 supported in 1 MHz only */
+		  150000,
+		},
+		{  650000,
+		  1300000,
+		  1950000,
+		  2600000,
+		  3900000,
+		  5200000,
+		  5850000,
+		  6500000,
+		  7800000,
+		  /* MCS 9 not valid */
+		},
+		{  1350000,
+		   2700000,
+		   4050000,
+		   5400000,
+		   8100000,
+		  10800000,
+		  12150000,
+		  13500000,
+		  16200000,
+		  18000000,
+		},
+		{  2925000,
+		   5850000,
+		   8775000,
+		  11700000,
+		  17550000,
+		  23400000,
+		  26325000,
+		  29250000,
+		  35100000,
+		  39000000,
+		},
+		{  8580000,
+		  11700000,
+		  17550000,
+		  23400000,
+		  35100000,
+		  46800000,
+		  52650000,
+		  58500000,
+		  70200000,
+		  78000000,
+		},
+	};
+	u32 bitrate;
+	/* default is 1 MHz index */
+	int idx = 0;
+
+	if (rate->mcs >= 11)
+		goto warn;
+
+	switch (rate->bw) {
+	case RATE_INFO_BW_16:
+		idx = 4;
+		break;
+	case RATE_INFO_BW_8:
+		idx = 3;
+		break;
+	case RATE_INFO_BW_4:
+		idx = 2;
+		break;
+	case RATE_INFO_BW_2:
+		idx = 1;
+		break;
+	case RATE_INFO_BW_1:
+		idx = 0;
+		break;
+	case RATE_INFO_BW_5:
+	case RATE_INFO_BW_10:
+	case RATE_INFO_BW_20:
+	case RATE_INFO_BW_40:
+	case RATE_INFO_BW_80:
+	case RATE_INFO_BW_160:
+	default:
+		goto warn;
+	}
+
+	bitrate = base[idx][rate->mcs];
+	bitrate *= rate->nss;
+
+	if (rate->flags & RATE_INFO_FLAGS_SHORT_GI)
+		bitrate = (bitrate / 9) * 10;
+	/* do NOT round down here */
+	return (bitrate + 50000) / 100000;
+warn:
+	WARN_ONCE(1, "invalid rate bw=%d, mcs=%d, nss=%d\n",
+		  rate->bw, rate->mcs, rate->nss);
+	return 0;
+}
+
 u32 cfg80211_calculate_bitrate(struct rate_info *rate)
 {
 	if (rate->flags & RATE_INFO_FLAGS_MCS)
@@ -1662,6 +1774,8 @@ u32 cfg80211_calculate_bitrate(struct rate_info *rate)
 		return cfg80211_calculate_bitrate_he(rate);
 	if (rate->flags & RATE_INFO_FLAGS_EHT_MCS)
 		return cfg80211_calculate_bitrate_eht(rate);
+	if (rate->flags & RATE_INFO_FLAGS_S1G_MCS)
+		return cfg80211_calculate_bitrate_s1g(rate);
 
 	return rate->legacy;
 }

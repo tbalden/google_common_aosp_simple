@@ -396,8 +396,7 @@ static void pmz_transmit_chars(struct uart_pmac_port *uap)
 	write_zsdata(uap, xmit->buf[xmit->tail]);
 	zssync(uap);
 
-	xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-	uap->port.icount.tx++;
+	uart_xmit_advance(&uap->port, 1);
 
 	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
 		uart_write_wakeup(&uap->port);
@@ -613,8 +612,7 @@ static void pmz_start_tx(struct uart_port *port)
 			return;
 		write_zsdata(uap, xmit->buf[xmit->tail]);
 		zssync(uap);
-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-		port->icount.tx++;
+		uart_xmit_advance(port, 1);
 
 		if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
 			uart_write_wakeup(&uap->port);

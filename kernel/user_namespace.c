@@ -229,7 +229,7 @@ void __put_user_ns(struct user_namespace *ns)
 EXPORT_SYMBOL(__put_user_ns);
 
 /**
- * idmap_key struct holds the information necessary to find an idmapping in a
+ * struct idmap_key - holds the information necessary to find an idmapping in a
  * sorted idmap array. It is passed to cmp_map_id() as first argument.
  */
 struct idmap_key {
@@ -329,7 +329,7 @@ static u32 map_id_range_down(struct uid_gid_map *map, u32 id, u32 count)
 	return id;
 }
 
-static u32 map_id_down(struct uid_gid_map *map, u32 id)
+u32 map_id_down(struct uid_gid_map *map, u32 id)
 {
 	return map_id_range_down(map, id, 1);
 }
@@ -372,7 +372,7 @@ map_id_up_max(unsigned extents, struct uid_gid_map *map, u32 id)
 		       sizeof(struct uid_gid_extent), cmp_map_id);
 }
 
-static u32 map_id_up(struct uid_gid_map *map, u32 id)
+u32 map_id_up(struct uid_gid_map *map, u32 id)
 {
 	struct uid_gid_extent *extent;
 	unsigned extents = map->nr_extents;

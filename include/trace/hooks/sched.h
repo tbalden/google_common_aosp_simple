@@ -136,10 +136,6 @@ DECLARE_RESTRICTED_HOOK(android_rvh_sched_setaffinity,
 	TP_PROTO(struct task_struct *p, const struct cpumask *in_mask, int *retval),
 	TP_ARGS(p, in_mask, retval), 1);
 
-DECLARE_RESTRICTED_HOOK(android_rvh_sched_getaffinity,
-	TP_PROTO(struct task_struct *p, struct cpumask *in_mask),
-	TP_ARGS(p, in_mask), 1);
-
 DECLARE_RESTRICTED_HOOK(android_rvh_set_task_cpu,
 	TP_PROTO(struct task_struct *p, unsigned int new_cpu),
 	TP_ARGS(p, new_cpu), 1);
@@ -173,9 +169,8 @@ DECLARE_RESTRICTED_HOOK(android_rvh_tick_entry,
 	TP_ARGS(rq), 1);
 
 DECLARE_RESTRICTED_HOOK(android_rvh_schedule,
-	TP_PROTO(unsigned int sched_mode, struct task_struct *prev,
-		struct task_struct *next, struct rq *rq),
-	TP_ARGS(sched_mode, prev, next, rq), 1);
+	TP_PROTO(struct task_struct *prev, struct task_struct *next, struct rq *rq),
+	TP_ARGS(prev, next, rq), 1);
 
 DECLARE_RESTRICTED_HOOK(android_rvh_sched_cpu_starting,
 	TP_PROTO(int cpu),
@@ -236,12 +231,6 @@ DECLARE_HOOK(android_vh_build_sched_domains,
 	TP_PROTO(bool has_asym),
 	TP_ARGS(has_asym));
 
-DECLARE_RESTRICTED_HOOK(android_rvh_check_preempt_tick,
-	TP_PROTO(struct task_struct *p, unsigned long *ideal_runtime, bool *skip_preempt,
-			unsigned long delta_exec, struct cfs_rq *cfs_rq, struct sched_entity *curr,
-			unsigned int granularity),
-	TP_ARGS(p, ideal_runtime, skip_preempt, delta_exec, cfs_rq, curr, granularity), 1);
-
 DECLARE_RESTRICTED_HOOK(android_rvh_check_preempt_wakeup_ignore,
 	TP_PROTO(struct task_struct *p, bool *ignore),
 	TP_ARGS(p, ignore), 1);
@@ -255,18 +244,16 @@ DECLARE_RESTRICTED_HOOK(android_rvh_sched_balance_rt,
 	TP_PROTO(struct rq *rq, struct task_struct *p, int *done),
 	TP_ARGS(rq, p, done), 1);
 
-struct cfs_rq;
-DECLARE_RESTRICTED_HOOK(android_rvh_pick_next_entity,
-	TP_PROTO(struct cfs_rq *cfs_rq, struct sched_entity *curr,
-		 struct sched_entity **se),
-	TP_ARGS(cfs_rq, curr, se), 1);
-
 DECLARE_RESTRICTED_HOOK(android_rvh_check_preempt_wakeup,
 	TP_PROTO(struct rq *rq, struct task_struct *p, bool *preempt, bool *nopreempt,
 			int wake_flags, struct sched_entity *se, struct sched_entity *pse,
-			int next_buddy_marked, unsigned int granularity),
-	TP_ARGS(rq, p, preempt, nopreempt, wake_flags, se, pse, next_buddy_marked,
-			granularity), 1);
+			int next_buddy_marked),
+	TP_ARGS(rq, p, preempt, nopreempt, wake_flags, se, pse, next_buddy_marked), 1);
+
+struct cfs_rq;
+DECLARE_RESTRICTED_HOOK(android_rvh_update_deadline,
+	TP_PROTO(struct cfs_rq *cfs_rq, struct sched_entity *se, bool *skip_preempt),
+	TP_ARGS(cfs_rq, se, skip_preempt), 1);
 
 DECLARE_RESTRICTED_HOOK(android_rvh_set_cpus_allowed_by_task,
 	TP_PROTO(const struct cpumask *cpu_valid_mask, const struct cpumask *new_mask,
@@ -286,9 +273,8 @@ DECLARE_HOOK(android_vh_free_task,
 	TP_ARGS(p));
 
 DECLARE_HOOK(android_vh_copy_process,
-	TP_PROTO(struct task_struct *p, int nr_threads, int current_signal_nr_threads),
-	TP_ARGS(p, nr_threads, current_signal_nr_threads));
-
+	TP_PROTO(struct task_struct *p, int nr_threads),
+	TP_ARGS(p, nr_threads));
 
 DECLARE_HOOK(android_vh_irqtime_account_process_tick,
 	TP_PROTO(struct task_struct *p, struct rq *rq, int user_tick, int ticks),
@@ -346,8 +332,8 @@ DECLARE_HOOK(android_vh_setscheduler_uclamp,
 
 DECLARE_HOOK(android_vh_uclamp_validate,
 	TP_PROTO(struct task_struct *p, const struct sched_attr *attr,
-		 bool user, int *ret, bool *done),
-	TP_ARGS(p, attr, user, ret, done));
+		 int *ret, bool *done),
+	TP_ARGS(p, attr, ret, done));
 
 DECLARE_HOOK(android_vh_update_topology_flags_workfn,
 	TP_PROTO(void *unused),
@@ -365,45 +351,6 @@ DECLARE_HOOK(android_vh_set_wake_flags,
 	TP_PROTO(int *wake_flags, unsigned int *mode),
 	TP_ARGS(wake_flags, mode));
 
-DECLARE_RESTRICTED_HOOK(android_rvh_find_new_ilb,
-	TP_PROTO(struct cpumask *nohz_idle_cpus_mask, int *ilb),
-	TP_ARGS(nohz_idle_cpus_mask, ilb), 1);
-
-DECLARE_RESTRICTED_HOOK(android_rvh_find_energy_efficient_cpu,
-	TP_PROTO(struct task_struct *p, int prev_cpu, int sync, int *new_cpu),
-	TP_ARGS(p, prev_cpu, sync, new_cpu), 1);
-
-DECLARE_HOOK(android_vh_sched_pelt_multiplier,
-	TP_PROTO(unsigned int old, unsigned int cur, int *ret),
-	TP_ARGS(old, cur, ret));
-
-struct cpufreq_policy;
-DECLARE_HOOK(android_vh_map_util_freq,
-	TP_PROTO(unsigned long util, unsigned long freq,
-		unsigned long cap, unsigned long *next_freq, struct cpufreq_policy *policy,
-		bool *need_freq_update),
-	TP_ARGS(util, freq, cap, next_freq, policy, need_freq_update));
-
-DECLARE_RESTRICTED_HOOK(android_rvh_set_cpus_allowed_comm,
-	TP_PROTO(struct task_struct *p, const struct cpumask *new_mask),
-	TP_ARGS(p, new_mask), 1);
-
-DECLARE_HOOK(android_vh_sched_setaffinity_early,
-	TP_PROTO(struct task_struct *p, const struct cpumask *new_mask, bool *retval),
-	TP_ARGS(p, new_mask, retval));
-
-DECLARE_HOOK(android_vh_account_process_tick_gran,
-	TP_PROTO(int user_tick, int *ticks),
-	TP_ARGS(user_tick, ticks));
-
-DECLARE_HOOK(android_vh_account_task_time,
-	TP_PROTO(struct task_struct *p, struct rq *rq, int user_tick, int ticks),
-	TP_ARGS(p, rq, user_tick, ticks));
-
-DECLARE_HOOK(android_vh_dup_task_struct,
-	TP_PROTO(struct task_struct *tsk, struct task_struct *orig),
-	TP_ARGS(tsk, orig));
-
 DECLARE_RESTRICTED_HOOK(android_rvh_post_init_entity_util_avg,
 	TP_PROTO(struct sched_entity *se),
 	TP_ARGS(se), 1);
@@ -413,17 +360,83 @@ DECLARE_RESTRICTED_HOOK(android_rvh_effective_cpu_util,
 		 struct task_struct *p, unsigned long *new_util),
 	TP_ARGS(cpu, util_cfs, max, type, p, new_util), 1);
 
-DECLARE_HOOK(android_vh_mmput,
-	TP_PROTO(struct mm_struct *mm),
-	TP_ARGS(mm));
+DECLARE_HOOK(android_vh_dup_task_struct,
+	TP_PROTO(struct task_struct *tsk, struct task_struct *orig),
+	TP_ARGS(tsk, orig));
 
-struct sched_attr;
-DECLARE_HOOK(android_vh_set_sugov_sched_attr,
-	TP_PROTO(struct sched_attr *attr),
-	TP_ARGS(attr));
-DECLARE_RESTRICTED_HOOK(android_rvh_set_iowait,
-	TP_PROTO(struct task_struct *p, struct rq *rq, int *should_iowait_boost),
-	TP_ARGS(p, rq, should_iowait_boost), 1);
+DECLARE_RESTRICTED_HOOK(android_rvh_set_task_comm,
+	TP_PROTO(struct task_struct *tsk, bool exec),
+	TP_ARGS(tsk, exec), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_find_new_ilb,
+	TP_PROTO(struct cpumask *nohz_idle_cpus_mask, int *ilb),
+	TP_ARGS(nohz_idle_cpus_mask, ilb), 1);
+
+DECLARE_HOOK(android_vh_sched_pelt_multiplier,
+	TP_PROTO(unsigned int old, unsigned int cur, int *ret),
+	TP_ARGS(old, cur, ret));
+
+DECLARE_RESTRICTED_HOOK(android_rvh_find_energy_efficient_cpu,
+	TP_PROTO(struct task_struct *p, int prev_cpu, int sync, int *new_cpu),
+	TP_ARGS(p, prev_cpu, sync, new_cpu), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_cpu_util_cfs_boost,
+	TP_PROTO(int cpu, unsigned long *util),
+	TP_ARGS(cpu, util), 1);
+
+DECLARE_HOOK(android_vh_account_process_tick_gran,
+	TP_PROTO(struct task_struct *p, struct rq *rq, int user_tick, int *ticks),
+	TP_ARGS(p, rq, user_tick, ticks));
+
+struct affinity_context;
+DECLARE_RESTRICTED_HOOK(android_rvh_set_cpus_allowed_ptr,
+	TP_PROTO(struct task_struct *p, struct affinity_context *ctx, bool *skip_user_ptr),
+	TP_ARGS(p, ctx, skip_user_ptr), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_set_cpus_allowed_comm,
+	TP_PROTO(struct task_struct *p, const struct cpumask *new_mask),
+	TP_ARGS(p, new_mask), 1);
+
+DECLARE_HOOK(android_vh_sched_setaffinity_early,
+	TP_PROTO(struct task_struct *p, const struct cpumask *new_mask, bool *retval),
+	TP_ARGS(p, new_mask, retval));
+
+DECLARE_HOOK(android_vh_tick_nohz_idle_stop_tick,
+	TP_PROTO(void *unused),
+	TP_ARGS(unused));
+
+struct cpufreq_policy;
+DECLARE_HOOK(android_vh_map_util_freq,
+	TP_PROTO(unsigned long util, unsigned long freq,
+		unsigned long cap, unsigned long *next_freq, struct cpufreq_policy *policy,
+		bool *need_freq_update),
+	TP_ARGS(util, freq, cap, next_freq, policy, need_freq_update));
+
+struct cgroup_subsys_state;
+DECLARE_HOOK(android_vh_sched_move_task,
+	TP_PROTO(struct task_struct *tsk),
+	TP_ARGS(tsk));
+DECLARE_HOOK(android_vh_cpu_cgroup_css_alloc,
+	TP_PROTO(struct task_group *tg, struct cgroup_subsys_state *parent_css),
+	TP_ARGS(tg, parent_css));
+DECLARE_HOOK(android_vh_cpu_cgroup_css_alloc_early,
+	TP_PROTO(struct task_group *parent),
+	TP_ARGS(parent));
+DECLARE_HOOK(android_vh_cpu_cgroup_css_free,
+	TP_PROTO(struct cgroup_subsys_state *css),
+	TP_ARGS(css));
+
+DECLARE_HOOK(android_vh_reweight_entity,
+	TP_PROTO(struct sched_entity *se),
+	TP_ARGS(se));
+
+DECLARE_RESTRICTED_HOOK(android_rvh_context_switch,
+	TP_PROTO(struct task_struct *pre, struct task_struct *next),
+	TP_ARGS(pre, next), 1);
+
+DECLARE_HOOK(android_vh_mmput,
+	TP_PROTO(void *unused),
+	TP_ARGS(unused));
 
 DECLARE_RESTRICTED_HOOK(android_rvh_attach_entity_load_avg,
 	TP_PROTO(struct cfs_rq *cfs_rq, struct sched_entity *se),
@@ -437,11 +450,6 @@ DECLARE_RESTRICTED_HOOK(android_rvh_update_load_avg,
 	TP_PROTO(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se),
 	TP_ARGS(now, cfs_rq, se), 1);
 
-
-DECLARE_RESTRICTED_HOOK(android_rvh_update_load_sum,
-	TP_PROTO(struct sched_avg *sa, u64 *delta, unsigned int *sched_pelt_lshift),
-	TP_ARGS(sa, delta, sched_pelt_lshift), 1);
-
 DECLARE_RESTRICTED_HOOK(android_rvh_remove_entity_load_avg,
 	TP_PROTO(struct cfs_rq *cfs_rq, struct sched_entity *se),
 	TP_ARGS(cfs_rq, se), 1);
@@ -449,6 +457,16 @@ DECLARE_RESTRICTED_HOOK(android_rvh_remove_entity_load_avg,
 DECLARE_RESTRICTED_HOOK(android_rvh_update_blocked_fair,
 	TP_PROTO(struct rq *rq),
 	TP_ARGS(rq), 1);
+
+struct sched_attr;
+
+DECLARE_HOOK(android_vh_set_sugov_sched_attr,
+	TP_PROTO(struct sched_attr *attr),
+	TP_ARGS(attr));
+
+DECLARE_RESTRICTED_HOOK(android_rvh_set_iowait,
+	TP_PROTO(struct task_struct *p, struct rq *rq, int *should_iowait_boost),
+	TP_ARGS(p, rq, should_iowait_boost), 1);
 
 DECLARE_RESTRICTED_HOOK(android_rvh_update_rt_rq_load_avg,
 	TP_PROTO(u64 now, struct rq *rq, struct task_struct *tsk, int running),

@@ -3048,7 +3048,7 @@ static int toshiba_acpi_hwmon_read(struct device *dev, enum hwmon_sensor_types t
 	return -EOPNOTSUPP;
 }
 
-static const struct hwmon_channel_info *toshiba_acpi_hwmon_info[] = {
+static const struct hwmon_channel_info * const toshiba_acpi_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT),
 	NULL
 };
@@ -3124,7 +3124,7 @@ static struct attribute *toshiba_acpi_battery_attrs[] = {
 
 ATTRIBUTE_GROUPS(toshiba_acpi_battery);
 
-static int toshiba_acpi_battery_add(struct power_supply *battery)
+static int toshiba_acpi_battery_add(struct power_supply *battery, struct acpi_battery_hook *hook)
 {
 	if (toshiba_acpi == NULL) {
 		pr_err("Init order issue\n");
@@ -3137,7 +3137,7 @@ static int toshiba_acpi_battery_add(struct power_supply *battery)
 	return 0;
 }
 
-static int toshiba_acpi_battery_remove(struct power_supply *battery)
+static int toshiba_acpi_battery_remove(struct power_supply *battery, struct acpi_battery_hook *hook)
 {
 	device_remove_groups(&battery->dev, toshiba_acpi_battery_groups);
 	return 0;
@@ -3197,7 +3197,7 @@ static void print_supported_features(struct toshiba_acpi_dev *dev)
 	pr_cont("\n");
 }
 
-static int toshiba_acpi_remove(struct acpi_device *acpi_dev)
+static void toshiba_acpi_remove(struct acpi_device *acpi_dev)
 {
 	struct toshiba_acpi_dev *dev = acpi_driver_data(acpi_dev);
 
@@ -3245,8 +3245,6 @@ static int toshiba_acpi_remove(struct acpi_device *acpi_dev)
 		toshiba_acpi = NULL;
 
 	kfree(dev);
-
-	return 0;
 }
 
 static const char *find_hci_method(acpi_handle handle)

@@ -5,6 +5,7 @@
 #include <linux/seq_file.h>
 #include <asm/setup.h>
 
+#include "internal.h"
 #if 1
 #include <linux/slab.h>
 
@@ -115,6 +116,7 @@ static void replace_safetynet_flags(char *cmd)
 
 static int __init proc_cmdline_init(void)
 {
+	struct proc_dir_entry *pde;
 #ifdef CONFIG_UCI
 	init_custom_fs();
 #endif
@@ -131,7 +133,9 @@ static int __init proc_cmdline_init(void)
 	remove_safetynet_flags(new_command_line);
 #endif
 
-	proc_create_single("cmdline", 0, NULL, cmdline_proc_show);
+	pde = proc_create_single("cmdline", 0, NULL, cmdline_proc_show);
+	pde_make_permanent(pde);
+	pde->size = saved_command_line_len + 1;
 	return 0;
 }
 fs_initcall(proc_cmdline_init);

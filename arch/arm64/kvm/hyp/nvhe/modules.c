@@ -5,12 +5,25 @@
 #include <asm/kvm_host.h>
 #include <asm/kvm_pkvm_module.h>
 
+#include <nvhe/alloc.h>
+#include <nvhe/iommu.h>
 #include <nvhe/mem_protect.h>
 #include <nvhe/modules.h>
 #include <nvhe/mm.h>
 #include <nvhe/serial.h>
 #include <nvhe/spinlock.h>
+#include <nvhe/trace/trace.h>
 #include <nvhe/trap_handler.h>
+
+static void *__pkvm_module_memcpy(void *to, const void *from, size_t count)
+{
+	return memcpy(to, from, count);
+}
+
+static void *__pkvm_module_memset(void *dst, int c, size_t count)
+{
+	return memset(dst, c, count);
+}
 
 static void __kvm_flush_dcache_to_poc(void *addr, size_t size)
 {
@@ -77,9 +90,19 @@ void __pkvm_close_module_registration(void)
 	 */
 }
 
-static int __pkvm_module_host_donate_hyp(u64 pfn, u64 nr_pages)
+static int _hyp_smp_processor_id(void)
 {
-	return ___pkvm_host_donate_hyp(pfn, nr_pages, true);
+	return hyp_smp_processor_id();
+}
+
+static int host_stage2_enable_lazy_pte(u64 pfn, u64 nr_pages)
+{
+	return __pkvm_host_lazy_pte(pfn, nr_pages, true);
+}
+
+static int host_stage2_disable_lazy_pte(u64 pfn, u64 nr_pages)
+{
+	return __pkvm_host_lazy_pte(pfn, nr_pages, false);
 }
 
 const struct pkvm_module_ops module_ops = {
@@ -87,6 +110,7 @@ const struct pkvm_module_ops module_ops = {
 	.alloc_module_va = __pkvm_alloc_module_va,
 	.map_module_page = __pkvm_map_module_page,
 	.register_serial_driver = __pkvm_register_serial_driver,
+	.putc = hyp_putc,
 	.puts = hyp_puts,
 	.putx64 = hyp_putx64,
 	.fixmap_map = hyp_fixmap_map,
@@ -104,18 +128,43 @@ const struct pkvm_module_ops module_ops = {
 	.register_illegal_abt_notifier = __pkvm_register_illegal_abt_notifier,
 	.register_psci_notifier = __pkvm_register_psci_notifier,
 	.register_hyp_panic_notifier = __pkvm_register_hyp_panic_notifier,
-	.host_donate_hyp = __pkvm_module_host_donate_hyp,
+	.register_unmask_serror = __pkvm_register_unmask_serror,
+	.host_donate_hyp = ___pkvm_host_donate_hyp,
+	.host_donate_hyp_prot = ___pkvm_host_donate_hyp_prot,
 	.hyp_donate_host = __pkvm_hyp_donate_host,
 	.host_share_hyp = __pkvm_host_share_hyp,
 	.host_unshare_hyp = __pkvm_host_unshare_hyp,
 	.pin_shared_mem = hyp_pin_shared_mem,
 	.unpin_shared_mem = hyp_unpin_shared_mem,
-	.memcpy = memcpy,
-	.memset = memset,
+	.memcpy = __pkvm_module_memcpy,
+	.memset = __pkvm_module_memset,
 	.hyp_pa = hyp_virt_to_phys,
 	.hyp_va = hyp_phys_to_virt,
 	.kern_hyp_va = __kern_hyp_va,
-	.host_stage2_mod_prot_range = module_change_host_page_prot_range,
+	.hyp_alloc = hyp_alloc,
+	.hyp_alloc_errno = hyp_alloc_errno,
+	.hyp_free = hyp_free,
+	.iommu_donate_pages = kvm_iommu_donate_pages,
+	.iommu_reclaim_pages = kvm_iommu_reclaim_pages,
+	.iommu_request = kvm_iommu_request,
+	.iommu_init_device = kvm_iommu_init_device,
+	.udelay = pkvm_udelay,
+	.hyp_alloc_missing_donations = hyp_alloc_missing_donations,
+#ifdef CONFIG_LIST_HARDENED
+	.list_add_valid_or_report = __list_add_valid_or_report,
+	.list_del_entry_valid_or_report = __list_del_entry_valid_or_report,
+#endif
+	.iommu_iotlb_gather_add_page = kvm_iommu_iotlb_gather_add_page,
+	.register_hyp_event_ids = register_hyp_event_ids,
+	.tracing_reserve_entry = tracing_reserve_entry,
+	.tracing_commit_entry = tracing_commit_entry,
+	.iommu_donate_pages_atomic = kvm_iommu_donate_pages_atomic,
+	.iommu_reclaim_pages_atomic = kvm_iommu_reclaim_pages_atomic,
+	.iommu_snapshot_host_stage2 = kvm_iommu_snapshot_host_stage2,
+	.hyp_smp_processor_id = _hyp_smp_processor_id,
+	.iommu_flush_unmap_cache = kvm_iommu_flush_unmap_cache,
+	.host_stage2_enable_lazy_pte = host_stage2_enable_lazy_pte,
+	.host_stage2_disable_lazy_pte = host_stage2_disable_lazy_pte,
 };
 
 int __pkvm_init_module(void *module_init)
@@ -132,9 +181,8 @@ DEFINE_HYP_SPINLOCK(dyn_hcall_lock);
 
 static dyn_hcall_t host_dynamic_hcalls[MAX_DYNAMIC_HCALLS];
 
-int handle_host_dynamic_hcall(struct kvm_cpu_context *host_ctxt)
+int handle_host_dynamic_hcall(struct user_pt_regs *regs, int id)
 {
-	DECLARE_REG(unsigned long, id, host_ctxt, 0);
 	dyn_hcall_t hfn;
 	int dyn_id;
 
@@ -142,27 +190,23 @@ int handle_host_dynamic_hcall(struct kvm_cpu_context *host_ctxt)
 	 * TODO: static key to protect when no dynamic hcall is registered?
 	 */
 
-	dyn_id = (int)(id - KVM_HOST_SMCCC_ID(0)) -
-		 __KVM_HOST_SMCCC_FUNC___dynamic_hcalls;
+	dyn_id = id - __KVM_HOST_SMCCC_FUNC___dynamic_hcalls;
 	if (dyn_id < 0)
 		return HCALL_UNHANDLED;
-
-	cpu_reg(host_ctxt, 0) = SMCCC_RET_NOT_SUPPORTED;
 
 	/*
 	 * Order access to num_dynamic_hcalls and host_dynamic_hcalls. Paired
 	 * with __pkvm_register_hcall().
 	 */
 	if (dyn_id >= atomic_read_acquire(&num_dynamic_hcalls))
-		goto end;
+		return HCALL_UNHANDLED;
 
 	hfn = READ_ONCE(host_dynamic_hcalls[dyn_id]);
 	if (!hfn)
-		goto end;
+		return HCALL_UNHANDLED;
 
-	cpu_reg(host_ctxt, 0) = SMCCC_RET_SUCCESS;
-	hfn(host_ctxt);
-end:
+	hfn(regs);
+
 	return HCALL_HANDLED;
 }
 

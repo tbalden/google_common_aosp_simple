@@ -802,7 +802,7 @@ static ssize_t reiserfs_quota_write(struct super_block *, int, const char *,
 static ssize_t reiserfs_quota_read(struct super_block *, int, char *, size_t,
 				   loff_t);
 
-static struct dquot **reiserfs_get_dquots(struct inode *inode)
+static struct dquot __rcu **reiserfs_get_dquots(struct inode *inode)
 {
 	return REISERFS_I(inode)->i_dquot;
 }
@@ -2587,7 +2587,7 @@ out:
 		return err;
 	if (inode->i_size < off + len - towrite)
 		i_size_write(inode, off + len - towrite);
-	inode->i_mtime = inode->i_ctime = current_time(inode);
+	inode->i_mtime = inode_set_ctime_current(inode);
 	mark_inode_dirty(inode);
 	return len - towrite;
 }
@@ -2642,6 +2642,7 @@ MODULE_ALIAS_FS("reiserfs");
 MODULE_DESCRIPTION("ReiserFS journaled filesystem");
 MODULE_AUTHOR("Hans Reiser <reiser@namesys.com>");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
 
 module_init(init_reiserfs_fs);
 module_exit(exit_reiserfs_fs);

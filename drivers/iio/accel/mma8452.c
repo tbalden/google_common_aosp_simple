@@ -28,7 +28,7 @@
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/events.h>
 #include <linux/delay.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
@@ -711,7 +711,7 @@ static int mma8452_write_raw(struct iio_dev *indio_dev,
 			     int val, int val2, long mask)
 {
 	struct mma8452_data *data = iio_priv(indio_dev);
-	int i, j, ret;
+	int i, ret;
 
 	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
@@ -771,17 +771,13 @@ static int mma8452_write_raw(struct iio_dev *indio_dev,
 		break;
 
 	case IIO_CHAN_INFO_OVERSAMPLING_RATIO:
-		j = mma8452_get_odr_index(data);
+		ret = mma8452_get_odr_index(data);
 
 		for (i = 0; i < ARRAY_SIZE(mma8452_os_ratio); i++) {
-			if (mma8452_os_ratio[i][j] == val) {
+			if (mma8452_os_ratio[i][ret] == val) {
 				ret = mma8452_set_power_mode(data, i);
 				break;
 			}
-		}
-		if (i == ARRAY_SIZE(mma8452_os_ratio)) {
-			ret = -EINVAL;
-			break;
 		}
 		break;
 	default:
@@ -1071,7 +1067,7 @@ static irqreturn_t mma8452_interrupt(int irq, void *p)
 		return IRQ_NONE;
 
 	if (src & MMA8452_INT_DRDY) {
-		iio_trigger_poll_chained(indio_dev->trig);
+		iio_trigger_poll_nested(indio_dev->trig);
 		ret = IRQ_HANDLED;
 	}
 
@@ -1549,9 +1545,9 @@ static const struct of_device_id mma8452_dt_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, mma8452_dt_ids);
 
-static int mma8452_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static int mma8452_probe(struct i2c_client *client)
 {
+	const struct i2c_device_id *id = i2c_client_get_device_id(client);
 	struct mma8452_data *data;
 	struct iio_dev *indio_dev;
 	int ret;

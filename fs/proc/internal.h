@@ -84,20 +84,6 @@ static inline void pde_make_permanent(struct proc_dir_entry *pde)
 	pde->flags |= PROC_ENTRY_PERMANENT;
 }
 
-static inline bool pde_has_proc_read_iter(const struct proc_dir_entry *pde)
-{
-	return pde->flags & PROC_ENTRY_proc_read_iter;
-}
-
-static inline bool pde_has_proc_compat_ioctl(const struct proc_dir_entry *pde)
-{
-#ifdef CONFIG_COMPAT
-	return pde->flags & PROC_ENTRY_proc_compat_ioctl;
-#else
-	return false;
-#endif
-}
-
 extern struct kmem_cache *proc_dir_entry_cache;
 void pde_free(struct proc_dir_entry *pde);
 
@@ -176,9 +162,9 @@ extern int proc_pid_statm(struct seq_file *, struct pid_namespace *,
  * base.c
  */
 extern const struct dentry_operations pid_dentry_operations;
-extern int pid_getattr(struct user_namespace *, const struct path *,
+extern int pid_getattr(struct mnt_idmap *, const struct path *,
 		       struct kstat *, u32, unsigned int);
-extern int proc_setattr(struct user_namespace *, struct dentry *,
+extern int proc_setattr(struct mnt_idmap *, struct dentry *,
 			struct iattr *);
 extern void proc_pid_evict_inode(struct proc_inode *);
 extern struct inode *proc_pid_make_inode(struct super_block *, struct task_struct *, umode_t);

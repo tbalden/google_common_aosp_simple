@@ -71,8 +71,7 @@
 #include <net/netlink.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/netlink.h>
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/net.h>
+
 #include "af_netlink.h"
 
 struct listeners {
@@ -659,6 +658,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 	struct netlink_sock *nlk;
 	int (*bind)(struct net *net, int group);
 	void (*unbind)(struct net *net, int group);
+	void (*release)(struct sock *sock, unsigned long *groups);
 	int err = 0;
 
 	sock->state = SS_UNCONNECTED;
@@ -686,6 +686,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 	cb_mutex = nl_table[protocol].cb_mutex;
 	bind = nl_table[protocol].bind;
 	unbind = nl_table[protocol].unbind;
+	release = nl_table[protocol].release;
 	netlink_unlock_table();
 
 	if (err < 0)
@@ -701,6 +702,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 	nlk->module = module;
 	nlk->netlink_bind = bind;
 	nlk->netlink_unbind = unbind;
+	nlk->netlink_release = release;
 out:
 	return err;
 
@@ -739,6 +741,8 @@ static int netlink_release(struct socket *sock)
 	 * OK. Socket is unlinked, any packets that arrive now
 	 * will be purged.
 	 */
+	if (nlk->netlink_release)
+		nlk->netlink_release(sk, nlk->groups);
 
 	/* must not acquire netlink_table_lock in any way again before unbind
 	 * and notifying genetlink is done as otherwise it might deadlock
@@ -798,6 +802,17 @@ static int netlink_release(struct socket *sock)
 	}
 
 	sock_prot_inuse_add(sock_net(sk), &netlink_proto, -1);
+
+	/* Because struct net might disappear soon, do not keep a pointer. */
+	if (!sk->sk_net_refcnt && sock_net(sk) != &init_net) {
+		__netns_tracker_free(sock_net(sk), &sk->ns_tracker, false);
+		/* Because of deferred_put_nlk_sk and use of work queue,
+		 * it is possible  netns will be freed before this socket.
+		 */
+		sock_net_set(sk, &init_net);
+		__netns_tracker_alloc(&init_net, &sk->ns_tracker,
+				      false, GFP_KERNEL);
+	}
 	call_rcu(&nlk->rcu, deferred_put_nlk_sk);
 	return 0;
 }
@@ -821,7 +836,7 @@ retry:
 		/* Bind collision, search negative portid values. */
 		if (rover == -4096)
 			/* rover will be in range [S32_MIN, -4097] */
-			rover = S32_MIN + prandom_u32_max(-4096 - S32_MIN);
+			rover = S32_MIN + get_random_u32_below(-4096 - S32_MIN);
 		else if (rover >= -4096)
 			rover = -4097;
 		portid = rover--;
@@ -1403,6 +1418,8 @@ struct netlink_broadcast_data {
 	int delivered;
 	gfp_t allocation;
 	struct sk_buff *skb, *skb2;
+	int (*tx_filter)(struct sock *dsk, struct sk_buff *skb, void *data);
+	void *tx_data;
 };
 
 static void do_one_broadcast(struct sock *sk,
@@ -1456,6 +1473,13 @@ static void do_one_broadcast(struct sock *sk,
 			p->delivery_failure = 1;
 		goto out;
 	}
+
+	if (p->tx_filter && p->tx_filter(sk, p->skb2, p->tx_data)) {
+		kfree_skb(p->skb2);
+		p->skb2 = NULL;
+		goto out;
+	}
+
 	if (sk_filter(sk, p->skb2)) {
 		kfree_skb(p->skb2);
 		p->skb2 = NULL;
@@ -1478,8 +1502,12 @@ out:
 	sock_put(sk);
 }
 
-int netlink_broadcast(struct sock *ssk, struct sk_buff *skb, u32 portid,
-		      u32 group, gfp_t allocation)
+int netlink_broadcast_filtered(struct sock *ssk, struct sk_buff *skb,
+			       u32 portid,
+			       u32 group, gfp_t allocation,
+			       int (*filter)(struct sock *dsk,
+					     struct sk_buff *skb, void *data),
+			       void *filter_data)
 {
 	struct net *net = sock_net(ssk);
 	struct netlink_broadcast_data info;
@@ -1498,6 +1526,8 @@ int netlink_broadcast(struct sock *ssk, struct sk_buff *skb, u32 portid,
 	info.allocation = allocation;
 	info.skb = skb;
 	info.skb2 = NULL;
+	info.tx_filter = filter;
+	info.tx_data = filter_data;
 
 	/* While we sleep in clone, do not allow to change socket list */
 
@@ -1522,6 +1552,14 @@ int netlink_broadcast(struct sock *ssk, struct sk_buff *skb, u32 portid,
 		return 0;
 	}
 	return -ESRCH;
+}
+EXPORT_SYMBOL(netlink_broadcast_filtered);
+
+int netlink_broadcast(struct sock *ssk, struct sk_buff *skb, u32 portid,
+		      u32 group, gfp_t allocation)
+{
+	return netlink_broadcast_filtered(ssk, skb, portid, group, allocation,
+					  NULL, NULL);
 }
 EXPORT_SYMBOL(netlink_broadcast);
 
@@ -1600,10 +1638,7 @@ static void netlink_update_socket_mc(struct netlink_sock *nlk,
 
 	old = test_bit(group - 1, nlk->groups);
 	subscriptions = nlk->subscriptions - old + new;
-	if (new)
-		__set_bit(group - 1, nlk->groups);
-	else
-		__clear_bit(group - 1, nlk->groups);
+	__assign_bit(group - 1, nlk->groups, new);
 	netlink_update_subscriptions(&nlk->sk, subscriptions);
 	netlink_update_listeners(&nlk->sk);
 }
@@ -1952,15 +1987,6 @@ out:
 	return err ? : copied;
 }
 
-static __poll_t netlink_poll(struct file *file, struct socket *sock,
-			     poll_table *wait)
-{
-	__poll_t mask = datagram_poll(file, sock, wait);
-
-	trace_android_vh_netlink_poll(file, sock, wait, &mask);
-	return mask;
-}
-
 static void netlink_data_ready(struct sock *sk)
 {
 	BUG();
@@ -2024,9 +2050,8 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
 		if (cfg) {
 			nl_table[unit].bind = cfg->bind;
 			nl_table[unit].unbind = cfg->unbind;
+			nl_table[unit].release = cfg->release;
 			nl_table[unit].flags = cfg->flags;
-			if (cfg->compare)
-				nl_table[unit].compare = cfg->compare;
 		}
 		nl_table[unit].registered = 1;
 	} else {
@@ -2319,7 +2344,9 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 	cb->strict_check = nlk_test_bit(STRICT_CHK, NETLINK_CB(skb).sk);
 
 	if (control->start) {
+		cb->extack = control->extack;
 		ret = control->start(cb);
+		cb->extack = NULL;
 		if (ret)
 			goto error_put;
 	}
@@ -2761,7 +2788,7 @@ static const struct proto_ops netlink_ops = {
 	.socketpair =	sock_no_socketpair,
 	.accept =	sock_no_accept,
 	.getname =	netlink_getname,
-	.poll =		netlink_poll,
+	.poll =		datagram_poll,
 	.ioctl =	netlink_ioctl,
 	.listen =	sock_no_listen,
 	.shutdown =	sock_no_shutdown,
@@ -2770,7 +2797,6 @@ static const struct proto_ops netlink_ops = {
 	.sendmsg =	netlink_sendmsg,
 	.recvmsg =	netlink_recvmsg,
 	.mmap =		sock_no_mmap,
-	.sendpage =	sock_no_sendpage,
 };
 
 static const struct net_proto_family netlink_family_ops = {

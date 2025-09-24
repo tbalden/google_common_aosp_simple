@@ -8,6 +8,7 @@
 
 #include <linux/skbuff.h>
 #include <net/gro.h>
+#include <net/gso.h>
 #include <net/udp.h>
 #include <net/protocol.h>
 #include <net/inet_common.h>
@@ -314,17 +315,13 @@ struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
 
 	/* clear destructor to avoid skb_segment assigning it to tail */
 	copy_dtor = gso_skb->destructor == sock_wfree;
-	if (copy_dtor) {
+	if (copy_dtor)
 		gso_skb->destructor = NULL;
-		gso_skb->sk = NULL;
-	}
 
 	segs = skb_segment(gso_skb, features);
 	if (IS_ERR_OR_NULL(segs)) {
-		if (copy_dtor) {
+		if (copy_dtor)
 			gso_skb->destructor = sock_wfree;
-			gso_skb->sk = sk;
-		}
 		return segs;
 	}
 
@@ -602,10 +599,10 @@ struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
 			goto out;
 
 		if (skb->dev->features & NETIF_F_GRO_FRAGLIST)
-			NAPI_GRO_CB(skb)->is_flist = sk ? !udp_sk(sk)->gro_enabled : 1;
+			NAPI_GRO_CB(skb)->is_flist = sk ? !udp_test_bit(GRO_ENABLED, sk) : 1;
 
 		if ((!sk && (skb->dev->features & NETIF_F_GRO_UDP_FWD)) ||
-		    (sk && udp_sk(sk)->gro_enabled) || NAPI_GRO_CB(skb)->is_flist)
+		    (sk && udp_test_bit(GRO_ENABLED, sk)) || NAPI_GRO_CB(skb)->is_flist)
 			return call_gro_receive(udp_gro_receive_segment, head, skb);
 
 		/* no GRO, be sure flush the current packet */
@@ -653,10 +650,14 @@ static struct sock *udp4_gro_lookup_skb(struct sk_buff *skb, __be16 sport,
 					__be16 dport)
 {
 	const struct iphdr *iph = skb_gro_network_header(skb);
+	struct net *net = dev_net(skb->dev);
+	int iif, sdif;
 
-	return __udp4_lib_lookup(dev_net(skb->dev), iph->saddr, sport,
-				 iph->daddr, dport, inet_iif(skb),
-				 inet_sdif(skb), &udp_table, NULL);
+	inet_get_iif_sdif(skb, &iif, &sdif);
+
+	return __udp4_lib_lookup(net, iph->saddr, sport,
+				 iph->daddr, dport, iif,
+				 sdif, net->ipv4.udp_table, NULL);
 }
 
 INDIRECT_CALLABLE_SCOPE
@@ -750,7 +751,8 @@ EXPORT_SYMBOL(udp_gro_complete);
 
 INDIRECT_CALLABLE_SCOPE int udp4_gro_complete(struct sk_buff *skb, int nhoff)
 {
-	const struct iphdr *iph = ip_hdr(skb);
+	const u16 offset = NAPI_GRO_CB(skb)->network_offsets[skb->encapsulation];
+	const struct iphdr *iph = (struct iphdr *)(skb->data + offset);
 	struct udphdr *uh = (struct udphdr *)(skb->data + nhoff);
 
 	/* do fraglist only if there is no outer UDP encap (or we already processed it) */

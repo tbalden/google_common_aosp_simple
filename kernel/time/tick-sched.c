@@ -185,7 +185,7 @@ static ktime_t tick_init_jiffy_update(void)
 
 static void tick_sched_do_timer(struct tick_sched *ts, ktime_t now)
 {
-	int cpu = smp_processor_id();
+	int tick_cpu, cpu = smp_processor_id();
 
 #ifdef CONFIG_NO_HZ_COMMON
 	/*
@@ -198,16 +198,18 @@ static void tick_sched_do_timer(struct tick_sched *ts, ktime_t now)
 	 * If nohz_full is enabled, this should not happen because the
 	 * tick_do_timer_cpu never relinquishes.
 	 */
-	if (unlikely(tick_do_timer_cpu == TICK_DO_TIMER_NONE)) {
+	tick_cpu = READ_ONCE(tick_do_timer_cpu);
+	if (unlikely(tick_cpu == TICK_DO_TIMER_NONE)) {
 #ifdef CONFIG_NO_HZ_FULL
 		WARN_ON_ONCE(tick_nohz_full_running);
 #endif
-		tick_do_timer_cpu = cpu;
+		WRITE_ONCE(tick_do_timer_cpu, cpu);
+		tick_cpu = cpu;
 	}
 #endif
 
 	/* Check, if the jiffies need an update */
-	if (tick_do_timer_cpu == cpu) {
+	if (tick_cpu == cpu) {
 		tick_do_update_jiffies64(now);
 		trace_android_vh_jiffies_update(NULL);
 	}
@@ -553,7 +555,7 @@ bool tick_nohz_cpu_hotpluggable(unsigned int cpu)
 	 * timers, workqueues, timekeeping, ...) on behalf of full dynticks
 	 * CPUs. It must remain online when nohz full is enabled.
 	 */
-	if (tick_nohz_full_running && tick_do_timer_cpu == cpu)
+	if (tick_nohz_full_running && READ_ONCE(tick_do_timer_cpu) == cpu)
 		return false;
 	return true;
 }
@@ -661,41 +663,65 @@ static void tick_nohz_update_jiffies(ktime_t now)
 	touch_softlockup_watchdog_sched();
 }
 
-/*
- * Updates the per-CPU time idle statistics counters
- */
-static void
-update_ts_time_stats(int cpu, struct tick_sched *ts, ktime_t now, u64 *last_update_time)
+static void tick_nohz_stop_idle(struct tick_sched *ts, ktime_t now)
 {
 	ktime_t delta;
 
-	if (ts->idle_active) {
-		delta = ktime_sub(now, ts->idle_entrytime);
-		if (nr_iowait_cpu(cpu) > 0)
-			ts->iowait_sleeptime = ktime_add(ts->iowait_sleeptime, delta);
-		else
-			ts->idle_sleeptime = ktime_add(ts->idle_sleeptime, delta);
-		ts->idle_entrytime = now;
-	}
+	if (WARN_ON_ONCE(!ts->idle_active))
+		return;
 
-	if (last_update_time)
-		*last_update_time = ktime_to_us(now);
+	delta = ktime_sub(now, ts->idle_entrytime);
 
-}
+	write_seqcount_begin(&ts->idle_sleeptime_seq);
+	if (nr_iowait_cpu(smp_processor_id()) > 0)
+		ts->iowait_sleeptime = ktime_add(ts->iowait_sleeptime, delta);
+	else
+		ts->idle_sleeptime = ktime_add(ts->idle_sleeptime, delta);
 
-static void tick_nohz_stop_idle(struct tick_sched *ts, ktime_t now)
-{
-	update_ts_time_stats(smp_processor_id(), ts, now, NULL);
+	ts->idle_entrytime = now;
 	ts->idle_active = 0;
+	write_seqcount_end(&ts->idle_sleeptime_seq);
 
 	sched_clock_idle_wakeup_event();
 }
 
 static void tick_nohz_start_idle(struct tick_sched *ts)
 {
+	write_seqcount_begin(&ts->idle_sleeptime_seq);
 	ts->idle_entrytime = ktime_get();
 	ts->idle_active = 1;
+	write_seqcount_end(&ts->idle_sleeptime_seq);
+
 	sched_clock_idle_sleep_event();
+}
+
+static u64 get_cpu_sleep_time_us(struct tick_sched *ts, ktime_t *sleeptime,
+				 bool compute_delta, u64 *last_update_time)
+{
+	ktime_t now, idle;
+	unsigned int seq;
+
+	if (!tick_nohz_active)
+		return -1;
+
+	now = ktime_get();
+	if (last_update_time)
+		*last_update_time = ktime_to_us(now);
+
+	do {
+		seq = read_seqcount_begin(&ts->idle_sleeptime_seq);
+
+		if (ts->idle_active && compute_delta) {
+			ktime_t delta = ktime_sub(now, ts->idle_entrytime);
+
+			idle = ktime_add(*sleeptime, delta);
+		} else {
+			idle = *sleeptime;
+		}
+	} while (read_seqcount_retry(&ts->idle_sleeptime_seq, seq));
+
+	return ktime_to_us(idle);
+
 }
 
 /**
@@ -705,7 +731,10 @@ static void tick_nohz_start_idle(struct tick_sched *ts)
  * counters if NULL.
  *
  * Return the cumulative idle time (since boot) for a given
- * CPU, in microseconds.
+ * CPU, in microseconds. Note this is partially broken due to
+ * the counter of iowait tasks that can be remotely updated without
+ * any synchronization. Therefore it is possible to observe backward
+ * values within two consecutive reads.
  *
  * This time is measured via accounting rather than sampling,
  * and is as accurate as ktime_get() is.
@@ -715,27 +744,9 @@ static void tick_nohz_start_idle(struct tick_sched *ts)
 u64 get_cpu_idle_time_us(int cpu, u64 *last_update_time)
 {
 	struct tick_sched *ts = &per_cpu(tick_cpu_sched, cpu);
-	ktime_t now, idle;
 
-	if (!tick_nohz_active)
-		return -1;
-
-	now = ktime_get();
-	if (last_update_time) {
-		update_ts_time_stats(cpu, ts, now, last_update_time);
-		idle = ts->idle_sleeptime;
-	} else {
-		if (ts->idle_active && !nr_iowait_cpu(cpu)) {
-			ktime_t delta = ktime_sub(now, ts->idle_entrytime);
-
-			idle = ktime_add(ts->idle_sleeptime, delta);
-		} else {
-			idle = ts->idle_sleeptime;
-		}
-	}
-
-	return ktime_to_us(idle);
-
+	return get_cpu_sleep_time_us(ts, &ts->idle_sleeptime,
+				     !nr_iowait_cpu(cpu), last_update_time);
 }
 EXPORT_SYMBOL_GPL(get_cpu_idle_time_us);
 
@@ -746,7 +757,10 @@ EXPORT_SYMBOL_GPL(get_cpu_idle_time_us);
  * counters if NULL.
  *
  * Return the cumulative iowait time (since boot) for a given
- * CPU, in microseconds.
+ * CPU, in microseconds. Note this is partially broken due to
+ * the counter of iowait tasks that can be remotely updated without
+ * any synchronization. Therefore it is possible to observe backward
+ * values within two consecutive reads.
  *
  * This time is measured via accounting rather than sampling,
  * and is as accurate as ktime_get() is.
@@ -756,26 +770,9 @@ EXPORT_SYMBOL_GPL(get_cpu_idle_time_us);
 u64 get_cpu_iowait_time_us(int cpu, u64 *last_update_time)
 {
 	struct tick_sched *ts = &per_cpu(tick_cpu_sched, cpu);
-	ktime_t now, iowait;
 
-	if (!tick_nohz_active)
-		return -1;
-
-	now = ktime_get();
-	if (last_update_time) {
-		update_ts_time_stats(cpu, ts, now, last_update_time);
-		iowait = ts->iowait_sleeptime;
-	} else {
-		if (ts->idle_active && nr_iowait_cpu(cpu) > 0) {
-			ktime_t delta = ktime_sub(now, ts->idle_entrytime);
-
-			iowait = ktime_add(ts->iowait_sleeptime, delta);
-		} else {
-			iowait = ts->iowait_sleeptime;
-		}
-	}
-
-	return ktime_to_us(iowait);
+	return get_cpu_sleep_time_us(ts, &ts->iowait_sleeptime,
+				     nr_iowait_cpu(cpu), last_update_time);
 }
 EXPORT_SYMBOL_GPL(get_cpu_iowait_time_us);
 
@@ -811,6 +808,7 @@ static ktime_t tick_nohz_next_event(struct tick_sched *ts, int cpu)
 	u64 basemono, next_tick, delta, expires;
 	unsigned long basejiff;
 	unsigned int seq;
+	int tick_cpu;
 
 	/* Read jiffies and the time when jiffies were updated last */
 	do {
@@ -873,8 +871,9 @@ static ktime_t tick_nohz_next_event(struct tick_sched *ts, int cpu)
 	 * Otherwise we can sleep as long as we want.
 	 */
 	delta = timekeeping_max_deferment();
-	if (cpu != tick_do_timer_cpu &&
-	    (tick_do_timer_cpu != TICK_DO_TIMER_NONE || !ts->do_timer_last))
+	tick_cpu = READ_ONCE(tick_do_timer_cpu);
+	if (tick_cpu != cpu &&
+	    (tick_cpu != TICK_DO_TIMER_NONE || !ts->do_timer_last))
 		delta = KTIME_MAX;
 
 	/* Calculate the next expiry time */
@@ -895,6 +894,7 @@ static void tick_nohz_stop_tick(struct tick_sched *ts, int cpu)
 	u64 basemono = ts->timer_expires_base;
 	u64 expires = ts->timer_expires;
 	ktime_t tick = expires;
+	int tick_cpu;
 
 	/* Make sure we won't be trying to stop it twice in a row. */
 	ts->timer_expires_base = 0;
@@ -907,10 +907,11 @@ static void tick_nohz_stop_tick(struct tick_sched *ts, int cpu)
 	 * do_timer() never invoked. Keep track of the fact that it
 	 * was the one which had the do_timer() duty last.
 	 */
-	if (cpu == tick_do_timer_cpu) {
-		tick_do_timer_cpu = TICK_DO_TIMER_NONE;
+	tick_cpu = READ_ONCE(tick_do_timer_cpu);
+	if (tick_cpu == cpu) {
+		WRITE_ONCE(tick_do_timer_cpu, TICK_DO_TIMER_NONE);
 		ts->do_timer_last = 1;
-	} else if (tick_do_timer_cpu != TICK_DO_TIMER_NONE) {
+	} else if (tick_cpu != TICK_DO_TIMER_NONE) {
 		ts->do_timer_last = 0;
 	}
 
@@ -1073,8 +1074,10 @@ static bool can_stop_idle_tick(int cpu, struct tick_sched *ts)
 	 * invoked.
 	 */
 	if (unlikely(!cpu_online(cpu))) {
-		if (cpu == tick_do_timer_cpu)
-			tick_do_timer_cpu = TICK_DO_TIMER_NONE;
+		int tick_cpu = READ_ONCE(tick_do_timer_cpu);
+
+		if (tick_cpu == cpu)
+			WRITE_ONCE(tick_do_timer_cpu, TICK_DO_TIMER_NONE);
 		/*
 		 * Make sure the CPU doesn't get fooled by obsolete tick
 		 * deadline if it comes back online later.
@@ -1093,25 +1096,34 @@ static bool can_stop_idle_tick(int cpu, struct tick_sched *ts)
 		return false;
 
 	if (tick_nohz_full_enabled()) {
+		int tick_cpu = READ_ONCE(tick_do_timer_cpu);
 		/*
 		 * Keep the tick alive to guarantee timekeeping progression
 		 * if there are full dynticks CPUs around
 		 */
-		if (tick_do_timer_cpu == cpu)
+		if (tick_cpu == cpu)
 			return false;
 
 		/* Should not happen for nohz-full */
-		if (WARN_ON_ONCE(tick_do_timer_cpu == TICK_DO_TIMER_NONE))
+		if (WARN_ON_ONCE(tick_cpu == TICK_DO_TIMER_NONE))
 			return false;
 	}
 
 	return true;
 }
 
-static void __tick_nohz_idle_stop_tick(struct tick_sched *ts)
+/**
+ * tick_nohz_idle_stop_tick - stop the idle tick from the idle task
+ *
+ * When the next event is more than a tick into the future, stop the idle tick
+ */
+void tick_nohz_idle_stop_tick(void)
 {
-	ktime_t expires;
+	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
 	int cpu = smp_processor_id();
+	ktime_t expires;
+
+	trace_android_vh_tick_nohz_idle_stop_tick(NULL);
 
 	/*
 	 * If tick_nohz_get_sleep_length() ran tick_nohz_next_event(), the
@@ -1141,16 +1153,6 @@ static void __tick_nohz_idle_stop_tick(struct tick_sched *ts)
 	} else {
 		tick_nohz_retain_tick(ts);
 	}
-}
-
-/**
- * tick_nohz_idle_stop_tick - stop the idle tick from the idle task
- *
- * When the next event is more than a tick into the future, stop the idle tick
- */
-void tick_nohz_idle_stop_tick(void)
-{
-	__tick_nohz_idle_stop_tick(this_cpu_ptr(&tick_cpu_sched));
 }
 
 void tick_nohz_idle_retain_tick(void)

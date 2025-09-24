@@ -178,13 +178,13 @@ static int
 drm_dp_mst_rad_to_str(const u8 rad[8], u8 lct, char *out, size_t len)
 {
 	int i;
-	u8 unpacked_rad[16] = {};
+	u8 unpacked_rad[16];
 
-	for (i = 1; i < lct; i++) {
+	for (i = 0; i < lct; i++) {
 		if (i % 2)
-			unpacked_rad[i] = rad[(i - 1) / 2] >> 4;
+			unpacked_rad[i] = rad[i / 2] >> 4;
 		else
-			unpacked_rad[i] = rad[(i - 1) / 2] & 0xF;
+			unpacked_rad[i] = rad[i / 2] & BIT_MASK(4);
 	}
 
 	/* TODO: Eventually add something to printk so we can format the rad
@@ -1826,7 +1826,7 @@ static void drm_dp_destroy_port(struct kref *kref)
 		return;
 	}
 
-	kfree(port->cached_edid);
+	drm_edid_free(port->cached_edid);
 
 	/*
 	 * we can't destroy the connector here, as we might be holding the
@@ -2275,8 +2275,8 @@ drm_dp_mst_port_add_connector(struct drm_dp_mst_branch *mstb,
 	if (port->pdt != DP_PEER_DEVICE_NONE &&
 	    drm_dp_mst_is_end_device(port->pdt, port->mcs) &&
 	    port->port_num >= DP_MST_LOGICAL_PORT_0)
-		port->cached_edid = drm_get_edid(port->connector,
-						 &port->aux.ddc);
+		port->cached_edid = drm_edid_read_ddc(port->connector,
+						      &port->aux.ddc);
 
 	drm_connector_register(port->connector);
 	return;
@@ -3959,22 +3959,6 @@ out:
 	return 0;
 }
 
-static bool primary_mstb_probing_is_done(struct drm_dp_mst_topology_mgr *mgr)
-{
-	bool probing_done = false;
-
-	mutex_lock(&mgr->lock);
-
-	if (mgr->mst_primary && drm_dp_mst_topology_try_get_mstb(mgr->mst_primary)) {
-		probing_done = mgr->mst_primary->link_address_sent;
-		drm_dp_mst_topology_put_mstb(mgr->mst_primary);
-	}
-
-	mutex_unlock(&mgr->lock);
-
-	return probing_done;
-}
-
 static inline bool
 drm_dp_mst_process_up_req(struct drm_dp_mst_topology_mgr *mgr,
 			  struct drm_dp_pending_up_req *up_req)
@@ -4005,12 +3989,8 @@ drm_dp_mst_process_up_req(struct drm_dp_mst_topology_mgr *mgr,
 
 	/* TODO: Add missing handler for DP_RESOURCE_STATUS_NOTIFY events */
 	if (msg->req_type == DP_CONNECTION_STATUS_NOTIFY) {
-		if (!primary_mstb_probing_is_done(mgr)) {
-			drm_dbg_kms(mgr->dev, "Got CSN before finish topology probing. Skip it.\n");
-		} else {
-			dowork = drm_dp_mst_handle_conn_stat(mstb, &msg->u.conn_stat);
-			hotplug = true;
-		}
+		dowork = drm_dp_mst_handle_conn_stat(mstb, &msg->u.conn_stat);
+		hotplug = true;
 	}
 
 	drm_dp_mst_topology_put_mstb(mstb);
@@ -4089,11 +4069,10 @@ static int drm_dp_mst_handle_up_req(struct drm_dp_mst_topology_mgr *mgr)
 	drm_dp_send_up_ack_reply(mgr, mst_primary, up_req->msg.req_type,
 				 false);
 
-	drm_dp_mst_topology_put_mstb(mst_primary);
-
 	if (up_req->msg.req_type == DP_CONNECTION_STATUS_NOTIFY) {
 		const struct drm_dp_connection_status_notify *conn_stat =
 			&up_req->msg.u.conn_stat;
+		bool handle_csn;
 
 		drm_dbg_kms(mgr->dev, "Got CSN: pn: %d ldps:%d ddps: %d mcs: %d ip: %d pdt: %d\n",
 			    conn_stat->port_number,
@@ -4102,6 +4081,16 @@ static int drm_dp_mst_handle_up_req(struct drm_dp_mst_topology_mgr *mgr)
 			    conn_stat->message_capability_status,
 			    conn_stat->input_port,
 			    conn_stat->peer_device_type);
+
+		mutex_lock(&mgr->probe_lock);
+		handle_csn = mst_primary->link_address_sent;
+		mutex_unlock(&mgr->probe_lock);
+
+		if (!handle_csn) {
+			drm_dbg_kms(mgr->dev, "Got CSN before finish topology probing. Skip it.");
+			kfree(up_req);
+			goto out_put_primary;
+		}
 	} else if (up_req->msg.req_type == DP_RESOURCE_STATUS_NOTIFY) {
 		const struct drm_dp_resource_status_notify *res_stat =
 			&up_req->msg.u.resource_stat;
@@ -4116,6 +4105,9 @@ static int drm_dp_mst_handle_up_req(struct drm_dp_mst_topology_mgr *mgr)
 	list_add_tail(&up_req->next, &mgr->up_req_list);
 	mutex_unlock(&mgr->up_req_lock);
 	queue_work(system_long_wq, &mgr->up_req_work);
+
+out_put_primary:
+	drm_dp_mst_topology_put_mstb(mst_primary);
 out_clear_reply:
 	memset(&mgr->up_req_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
 	return 0;
@@ -4255,7 +4247,7 @@ drm_dp_mst_detect_port(struct drm_connector *connector,
 		ret = connector_status_connected;
 		/* for logical ports - cache the EDID */
 		if (port->port_num >= DP_MST_LOGICAL_PORT_0 && !port->cached_edid)
-			port->cached_edid = drm_get_edid(connector, &port->aux.ddc);
+			port->cached_edid = drm_edid_read_ddc(connector, &port->aux.ddc);
 		break;
 	case DP_PEER_DEVICE_DP_LEGACY_CONV:
 		if (port->ldps)
@@ -4269,7 +4261,7 @@ out:
 EXPORT_SYMBOL(drm_dp_mst_detect_port);
 
 /**
- * drm_dp_mst_get_edid() - get EDID for an MST port
+ * drm_dp_mst_edid_read() - get EDID for an MST port
  * @connector: toplevel connector to get EDID for
  * @mgr: manager for this port
  * @port: unverified pointer to a port.
@@ -4278,9 +4270,11 @@ EXPORT_SYMBOL(drm_dp_mst_detect_port);
  * It validates the pointer still exists so the caller doesn't require a
  * reference.
  */
-struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port)
+const struct drm_edid *drm_dp_mst_edid_read(struct drm_connector *connector,
+					    struct drm_dp_mst_topology_mgr *mgr,
+					    struct drm_dp_mst_port *port)
 {
-	struct edid *edid = NULL;
+	const struct drm_edid *drm_edid;
 
 	/* we need to search for the port in the mgr in case it's gone */
 	port = drm_dp_mst_topology_get_port_validated(mgr, port);
@@ -4288,12 +4282,41 @@ struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_
 		return NULL;
 
 	if (port->cached_edid)
-		edid = drm_edid_duplicate(port->cached_edid);
-	else {
-		edid = drm_get_edid(connector, &port->aux.ddc);
-	}
-	port->has_audio = drm_detect_monitor_audio(edid);
+		drm_edid = drm_edid_dup(port->cached_edid);
+	else
+		drm_edid = drm_edid_read_ddc(connector, &port->aux.ddc);
+
 	drm_dp_mst_topology_put_port(port);
+
+	return drm_edid;
+}
+EXPORT_SYMBOL(drm_dp_mst_edid_read);
+
+/**
+ * drm_dp_mst_get_edid() - get EDID for an MST port
+ * @connector: toplevel connector to get EDID for
+ * @mgr: manager for this port
+ * @port: unverified pointer to a port.
+ *
+ * This function is deprecated; please use drm_dp_mst_edid_read() instead.
+ *
+ * This returns an EDID for the port connected to a connector,
+ * It validates the pointer still exists so the caller doesn't require a
+ * reference.
+ */
+struct edid *drm_dp_mst_get_edid(struct drm_connector *connector,
+				 struct drm_dp_mst_topology_mgr *mgr,
+				 struct drm_dp_mst_port *port)
+{
+	const struct drm_edid *drm_edid;
+	struct edid *edid;
+
+	drm_edid = drm_dp_mst_edid_read(connector, mgr, port);
+
+	edid = drm_edid_duplicate(drm_edid_raw(drm_edid));
+
+	drm_edid_free(drm_edid);
+
 	return edid;
 }
 EXPORT_SYMBOL(drm_dp_mst_get_edid);
@@ -4741,13 +4764,12 @@ EXPORT_SYMBOL(drm_dp_check_act_status);
 
 /**
  * drm_dp_calc_pbn_mode() - Calculate the PBN for a mode.
- * @clock: dot clock for the mode
- * @bpp: bpp for the mode.
- * @dsc: DSC mode. If true, bpp has units of 1/16 of a bit per pixel
+ * @clock: dot clock
+ * @bpp: bpp as .4 binary fixed point
  *
  * This uses the formula in the spec to calculate the PBN value for a mode.
  */
-int drm_dp_calc_pbn_mode(int clock, int bpp, bool dsc)
+int drm_dp_calc_pbn_mode(int clock, int bpp)
 {
 	/*
 	 * margin 5300ppm + 300ppm ~ 0.6% as per spec, factor is 1.006
@@ -4758,18 +4780,9 @@ int drm_dp_calc_pbn_mode(int clock, int bpp, bool dsc)
 	 * peak_kbps *= (1006/1000)
 	 * peak_kbps *= (64/54)
 	 * peak_kbps *= 8    convert to bytes
-	 *
-	 * If the bpp is in units of 1/16, further divide by 16. Put this
-	 * factor in the numerator rather than the denominator to avoid
-	 * integer overflow
 	 */
-
-	if (dsc)
-		return DIV_ROUND_UP_ULL(mul_u32_u32(clock * (bpp / 16), 64 * 1006),
-					8 * 54 * 1000 * 1000);
-
-	return DIV_ROUND_UP_ULL(mul_u32_u32(clock * bpp, 64 * 1006),
-				8 * 54 * 1000 * 1000);
+	return DIV_ROUND_UP_ULL(mul_u32_u32(clock * bpp, 64 * 1006 >> 4),
+				1000 * 8 * 54 * 1000);
 }
 EXPORT_SYMBOL(drm_dp_calc_pbn_mode);
 
@@ -5824,7 +5837,7 @@ static int drm_dp_mst_register_i2c_bus(struct drm_dp_mst_port *port)
 	aux->ddc.dev.parent = parent_dev;
 	aux->ddc.dev.of_node = parent_dev->of_node;
 
-	strlcpy(aux->ddc.name, aux->name ? aux->name : dev_name(parent_dev),
+	strscpy(aux->ddc.name, aux->name ? aux->name : dev_name(parent_dev),
 		sizeof(aux->ddc.name));
 
 	return i2c_add_adapter(&aux->ddc);

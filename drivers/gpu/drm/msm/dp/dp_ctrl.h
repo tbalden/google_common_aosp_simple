@@ -14,7 +14,6 @@
 #include "dp_catalog.h"
 
 struct dp_ctrl {
-	bool orientation;
 	atomic_t aborted;
 	bool wide_bus_en;
 };
@@ -36,5 +35,8 @@ void dp_ctrl_reset_irq_ctrl(struct dp_ctrl *dp_ctrl, bool enable);
 void dp_ctrl_phy_init(struct dp_ctrl *dp_ctrl);
 void dp_ctrl_phy_exit(struct dp_ctrl *dp_ctrl);
 void dp_ctrl_irq_phy_exit(struct dp_ctrl *dp_ctrl);
+
+void dp_ctrl_set_psr(struct dp_ctrl *dp_ctrl, bool enable);
+void dp_ctrl_config_psr(struct dp_ctrl *dp_ctrl);
 
 #endif /* _DP_CTRL_H_ */

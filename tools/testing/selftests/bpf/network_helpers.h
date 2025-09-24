@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __NETWORK_HELPERS_H
 #define __NETWORK_HELPERS_H
-#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <linux/types.h>
@@ -22,6 +21,9 @@ struct network_helper_opts {
 	const char *cc;
 	int timeout_ms;
 	bool must_fail;
+	bool noconnect;
+	int type;
+	int proto;
 };
 
 /* ipv4 test vector */
@@ -57,6 +59,7 @@ int fastopen_connect(int server_fd, const char *data, unsigned int data_len,
 int make_sockaddr(int family, const char *addr_str, __u16 port,
 		  struct sockaddr_storage *addr, socklen_t *len);
 char *ping_command(int family);
+int get_socket_local_port(int sock_fd);
 
 struct nstoken;
 /**
@@ -67,47 +70,4 @@ struct nstoken;
  */
 struct nstoken *open_netns(const char *name);
 void close_netns(struct nstoken *token);
-
-static __u16 csum_fold(__u32 csum)
-{
-	csum = (csum & 0xffff) + (csum >> 16);
-	csum = (csum & 0xffff) + (csum >> 16);
-
-	return (__u16)~csum;
-}
-
-static inline __sum16 csum_tcpudp_magic(__be32 saddr, __be32 daddr,
-					__u32 len, __u8 proto,
-					__wsum csum)
-{
-	__u64 s = csum;
-
-	s += (__u32)saddr;
-	s += (__u32)daddr;
-	s += htons(proto + len);
-	s = (s & 0xffffffff) + (s >> 32);
-	s = (s & 0xffffffff) + (s >> 32);
-
-	return csum_fold((__u32)s);
-}
-
-static inline __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
-				      const struct in6_addr *daddr,
-					__u32 len, __u8 proto,
-					__wsum csum)
-{
-	__u64 s = csum;
-	int i;
-
-	for (i = 0; i < 4; i++)
-		s += (__u32)saddr->s6_addr32[i];
-	for (i = 0; i < 4; i++)
-		s += (__u32)daddr->s6_addr32[i];
-	s += htons(proto + len);
-	s = (s & 0xffffffff) + (s >> 32);
-	s = (s & 0xffffffff) + (s >> 32);
-
-	return csum_fold((__u32)s);
-}
-
 #endif

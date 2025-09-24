@@ -480,7 +480,7 @@ void f2fs_set_link(struct inode *dir, struct f2fs_dir_entry *de,
 	de->file_type = fs_umode_to_ftype(inode->i_mode);
 	set_page_dirty(page);
 
-	dir->i_mtime = dir->i_ctime = current_time(dir);
+	dir->i_mtime = inode_set_ctime_current(dir);
 	f2fs_mark_inode_dirty_sync(dir, false);
 	f2fs_put_page(page, 1);
 }
@@ -634,7 +634,7 @@ void f2fs_update_parent_metadata(struct inode *dir, struct inode *inode,
 			f2fs_i_links_write(dir, true);
 		clear_inode_flag(inode, FI_NEW_INODE);
 	}
-	dir->i_mtime = dir->i_ctime = current_time(dir);
+	dir->i_mtime = inode_set_ctime_current(dir);
 	f2fs_mark_inode_dirty_sync(dir, false);
 
 	if (F2FS_I(dir)->i_current_depth != current_depth)
@@ -855,13 +855,14 @@ int f2fs_do_add_link(struct inode *dir, const struct qstr *name,
 	return err;
 }
 
-int f2fs_do_tmpfile(struct inode *inode, struct inode *dir)
+int f2fs_do_tmpfile(struct inode *inode, struct inode *dir,
+					struct f2fs_filename *fname)
 {
 	struct page *page;
 	int err = 0;
 
 	f2fs_down_write(&F2FS_I(inode)->i_sem);
-	page = f2fs_init_inode_metadata(inode, dir, NULL, NULL);
+	page = f2fs_init_inode_metadata(inode, dir, fname, NULL);
 	if (IS_ERR(page)) {
 		err = PTR_ERR(page);
 		goto fail;
@@ -883,7 +884,7 @@ void f2fs_drop_nlink(struct inode *dir, struct inode *inode)
 
 	if (S_ISDIR(inode->i_mode))
 		f2fs_i_links_write(dir, false);
-	inode->i_ctime = current_time(inode);
+	inode_set_ctime_current(inode);
 
 	f2fs_i_links_write(inode, false);
 	if (S_ISDIR(inode->i_mode)) {
@@ -908,6 +909,7 @@ void f2fs_delete_entry(struct f2fs_dir_entry *dentry, struct page *page,
 	struct	f2fs_dentry_block *dentry_blk;
 	unsigned int bit_pos;
 	int slots = GET_DENTRY_SLOTS(le16_to_cpu(dentry->name_len));
+	pgoff_t index = page_folio(page)->index;
 	int i;
 
 	f2fs_update_time(F2FS_I_SB(dir), REQ_TIME);
@@ -933,8 +935,8 @@ void f2fs_delete_entry(struct f2fs_dir_entry *dentry, struct page *page,
 	set_page_dirty(page);
 
 	if (bit_pos == NR_DENTRY_IN_BLOCK &&
-		!f2fs_truncate_hole(dir, page->index, page->index + 1)) {
-		f2fs_clear_page_cache_dirty_tag(page);
+		!f2fs_truncate_hole(dir, index, index + 1)) {
+		f2fs_clear_page_cache_dirty_tag(page_folio(page));
 		clear_page_dirty_for_io(page);
 		ClearPageUptodate(page);
 		clear_page_private_all(page);
@@ -944,7 +946,7 @@ void f2fs_delete_entry(struct f2fs_dir_entry *dentry, struct page *page,
 	}
 	f2fs_put_page(page, 1);
 
-	dir->i_ctime = dir->i_mtime = current_time(dir);
+	dir->i_mtime = inode_set_ctime_current(dir);
 	f2fs_mark_inode_dirty_sync(dir, false);
 
 	if (inode)
@@ -1020,9 +1022,8 @@ int f2fs_fill_dentries(struct dir_context *ctx, struct f2fs_dentry_ptr *d,
 		de = &d->dentry[bit_pos];
 		if (de->name_len == 0) {
 			if (found_valid_dirent || !bit_pos) {
-				printk_ratelimited(
-					"%sF2FS-fs (%s): invalid namelen(0), ino:%u, run fsck to fix.",
-					KERN_WARNING, sbi->sb->s_id,
+				f2fs_warn_ratelimited(sbi,
+					"invalid namelen(0), ino:%u, run fsck to fix.",
 					le32_to_cpu(de->ino));
 				set_sbi_flag(sbi, SBI_NEED_FSCK);
 			}

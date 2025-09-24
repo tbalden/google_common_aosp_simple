@@ -132,6 +132,19 @@ static inline bool vgic_irq_is_multi_sgi(struct vgic_irq *irq)
 	return vgic_irq_get_lr_count(irq) > 1;
 }
 
+static inline int vgic_write_guest_lock(struct kvm *kvm, gpa_t gpa,
+					const void *data, unsigned long len)
+{
+	struct vgic_dist *dist = &kvm->arch.vgic;
+	int ret;
+
+	dist->table_write_in_progress = true;
+	ret = kvm_write_guest_lock(kvm, gpa, data, len);
+	dist->table_write_in_progress = false;
+
+	return ret;
+}
+
 static inline int vgic_its_read_entry_lock(struct vgic_its *its, gpa_t eaddr,
 					   u64 *eval, unsigned long esize)
 {
@@ -152,7 +165,7 @@ static inline int vgic_its_write_entry_lock(struct vgic_its *its, gpa_t eaddr,
 	if (KVM_BUG_ON(esize != sizeof(eval), kvm))
 		return -EINVAL;
 
-	return kvm_write_guest_lock(kvm, eaddr, &eval, esize);
+	return vgic_write_guest_lock(kvm, eaddr, &eval, esize);
 }
 
 /*
@@ -209,7 +222,6 @@ void vgic_v2_fold_lr_state(struct kvm_vcpu *vcpu);
 void vgic_v2_populate_lr(struct kvm_vcpu *vcpu, struct vgic_irq *irq, int lr);
 void vgic_v2_clear_lr(struct kvm_vcpu *vcpu, int lr);
 void vgic_v2_set_underflow(struct kvm_vcpu *vcpu);
-void vgic_v2_set_npie(struct kvm_vcpu *vcpu);
 int vgic_v2_has_attr_regs(struct kvm_device *dev, struct kvm_device_attr *attr);
 int vgic_v2_dist_uaccess(struct kvm_vcpu *vcpu, bool is_write,
 			 int offset, u32 *val);
@@ -225,7 +237,7 @@ int vgic_register_dist_iodev(struct kvm *kvm, gpa_t dist_base_address,
 
 void vgic_v2_init_lrs(void);
 void vgic_v2_load(struct kvm_vcpu *vcpu);
-void vgic_v2_put(struct kvm_vcpu *vcpu, bool blocking);
+void vgic_v2_put(struct kvm_vcpu *vcpu);
 
 void vgic_v2_save_state(struct kvm_vcpu *vcpu);
 void vgic_v2_restore_state(struct kvm_vcpu *vcpu);
@@ -242,7 +254,6 @@ void vgic_v3_fold_lr_state(struct kvm_vcpu *vcpu);
 void vgic_v3_populate_lr(struct kvm_vcpu *vcpu, struct vgic_irq *irq, int lr);
 void vgic_v3_clear_lr(struct kvm_vcpu *vcpu, int lr);
 void vgic_v3_set_underflow(struct kvm_vcpu *vcpu);
-void vgic_v3_set_npie(struct kvm_vcpu *vcpu);
 void vgic_v3_set_vmcr(struct kvm_vcpu *vcpu, struct vgic_vmcr *vmcr);
 void vgic_v3_get_vmcr(struct kvm_vcpu *vcpu, struct vgic_vmcr *vmcr);
 void vgic_v3_enable(struct kvm_vcpu *vcpu);
@@ -256,7 +267,7 @@ void vgic_unregister_redist_iodev(struct kvm_vcpu *vcpu);
 bool vgic_v3_check_base(struct kvm *kvm);
 
 void vgic_v3_load(struct kvm_vcpu *vcpu);
-void vgic_v3_put(struct kvm_vcpu *vcpu, bool blocking);
+void vgic_v3_put(struct kvm_vcpu *vcpu);
 
 bool vgic_has_its(struct kvm *kvm);
 int kvm_vgic_register_its_device(void);
@@ -281,9 +292,6 @@ int vgic_init(struct kvm *kvm);
 
 void vgic_debug_init(struct kvm *kvm);
 void vgic_debug_destroy(struct kvm *kvm);
-
-bool lock_all_vcpus(struct kvm *kvm);
-void unlock_all_vcpus(struct kvm *kvm);
 
 static inline int vgic_v3_max_apr_idx(struct kvm_vcpu *vcpu)
 {

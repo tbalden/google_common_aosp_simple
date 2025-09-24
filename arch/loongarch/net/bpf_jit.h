@@ -4,6 +4,7 @@
  *
  * Copyright (C) 2022 Loongson Technology Corporation Limited
  */
+#include <linux/bitfield.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
 #include <asm/cacheflush.h>
@@ -15,6 +16,7 @@ struct jit_ctx {
 	unsigned int flags;
 	unsigned int epilogue_offset;
 	u32 *offset;
+	int num_exentries;
 	union loongarch_instruction *image;
 	u32 stack_size;
 };
@@ -24,11 +26,6 @@ struct jit_data {
 	u8 *image;
 	struct jit_ctx ctx;
 };
-
-static inline void emit_nop(union loongarch_instruction *insn)
-{
-	insn->word = INSN_NOP;
-}
 
 #define emit_insn(ctx, func, ...)						\
 do {										\

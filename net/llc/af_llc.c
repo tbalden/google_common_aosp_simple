@@ -404,7 +404,7 @@ static int llc_ui_bind(struct socket *sock, struct sockaddr *uaddr, int addrlen)
 		memcpy(laddr.mac, addr->sllc_mac, IFHWADDRLEN);
 		laddr.lsap = addr->sllc_sap;
 		rc = -EADDRINUSE; /* mac + sap clash. */
-		ask = llc_lookup_established(sap, &daddr, &laddr);
+		ask = llc_lookup_established(sap, &daddr, &laddr, &init_net);
 		if (ask) {
 			sock_put(ask);
 			goto out_put;
@@ -1099,7 +1099,7 @@ static int llc_ui_setsockopt(struct socket *sock, int level, int optname,
 	lock_sock(sk);
 	if (unlikely(level != SOL_LLC || optlen != sizeof(int)))
 		goto out;
-	rc = copy_from_sockptr(&opt, optval, sizeof(opt));
+	rc = copy_safe_from_sockptr(&opt, sizeof(opt), optval, optlen);
 	if (rc)
 		goto out;
 	rc = -EINVAL;
@@ -1242,7 +1242,6 @@ static const struct proto_ops llc_ui_ops = {
 	.sendmsg     = llc_ui_sendmsg,
 	.recvmsg     = llc_ui_recvmsg,
 	.mmap	     = sock_no_mmap,
-	.sendpage    = sock_no_sendpage,
 };
 
 static const char llc_proc_err_msg[] __initconst =

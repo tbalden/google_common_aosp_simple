@@ -9,7 +9,7 @@
  * Copyright 2009, Johannes Berg <johannes@sipsolutions.net>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
  * Copyright(c) 2016 Intel Deutschland GmbH
- * Copyright(c) 2018-2022 Intel Corporation
+ * Copyright(c) 2018-2023 Intel Corporation
  */
 
 #include <linux/delay.h>
@@ -226,7 +226,7 @@ static void __ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 	struct ieee80211_local *local = sdata->local;
 	struct ieee80211_mgmt *mgmt;
 	struct cfg80211_bss *bss;
-	u32 bss_change;
+	u64 bss_change;
 	struct cfg80211_chan_def chandef;
 	struct ieee80211_channel *chan;
 	struct beacon_data *presp;
@@ -382,7 +382,6 @@ static void __ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 		  round_jiffies(jiffies + IEEE80211_IBSS_MERGE_INTERVAL));
 
 	bss_meta.chan = chan;
-	bss_meta.scan_width = cfg80211_chandef_to_scan_width(&chandef);
 	bss = cfg80211_inform_bss_frame_data(local->hw.wiphy, &bss_meta, mgmt,
 					     presp->head_len, GFP_KERNEL);
 
@@ -478,7 +477,8 @@ static void ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 }
 
 int ieee80211_ibss_csa_beacon(struct ieee80211_sub_if_data *sdata,
-			      struct cfg80211_csa_settings *csa_settings)
+			      struct cfg80211_csa_settings *csa_settings,
+			      u64 *changed)
 {
 	struct ieee80211_if_ibss *ifibss = &sdata->u.ibss;
 	struct beacon_data *presp, *old_presp;
@@ -520,10 +520,11 @@ int ieee80211_ibss_csa_beacon(struct ieee80211_sub_if_data *sdata,
 	if (old_presp)
 		kfree_rcu(old_presp, rcu_head);
 
-	return BSS_CHANGED_BEACON;
+	*changed |= BSS_CHANGED_BEACON;
+	return 0;
 }
 
-int ieee80211_ibss_finish_csa(struct ieee80211_sub_if_data *sdata)
+int ieee80211_ibss_finish_csa(struct ieee80211_sub_if_data *sdata, u64 *changed)
 {
 	struct ieee80211_if_ibss *ifibss = &sdata->u.ibss;
 	struct cfg80211_bss *cbss;
@@ -552,14 +553,15 @@ int ieee80211_ibss_finish_csa(struct ieee80211_sub_if_data *sdata)
 	ifibss->chandef = sdata->deflink.csa_chandef;
 
 	/* generate the beacon */
-	return ieee80211_ibss_csa_beacon(sdata, NULL);
+	return ieee80211_ibss_csa_beacon(sdata, NULL, changed);
 }
 
 void ieee80211_ibss_stop(struct ieee80211_sub_if_data *sdata)
 {
 	struct ieee80211_if_ibss *ifibss = &sdata->u.ibss;
 
-	cancel_work_sync(&ifibss->csa_connection_drop_work);
+	wiphy_work_cancel(sdata->local->hw.wiphy,
+			  &ifibss->csa_connection_drop_work);
 }
 
 static struct sta_info *ieee80211_ibss_finish_sta(struct sta_info *sta)
@@ -597,7 +599,6 @@ ieee80211_ibss_add_sta(struct ieee80211_sub_if_data *sdata, const u8 *bssid,
 	struct sta_info *sta;
 	struct ieee80211_chanctx_conf *chanctx_conf;
 	struct ieee80211_supported_band *sband;
-	enum nl80211_bss_scan_width scan_width;
 	int band;
 
 	/*
@@ -626,7 +627,6 @@ ieee80211_ibss_add_sta(struct ieee80211_sub_if_data *sdata, const u8 *bssid,
 	if (WARN_ON_ONCE(!chanctx_conf))
 		return NULL;
 	band = chanctx_conf->def.chan->band;
-	scan_width = cfg80211_chandef_to_scan_width(&chanctx_conf->def);
 	rcu_read_unlock();
 
 	sta = sta_info_alloc(sdata, addr, GFP_KERNEL);
@@ -638,7 +638,7 @@ ieee80211_ibss_add_sta(struct ieee80211_sub_if_data *sdata, const u8 *bssid,
 	/* make sure mandatory rates are always added */
 	sband = local->hw.wiphy->bands[band];
 	sta->sta.deflink.supp_rates[band] = supp_rates |
-			ieee80211_mandatory_rates(sband, scan_width);
+			ieee80211_mandatory_rates(sband);
 
 	return ieee80211_ibss_finish_sta(sta);
 }
@@ -728,7 +728,8 @@ static void ieee80211_ibss_disconnect(struct ieee80211_sub_if_data *sdata)
 	mutex_unlock(&local->mtx);
 }
 
-static void ieee80211_csa_connection_drop_work(struct work_struct *work)
+static void ieee80211_csa_connection_drop_work(struct wiphy *wiphy,
+					       struct wiphy_work *work)
 {
 	struct ieee80211_sub_if_data *sdata =
 		container_of(work, struct ieee80211_sub_if_data,
@@ -741,7 +742,7 @@ static void ieee80211_csa_connection_drop_work(struct work_struct *work)
 	skb_queue_purge(&sdata->skb_queue);
 
 	/* trigger a scan to find another IBSS network to join */
-	ieee80211_queue_work(&sdata->local->hw, &sdata->work);
+	wiphy_work_queue(sdata->local->hw.wiphy, &sdata->work);
 
 	sdata_unlock(sdata);
 }
@@ -894,8 +895,8 @@ ieee80211_ibss_process_chanswitch(struct ieee80211_sub_if_data *sdata,
 	return true;
 disconnect:
 	ibss_dbg(sdata, "Can't handle channel switch, disconnect\n");
-	ieee80211_queue_work(&sdata->local->hw,
-			     &ifibss->csa_connection_drop_work);
+	wiphy_work_queue(sdata->local->hw.wiphy,
+			 &ifibss->csa_connection_drop_work);
 
 	ieee80211_ibss_csa_mark_radar(sdata);
 
@@ -980,7 +981,6 @@ static void ieee80211_update_sta_info(struct ieee80211_sub_if_data *sdata,
 {
 	struct sta_info *sta;
 	enum nl80211_band band = rx_status->band;
-	enum nl80211_bss_scan_width scan_width;
 	struct ieee80211_local *local = sdata->local;
 	struct ieee80211_supported_band *sband;
 	bool rates_updated = false;
@@ -1006,15 +1006,9 @@ static void ieee80211_update_sta_info(struct ieee80211_sub_if_data *sdata,
 			u32 prev_rates;
 
 			prev_rates = sta->sta.deflink.supp_rates[band];
-			/* make sure mandatory rates are always added */
-			scan_width = NL80211_BSS_CHAN_WIDTH_20;
-			if (rx_status->bw == RATE_INFO_BW_5)
-				scan_width = NL80211_BSS_CHAN_WIDTH_5;
-			else if (rx_status->bw == RATE_INFO_BW_10)
-				scan_width = NL80211_BSS_CHAN_WIDTH_10;
 
 			sta->sta.deflink.supp_rates[band] = supp_rates |
-				ieee80211_mandatory_rates(sband, scan_width);
+				ieee80211_mandatory_rates(sband);
 			if (sta->sta.deflink.supp_rates[band] != prev_rates) {
 				ibss_dbg(sdata,
 					 "updated supp_rates set for %pM based on beacon/probe_resp (0x%x -> 0x%x)\n",
@@ -1201,7 +1195,6 @@ void ieee80211_ibss_rx_no_sta(struct ieee80211_sub_if_data *sdata,
 	struct sta_info *sta;
 	struct ieee80211_chanctx_conf *chanctx_conf;
 	struct ieee80211_supported_band *sband;
-	enum nl80211_bss_scan_width scan_width;
 	int band;
 
 	/*
@@ -1227,7 +1220,6 @@ void ieee80211_ibss_rx_no_sta(struct ieee80211_sub_if_data *sdata,
 		return;
 	}
 	band = chanctx_conf->def.chan->band;
-	scan_width = cfg80211_chandef_to_scan_width(&chanctx_conf->def);
 	rcu_read_unlock();
 
 	sta = sta_info_alloc(sdata, addr, GFP_ATOMIC);
@@ -1237,12 +1229,12 @@ void ieee80211_ibss_rx_no_sta(struct ieee80211_sub_if_data *sdata,
 	/* make sure mandatory rates are always added */
 	sband = local->hw.wiphy->bands[band];
 	sta->sta.deflink.supp_rates[band] = supp_rates |
-			ieee80211_mandatory_rates(sband, scan_width);
+			ieee80211_mandatory_rates(sband);
 
 	spin_lock(&ifibss->incomplete_lock);
 	list_add(&sta->list, &ifibss->incomplete_stations);
 	spin_unlock(&ifibss->incomplete_lock);
-	ieee80211_queue_work(&local->hw, &sdata->work);
+	wiphy_work_queue(local->hw.wiphy, &sdata->work);
 }
 
 static void ieee80211_ibss_sta_expire(struct ieee80211_sub_if_data *sdata)
@@ -1289,7 +1281,6 @@ static void ieee80211_ibss_sta_expire(struct ieee80211_sub_if_data *sdata)
 static void ieee80211_sta_merge_ibss(struct ieee80211_sub_if_data *sdata)
 {
 	struct ieee80211_if_ibss *ifibss = &sdata->u.ibss;
-	enum nl80211_bss_scan_width scan_width;
 
 	sdata_assert_lock(sdata);
 
@@ -1311,9 +1302,8 @@ static void ieee80211_sta_merge_ibss(struct ieee80211_sub_if_data *sdata)
 	sdata_info(sdata,
 		   "No active IBSS STAs - trying to scan for other IBSS networks with same SSID (merge)\n");
 
-	scan_width = cfg80211_chandef_to_scan_width(&ifibss->chandef);
 	ieee80211_request_ibss_scan(sdata, ifibss->ssid, ifibss->ssid_len,
-				    NULL, 0, scan_width);
+				    NULL, 0);
 }
 
 static void ieee80211_sta_create_ibss(struct ieee80211_sub_if_data *sdata)
@@ -1431,7 +1421,6 @@ static void ieee80211_sta_find_ibss(struct ieee80211_sub_if_data *sdata)
 	struct cfg80211_bss *cbss;
 	struct ieee80211_channel *chan = NULL;
 	const u8 *bssid = NULL;
-	enum nl80211_bss_scan_width scan_width;
 	int active_ibss;
 
 	sdata_assert_lock(sdata);
@@ -1490,8 +1479,6 @@ static void ieee80211_sta_find_ibss(struct ieee80211_sub_if_data *sdata)
 
 		sdata_info(sdata, "Trigger new scan to find an IBSS to join\n");
 
-		scan_width = cfg80211_chandef_to_scan_width(&ifibss->chandef);
-
 		if (ifibss->fixed_channel) {
 			num = ieee80211_ibss_setup_scan_channels(local->hw.wiphy,
 								 &ifibss->chandef,
@@ -1499,11 +1486,10 @@ static void ieee80211_sta_find_ibss(struct ieee80211_sub_if_data *sdata)
 								 ARRAY_SIZE(channels));
 			ieee80211_request_ibss_scan(sdata, ifibss->ssid,
 						    ifibss->ssid_len, channels,
-						    num, scan_width);
+						    num);
 		} else {
 			ieee80211_request_ibss_scan(sdata, ifibss->ssid,
-						    ifibss->ssid_len, NULL,
-						    0, scan_width);
+						    ifibss->ssid_len, NULL, 0);
 		}
 	} else {
 		int interval = IEEE80211_SCAN_INTERVAL;
@@ -1721,7 +1707,7 @@ static void ieee80211_ibss_timer(struct timer_list *t)
 	struct ieee80211_sub_if_data *sdata =
 		from_timer(sdata, t, u.ibss.timer);
 
-	ieee80211_queue_work(&sdata->local->hw, &sdata->work);
+	wiphy_work_queue(sdata->local->hw.wiphy, &sdata->work);
 }
 
 void ieee80211_ibss_setup_sdata(struct ieee80211_sub_if_data *sdata)
@@ -1731,8 +1717,8 @@ void ieee80211_ibss_setup_sdata(struct ieee80211_sub_if_data *sdata)
 	timer_setup(&ifibss->timer, ieee80211_ibss_timer, 0);
 	INIT_LIST_HEAD(&ifibss->incomplete_stations);
 	spin_lock_init(&ifibss->incomplete_lock);
-	INIT_WORK(&ifibss->csa_connection_drop_work,
-		  ieee80211_csa_connection_drop_work);
+	wiphy_work_init(&ifibss->csa_connection_drop_work,
+			ieee80211_csa_connection_drop_work);
 }
 
 /* scan finished notification */
@@ -1754,7 +1740,7 @@ void ieee80211_ibss_notify_scan_completed(struct ieee80211_local *local)
 int ieee80211_ibss_join(struct ieee80211_sub_if_data *sdata,
 			struct cfg80211_ibss_params *params)
 {
-	u32 changed = 0;
+	u64 changed = 0;
 	u32 rate_flags;
 	struct ieee80211_supported_band *sband;
 	enum ieee80211_chanctx_mode chanmode;
@@ -1856,7 +1842,7 @@ int ieee80211_ibss_join(struct ieee80211_sub_if_data *sdata,
 	sdata->deflink.needed_rx_chains = local->rx_chains;
 	sdata->control_port_over_nl80211 = params->control_port_over_nl80211;
 
-	ieee80211_queue_work(&local->hw, &sdata->work);
+	wiphy_work_queue(local->hw.wiphy, &sdata->work);
 
 	return 0;
 }

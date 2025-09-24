@@ -19,6 +19,7 @@ static inline int gfp_migratetype(const gfp_t gfp_flags)
 	BUILD_BUG_ON((1UL << GFP_MOVABLE_SHIFT) != ___GFP_MOVABLE);
 	BUILD_BUG_ON((___GFP_MOVABLE >> GFP_MOVABLE_SHIFT) != MIGRATE_MOVABLE);
 	BUILD_BUG_ON((___GFP_RECLAIMABLE >> GFP_MOVABLE_SHIFT) != MIGRATE_RECLAIMABLE);
+
 	if (unlikely(page_group_by_mobility_disabled))
 		return MIGRATE_UNMOVABLE;
 
@@ -84,8 +85,8 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
  * GFP_ZONES_SHIFT must be <= 2 on 32 bit platforms.
  */
 
-#if defined(CONFIG_ZONE_DEVICE) && (MAX_NR_ZONES-1) <= 4
-/* ZONE_DEVICE is not a valid GFP zone specifier */
+#if MAX_NR_ZONES - 2 - IS_ENABLED(CONFIG_ZONE_DEVICE) <= 4
+/* zones beyond ZONE_MOVABLE are not valid GFP zone specifiers */
 #define GFP_ZONES_SHIFT 2
 #else
 #define GFP_ZONES_SHIFT ZONES_SHIFT
@@ -123,6 +124,8 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
 	| 1 << (___GFP_MOVABLE | ___GFP_DMA32 | ___GFP_DMA | ___GFP_HIGHMEM)  \
 )
 
+DECLARE_STATIC_KEY_FALSE(movablecore_enabled);
+
 static inline enum zone_type __gfp_zone(gfp_t flags)
 {
 	enum zone_type z;
@@ -131,7 +134,33 @@ static inline enum zone_type __gfp_zone(gfp_t flags)
 	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
 					 ((1 << GFP_ZONES_SHIFT) - 1);
 	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
+
+
+	if (z == ZONE_MOVABLE)
+		return LAST_VIRT_ZONE;
+
+	 /* Allow dma-buf etc to use virtual zones, if there is no movable zone */
+	if ((flags & __GFP_COMP) && (flags & __GFP_HIGHMEM) &&
+	    !static_branch_unlikely(&movablecore_enabled) && !movable_node_is_enabled())
+		return LAST_VIRT_ZONE;
+
 	return z;
+}
+
+extern int zone_nomerge_order __read_mostly;
+extern int zone_nosplit_order __read_mostly;
+
+static inline enum zone_type gfp_order_zone(gfp_t flags, int order)
+{
+	enum zone_type zid = __gfp_zone(flags);
+
+	if (zid >= ZONE_NOMERGE && (!zone_nomerge_order || order != zone_nomerge_order))
+		zid = ZONE_NOMERGE - 1;
+
+	if (zid == ZONE_NOSPLIT && (!zone_nosplit_order || order < zone_nosplit_order))
+		zid = ZONE_NOSPLIT - 1;
+
+	return zid;
 }
 
 enum zone_type gfp_zone(gfp_t flags);
@@ -318,7 +347,7 @@ extern void page_frag_free(void *addr);
 #define __free_page(page) __free_pages((page), 0)
 #define free_page(addr) free_pages((addr), 0)
 
-void page_alloc_init(void);
+void page_alloc_init_cpuhp(void);
 void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp);
 void drain_all_pages(struct zone *zone);
 void drain_local_pages(struct zone *zone);
@@ -337,8 +366,10 @@ extern gfp_t gfp_allowed_mask;
 /* Returns true if the gfp_mask allows use of ALLOC_NO_WATERMARK */
 bool gfp_pfmemalloc_allowed(gfp_t gfp_mask);
 
-extern void pm_restrict_gfp_mask(void);
-extern void pm_restore_gfp_mask(void);
+static inline bool gfp_has_io_fs(gfp_t gfp)
+{
+	return (gfp & (__GFP_IO | __GFP_FS)) == (__GFP_IO | __GFP_FS);
+}
 
 /*
  * Check if the gfp flags allow compaction - GFP_NOIO is a really
@@ -351,15 +382,6 @@ static inline bool gfp_compaction_allowed(gfp_t gfp_mask)
 
 extern gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma);
 
-#ifdef CONFIG_PM_SLEEP
-extern bool pm_suspended_storage(void);
-#else
-static inline bool pm_suspended_storage(void)
-{
-	return false;
-}
-#endif /* CONFIG_PM_SLEEP */
-
 int set_reclaim_params(int wmark_scale_factor, int swappiness);
 void get_reclaim_params(int *wmark_scale_factor, int *swappiness);
 
@@ -371,10 +393,5 @@ extern struct page *alloc_contig_pages(unsigned long nr_pages, gfp_t gfp_mask,
 				       int nid, nodemask_t *nodemask);
 #endif
 void free_contig_range(unsigned long pfn, unsigned long nr_pages);
-
-#ifdef CONFIG_CMA
-/* CMA stuff */
-extern void init_cma_reserved_pageblock(struct page *page);
-#endif
 
 #endif /* __LINUX_GFP_H */

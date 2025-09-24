@@ -57,6 +57,7 @@
 #define SEC_TYPE_MASK		0x0F
 #define SEC_DONE_MASK		0x0001
 #define SEC_ICV_MASK		0x000E
+#define SEC_SQE_LEN_RATE_MASK	0x3
 
 #define SEC_TOTAL_IV_SZ(depth)	(SEC_IV_SIZE * (depth))
 #define SEC_SGL_SGE_NR		128
@@ -79,16 +80,16 @@
 #define SEC_TOTAL_PBUF_SZ(depth)	(PAGE_SIZE * SEC_PBUF_PAGE_NUM(depth) +	\
 				SEC_PBUF_LEFT_SZ(depth))
 
+#define SEC_SQE_LEN_RATE	4
 #define SEC_SQE_CFLAG		2
 #define SEC_SQE_AEAD_FLAG	3
 #define SEC_SQE_DONE		0x1
 #define SEC_ICV_ERR		0x2
+#define MIN_MAC_LEN		4
 #define MAC_LEN_MASK		0x1U
 #define MAX_INPUT_DATA_LEN	0xFFFE00
 #define BITS_MASK		0xFF
-#define WORD_MASK		0x3
 #define BYTE_BITS		0x8
-#define BYTES_TO_WORDS(bcount)	((bcount) >> 2)
 #define SEC_XTS_NAME_SZ		0x3
 #define IV_CM_CAL_NUM		2
 #define IV_CL_MASK		0x7
@@ -282,7 +283,6 @@ static int sec_bd_send(struct sec_ctx *ctx, struct sec_req *req)
 
 	spin_lock_bh(&qp_ctx->req_lock);
 	ret = hisi_qp_send(qp_ctx->qp, &req->sec_sqe);
-
 	if (ctx->fake_req_limit <=
 	    atomic_read(&qp_ctx->qp->qp_status.used) && !ret) {
 		list_add_tail(&req->backlog_head, &qp_ctx->backlog);
@@ -1094,6 +1094,11 @@ static int sec_aead_auth_set_key(struct sec_auth_ctx *ctx,
 	struct crypto_shash *hash_tfm = ctx->hash_tfm;
 	int blocksize, digestsize, ret;
 
+	if (!keys->authkeylen) {
+		pr_err("hisi_sec2: aead auth key error!\n");
+		return -EINVAL;
+	}
+
 	blocksize = crypto_shash_blocksize(hash_tfm);
 	digestsize = crypto_shash_digestsize(hash_tfm);
 	if (keys->authkeylen > blocksize) {
@@ -1105,8 +1110,7 @@ static int sec_aead_auth_set_key(struct sec_auth_ctx *ctx,
 		}
 		ctx->a_key_len = digestsize;
 	} else {
-		if (keys->authkeylen)
-			memcpy(ctx->a_key, keys->authkey, keys->authkeylen);
+		memcpy(ctx->a_key, keys->authkey, keys->authkeylen);
 		ctx->a_key_len = keys->authkeylen;
 	}
 
@@ -1175,7 +1179,7 @@ static int sec_aead_setkey(struct crypto_aead *tfm, const u8 *key,
 		goto bad_key;
 	}
 
-	if (ctx->a_ctx.a_key_len & WORD_MASK) {
+	if (ctx->a_ctx.a_key_len & SEC_SQE_LEN_RATE_MASK) {
 		ret = -EINVAL;
 		dev_err(dev, "AUTH key length error!\n");
 		goto bad_key;
@@ -1445,12 +1449,11 @@ static void sec_skcipher_callback(struct sec_ctx *ctx, struct sec_req *req,
 			break;
 
 		backlog_sk_req = backlog_req->c_req.sk_req;
-		backlog_sk_req->base.complete(&backlog_sk_req->base,
-						-EINPROGRESS);
+		skcipher_request_complete(backlog_sk_req, -EINPROGRESS);
 		atomic64_inc(&ctx->sec->debug.dfx.recv_busy_cnt);
 	}
 
-	sk_req->base.complete(&sk_req->base, err);
+	skcipher_request_complete(sk_req, err);
 }
 
 static void set_aead_auth_iv(struct sec_ctx *ctx, struct sec_req *req)
@@ -1584,10 +1587,11 @@ static void sec_auth_bd_fill_ex(struct sec_auth_ctx *ctx, int dir,
 
 	sec_sqe->type2.a_key_addr = cpu_to_le64(ctx->a_key_dma);
 
-	sec_sqe->type2.mac_key_alg = cpu_to_le32(BYTES_TO_WORDS(authsize));
+	sec_sqe->type2.mac_key_alg = cpu_to_le32(authsize / SEC_SQE_LEN_RATE);
 
 	sec_sqe->type2.mac_key_alg |=
-			cpu_to_le32((u32)BYTES_TO_WORDS(ctx->a_key_len) << SEC_AKEY_OFFSET);
+			cpu_to_le32((u32)((ctx->a_key_len) /
+			SEC_SQE_LEN_RATE) << SEC_AKEY_OFFSET);
 
 	sec_sqe->type2.mac_key_alg |=
 			cpu_to_le32((u32)(ctx->a_alg) << SEC_AEAD_ALG_OFFSET);
@@ -1639,10 +1643,12 @@ static void sec_auth_bd_fill_ex_v3(struct sec_auth_ctx *ctx, int dir,
 	sqe3->a_key_addr = cpu_to_le64(ctx->a_key_dma);
 
 	sqe3->auth_mac_key |=
-			cpu_to_le32(BYTES_TO_WORDS(authsize) << SEC_MAC_OFFSET_V3);
+			cpu_to_le32((u32)(authsize /
+			SEC_SQE_LEN_RATE) << SEC_MAC_OFFSET_V3);
 
 	sqe3->auth_mac_key |=
-			cpu_to_le32((u32)BYTES_TO_WORDS(ctx->a_key_len) << SEC_AKEY_OFFSET_V3);
+			cpu_to_le32((u32)(ctx->a_key_len /
+			SEC_SQE_LEN_RATE) << SEC_AKEY_OFFSET_V3);
 
 	sqe3->auth_mac_key |=
 			cpu_to_le32((u32)(ctx->a_alg) << SEC_AUTH_ALG_OFFSET_V3);
@@ -1719,12 +1725,11 @@ static void sec_aead_callback(struct sec_ctx *c, struct sec_req *req, int err)
 			break;
 
 		backlog_aead_req = backlog_req->aead_req.aead_req;
-		backlog_aead_req->base.complete(&backlog_aead_req->base,
-						-EINPROGRESS);
+		aead_request_complete(backlog_aead_req, -EINPROGRESS);
 		atomic64_inc(&c->sec->debug.dfx.recv_busy_cnt);
 	}
 
-	a_req->base.complete(&a_req->base, err);
+	aead_request_complete(a_req, err);
 }
 
 static void sec_request_uninit(struct sec_ctx *ctx, struct sec_req *req)
@@ -2002,7 +2007,7 @@ static int sec_aead_sha512_ctx_init(struct crypto_aead *tfm)
 	return sec_aead_ctx_init(tfm, "sha512");
 }
 
-static int sec_skcipher_cryptlen_ckeck(struct sec_ctx *ctx,
+static int sec_skcipher_cryptlen_check(struct sec_ctx *ctx,
 	struct sec_req *sreq)
 {
 	u32 cryptlen = sreq->c_req.sk_req->cryptlen;
@@ -2064,7 +2069,7 @@ static int sec_skcipher_param_check(struct sec_ctx *ctx, struct sec_req *sreq)
 		}
 		return 0;
 	} else if (c_alg == SEC_CALG_AES || c_alg == SEC_CALG_SM4) {
-		return sec_skcipher_cryptlen_ckeck(ctx, sreq);
+		return sec_skcipher_cryptlen_check(ctx, sreq);
 	}
 
 	dev_err(dev, "skcipher algorithm error!\n");
@@ -2260,8 +2265,8 @@ static int sec_aead_spec_check(struct sec_ctx *ctx, struct sec_req *sreq)
 	struct device *dev = ctx->dev;
 	int ret;
 
-	/* Hardware does not handle cases where authsize is not 4 bytes aligned */
-	if (c_mode == SEC_CMODE_CBC && (sz & WORD_MASK)) {
+	/* Hardware does not handle cases where authsize is less than 4 bytes */
+	if (unlikely(sz < MIN_MAC_LEN)) {
 		sreq->aead_req.fallback = true;
 		return -EINVAL;
 	}

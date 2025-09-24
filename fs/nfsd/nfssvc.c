@@ -397,6 +397,11 @@ void nfsd_reset_write_verifier(struct nfsd_net *nn)
 	write_sequnlock(&nn->writeverf_lock);
 }
 
+/*
+ * Crank up a set of per-namespace resources for a new NFSD instance,
+ * including lockd, a duplicate reply cache, an open file cache
+ * instance, and a cache of NFSv4 state objects.
+ */
 static int nfsd_startup_net(struct net *net, const struct cred *cred)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
@@ -924,7 +929,6 @@ nfsd(void *vrqstp)
 	struct svc_xprt *perm_sock = list_entry(rqstp->rq_server->sv_permsocks.next, typeof(struct svc_xprt), xpt_list);
 	struct net *net = perm_sock->xpt_net;
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
-	int err;
 
 	/* At this point, the thread shares current->fs
 	 * with the init process. We need to create files with the
@@ -943,21 +947,11 @@ nfsd(void *vrqstp)
 	/*
 	 * The main request loop
 	 */
-	for (;;) {
+	while (!kthread_should_stop()) {
 		/* Update sv_maxconn if it has changed */
 		rqstp->rq_server->sv_maxconn = nn->max_connections;
 
-		/*
-		 * Find a socket with data available and call its
-		 * recvfrom routine.
-		 */
-		while ((err = svc_recv(rqstp, 60*60*HZ)) == -EAGAIN)
-			;
-		if (err == -EINTR)
-			break;
-		validate_process_creds();
-		svc_process(rqstp);
-		validate_process_creds();
+		svc_recv(rqstp);
 	}
 
 	atomic_dec(&nfsd_th_cnt);
@@ -971,7 +965,6 @@ out:
 /**
  * nfsd_dispatch - Process an NFS or NFSACL Request
  * @rqstp: incoming request
- * @statp: pointer to location of accept_stat field in RPC Reply buffer
  *
  * This RPC dispatcher integrates the NFS server's duplicate reply cache.
  *
@@ -979,9 +972,11 @@ out:
  *  %0: Processing complete; do not send a Reply
  *  %1: Processing complete; send Reply in rqstp->rq_res
  */
-int nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
+int nfsd_dispatch(struct svc_rqst *rqstp)
 {
 	const struct svc_procedure *proc = rqstp->rq_procinfo;
+	__be32 *statp = rqstp->rq_accept_statp;
+	struct nfsd_cacherep *rp;
 	unsigned int start, len;
 	__be32 *nfs_reply;
 
@@ -990,8 +985,6 @@ int nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
 	 * (necessary in the NFSv4.0 compound case)
 	 */
 	rqstp->rq_cachetype = proc->pc_cachetype;
-
-	svcxdr_init_decode(rqstp);
 
 	/*
 	 * ->pc_decode advances the argument stream past the NFS
@@ -1003,7 +996,8 @@ int nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
 	if (!proc->pc_decode(rqstp, &rqstp->rq_arg_stream))
 		goto out_decode_err;
 
-	switch (nfsd_cache_lookup(rqstp, start, len)) {
+	rp = NULL;
+	switch (nfsd_cache_lookup(rqstp, start, len, &rp)) {
 	case RC_DOIT:
 		break;
 	case RC_REPLY:
@@ -1011,12 +1005,6 @@ int nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
 	case RC_DROPIT:
 		goto out_dropit;
 	}
-
-	/*
-	 * Need to grab the location to store the status, as
-	 * NFSv4 does some encoding while processing
-	 */
-	svcxdr_init_encode(rqstp);
 
 	nfs_reply = xdr_inline_decode(&rqstp->rq_res_stream, 0);
 	*statp = proc->pc_func(rqstp);
@@ -1026,7 +1014,7 @@ int nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
 	if (!proc->pc_encode(rqstp, &rqstp->rq_res_stream))
 		goto out_encode_err;
 
-	nfsd_cache_update(rqstp, rqstp->rq_cachetype, nfs_reply);
+	nfsd_cache_update(rqstp, rp, rqstp->rq_cachetype, nfs_reply);
 out_cached_reply:
 	return 1;
 
@@ -1036,13 +1024,13 @@ out_decode_err:
 	return 1;
 
 out_update_drop:
-	nfsd_cache_update(rqstp, RC_NOCACHE, NULL);
+	nfsd_cache_update(rqstp, rp, RC_NOCACHE, NULL);
 out_dropit:
 	return 0;
 
 out_encode_err:
 	trace_nfsd_cant_encode_err(rqstp);
-	nfsd_cache_update(rqstp, RC_NOCACHE, NULL);
+	nfsd_cache_update(rqstp, rp, RC_NOCACHE, NULL);
 	*statp = rpc_system_err;
 	return 1;
 }

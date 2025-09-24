@@ -6,13 +6,13 @@
 #include <linux/arm-smccc.h>
 #include <linux/list.h>
 #include <linux/percpu-defs.h>
-#include <linux/ring_buffer.h>
 #include <linux/trace_events.h>
 #include <linux/tracefs.h>
 
 #include <asm/kvm_host.h>
 #include <asm/kvm_hyptrace.h>
 #include <asm/kvm_hypevents_defs.h>
+#include <asm/kvm_pkvm.h>
 
 #include "hyp_constants.h"
 #include "hyp_trace.h"
@@ -23,52 +23,39 @@
 #define TRACEFS_MODE_WRITE 0640
 #define TRACEFS_MODE_READ 0440
 
-static bool hyp_trace_on;
-static bool hyp_free_tracing_deferred;
-static int hyp_trace_readers;
-static LIST_HEAD(hyp_pipe_readers);
-static struct trace_buffer *hyp_trace_buffer;
+static struct hyp_trace_buffer {
+	struct hyp_trace_desc		*desc;
+	struct ring_buffer_writer	writer;
+	struct trace_buffer		*trace_buffer;
+	size_t				desc_size;
+	bool				tracing_on;
+	int				nr_readers;
+	struct mutex			lock;
+	struct ht_iterator		*printk_iter;
+	bool				printk_on;
+} hyp_trace_buffer = {
+	.lock			= __MUTEX_INITIALIZER(hyp_trace_buffer.lock),
+};
+
 static size_t hyp_trace_buffer_size = 7 << 10;
-static struct hyp_buffer_pages_backing hyp_buffer_pages_backing;
-static DEFINE_MUTEX(hyp_trace_lock);
-static DEFINE_PER_CPU(struct mutex, hyp_trace_reader_lock);
 
-static int bpage_backing_setup(struct hyp_trace_pack *pack)
+/* Number of pages the ring-buffer requires to accommodate for size */
+#define NR_PAGES(size) \
+	((PAGE_ALIGN(size) >> PAGE_SHIFT) + 1)
+
+static inline bool hyp_trace_buffer_loaded(struct hyp_trace_buffer *hyp_buffer)
 {
-	size_t backing_size;
-	void *start;
-
-	if (hyp_buffer_pages_backing.start)
-		return -EBUSY;
-
-	backing_size = STRUCT_HYP_BUFFER_PAGE_SIZE *
-		       pack->trace_buffer_pack.total_pages;
-	backing_size = PAGE_ALIGN(backing_size);
-
-	start = alloc_pages_exact(backing_size, GFP_KERNEL_ACCOUNT);
-	if (!start)
-		return -ENOMEM;
-
-	hyp_buffer_pages_backing.start = (unsigned long)start;
-	hyp_buffer_pages_backing.size = backing_size;
-	pack->backing.start = (unsigned long)start;
-	pack->backing.size = backing_size;
-
-	return 0;
+	return !!hyp_buffer->trace_buffer;
 }
 
-static void bpage_backing_teardown(void)
+static int set_ht_printk_on(char *str)
 {
-	unsigned long backing = hyp_buffer_pages_backing.start;
+	if ((strcmp(str, "=0") != 0 && strcmp(str, "=off") != 0))
+		hyp_trace_buffer.printk_on = true;
 
-	if (!hyp_buffer_pages_backing.start)
-		return;
-
-	free_pages_exact((void *)backing, hyp_buffer_pages_backing.size);
-
-	hyp_buffer_pages_backing.start = 0;
-	hyp_buffer_pages_backing.size = 0;
+	return 1;
 }
+__setup("hyp_trace_printk", set_ht_printk_on);
 
 /*
  * Configure the hyp tracing clock. So far, only one is supported: "boot". This
@@ -76,9 +63,9 @@ static void bpage_backing_teardown(void)
  * if this clock is corrected by NTP while tracing, the hyp clock will slightly
  * drift compared to the host version.
  */
-static void hyp_clock_setup(struct hyp_trace_pack *pack)
+static void hyp_clock_setup(struct hyp_trace_desc *desc)
 {
-	struct kvm_nvhe_clock_data *clock_data = &pack->trace_clock_data;
+	struct kvm_nvhe_clock_data *clock_data = &desc->clock_data;
 	struct system_time_snapshot snap;
 
 	ktime_get_snapshot(&snap);
@@ -89,215 +76,267 @@ static void hyp_clock_setup(struct hyp_trace_pack *pack)
 	clock_data->shift = snap.mono_shift;
 }
 
-static int __swap_reader_page(int cpu)
+static int __swap_reader(int cpu)
 {
-	return kvm_call_hyp_nvhe(__pkvm_rb_swap_reader_page, cpu);
+	return kvm_call_hyp_nvhe(__pkvm_swap_reader_tracing, cpu);
 }
 
-static int __update_footers(int cpu)
+static void hyp_trace_free_pages(struct hyp_trace_desc *desc)
 {
-	return kvm_call_hyp_nvhe(__pkvm_rb_update_footers, cpu);
+	struct rb_page_desc *rb_desc;
+	int cpu, id;
+
+	for_each_rb_page_desc(rb_desc, cpu, &desc->page_desc) {
+		free_page(rb_desc->meta_va);
+		for (id = 0; id < rb_desc->nr_page_va; id++)
+			free_page(rb_desc->page_va[id]);
+	}
 }
 
-struct ring_buffer_ext_cb hyp_cb = {
-	.update_footers = __update_footers,
-	.swap_reader = __swap_reader_page,
-};
-
-static inline int share_page(unsigned long va)
+static int hyp_trace_alloc_pages(struct hyp_trace_desc *desc, size_t size)
 {
-	return kvm_call_hyp_nvhe(__pkvm_host_share_hyp, virt_to_pfn(va), 1);
-}
+	int err = 0, cpu, id, nr_pages = NR_PAGES(size);
+	struct trace_page_desc *trace_desc;
+	struct rb_page_desc *rb_desc;
 
-static inline int unshare_page(unsigned long va)
-{
-	return kvm_call_hyp_nvhe(__pkvm_host_unshare_hyp, virt_to_pfn(va), 1);
-}
+	trace_desc = &desc->page_desc;
+	trace_desc->nr_cpus = 0;
 
-static int trace_pack_pages_apply(struct trace_buffer_pack *trace_pack,
-				  int (*func)(unsigned long))
-{
-	struct ring_buffer_pack *rb_pack;
-	int cpu, i, ret;
+	rb_desc = (struct rb_page_desc *)&trace_desc->__data[0];
 
-	for_each_ring_buffer_pack(rb_pack, cpu, trace_pack) {
-		ret = func(rb_pack->reader_page_va);
-		if (ret)
-			return ret;
-
-		for (i = 0; i < rb_pack->nr_pages; i++) {
-			ret = func(rb_pack->page_va[i]);
-			if (ret)
-				return ret;
+	for_each_possible_cpu(cpu) {
+		rb_desc->cpu = cpu;
+		rb_desc->nr_page_va = 0;
+		rb_desc->meta_va = (unsigned long)page_to_virt(alloc_page(GFP_KERNEL));
+		if (!rb_desc->meta_va) {
+			err = -ENOMEM;
+			break;
 		}
+		for (id = 0; id < nr_pages; id++) {
+			rb_desc->page_va[id] = (unsigned long)page_to_virt(alloc_page(GFP_KERNEL));
+			if (!rb_desc->page_va[id]) {
+				err = -ENOMEM;
+				break;
+			}
+			rb_desc->nr_page_va++;
+		}
+		trace_desc->nr_cpus++;
+		rb_desc = __next_rb_page_desc(rb_desc);
+	}
+
+	if (err) {
+		hyp_trace_free_pages(desc);
+		return err;
 	}
 
 	return 0;
 }
 
-/*
- * hyp_trace_pack size depends on trace_buffer_pack's, so
- * trace_buffer_setup is in charge of the allocation for the former.
- */
-static int trace_buffer_setup(struct hyp_trace_pack **pack, size_t *pack_size)
+static int __load_page(unsigned long va)
 {
-	struct trace_buffer_pack *trace_pack;
-	int ret;
+	return kvm_call_hyp_nvhe(__pkvm_host_share_hyp, virt_to_pfn((void *)va), 1);
+}
 
-	hyp_trace_buffer = ring_buffer_alloc_ext(hyp_trace_buffer_size, &hyp_cb);
-	if (!hyp_trace_buffer)
-		return -ENOMEM;
+static void __teardown_page(unsigned long va)
+{
+	WARN_ON(kvm_call_hyp_nvhe(__pkvm_host_unshare_hyp, virt_to_pfn((void *)va), 1));
+}
 
-	*pack_size = offsetof(struct hyp_trace_pack, trace_buffer_pack) +
-		     trace_buffer_pack_size(hyp_trace_buffer);
+static void hyp_trace_teardown_pages(struct hyp_trace_desc *desc,
+				     int last_cpu)
+{
+	struct rb_page_desc *rb_desc;
+	int cpu, id;
+
+	for_each_rb_page_desc(rb_desc, cpu, &desc->page_desc) {
+		if (cpu > last_cpu)
+			break;
+		__teardown_page(rb_desc->meta_va);
+		for (id = 0; id < rb_desc->nr_page_va; id++)
+			__teardown_page(rb_desc->page_va[id]);
+	}
+}
+
+static int hyp_trace_load_pages(struct hyp_trace_desc *desc)
+{
+	int last_loaded_cpu = 0, cpu, id, err = -EINVAL;
+	struct rb_page_desc *rb_desc;
+
+	for_each_rb_page_desc(rb_desc, cpu, &desc->page_desc) {
+		err = __load_page(rb_desc->meta_va);
+		if (err)
+			break;
+
+		for (id = 0; id < rb_desc->nr_page_va; id++) {
+			err = __load_page(rb_desc->page_va[id]);
+			if (err)
+				break;
+		}
+
+		if (!err)
+			continue;
+
+		for (id--; id >= 0; id--)
+			__teardown_page(rb_desc->page_va[id]);
+
+		last_loaded_cpu = cpu - 1;
+
+		break;
+	}
+
+	if (!err)
+		return 0;
+
+	hyp_trace_teardown_pages(desc, last_loaded_cpu);
+
+	return err;
+}
+
+static int hyp_trace_buffer_load(struct hyp_trace_buffer *hyp_buffer, size_t size)
+{
+	int ret, nr_pages = NR_PAGES(size);
+	struct rb_page_desc *rbdesc;
+	struct hyp_trace_desc *desc;
+	size_t desc_size;
+
+	if (hyp_trace_buffer_loaded(hyp_buffer))
+		return 0;
+
+	desc_size = size_add(offsetof(struct hyp_trace_desc, page_desc),
+			     offsetof(struct trace_page_desc, __data));
+	desc_size = size_add(desc_size,
+			     size_mul(num_possible_cpus(),
+				      struct_size(rbdesc, page_va, nr_pages)));
+	if (desc_size == SIZE_MAX)
+		return -E2BIG;
+
 	/*
-	 * The hypervisor will unmap the pack from the host to protect the
-	 * reading. Page granularity for the pack allocation ensures no other
+	 * The hypervisor will unmap the descriptor from the host to protect the
+	 * reading. Page granularity for the allocation ensures no other
 	 * useful data will be unmapped.
 	 */
-	*pack_size = PAGE_ALIGN(*pack_size);
-	*pack = alloc_pages_exact(*pack_size, GFP_KERNEL);
-	if (!*pack) {
+	desc_size = PAGE_ALIGN(desc_size);
+
+	desc = (struct hyp_trace_desc *)alloc_pages_exact(desc_size, GFP_KERNEL);
+	if (!desc)
+		return -ENOMEM;
+
+	ret = hyp_trace_alloc_pages(desc, size);
+	if (ret)
+		goto err_free_desc;
+
+	ret = hyp_trace_load_pages(desc);
+	if (ret)
+		goto err_free_pages;
+
+	hyp_clock_setup(desc);
+
+	ret = kvm_call_refill_hyp_nvhe(__pkvm_load_tracing,
+				       (unsigned long)desc, desc_size);
+	if (ret)
+		goto err_teardown_pages;
+
+	hyp_buffer->writer.pdesc = &desc->page_desc;
+	hyp_buffer->writer.get_reader_page = __swap_reader;
+	hyp_buffer->trace_buffer = ring_buffer_reader(&hyp_buffer->writer);
+	if (!hyp_buffer->trace_buffer) {
 		ret = -ENOMEM;
-		goto err;
+		goto err_teardown_tracing;
 	}
 
-	trace_pack = &(*pack)->trace_buffer_pack;
-	WARN_ON(trace_buffer_pack(hyp_trace_buffer, trace_pack));
-
-	ret = trace_pack_pages_apply(trace_pack, share_page);
-	if (ret) {
-		trace_pack_pages_apply(trace_pack, unshare_page);
-		free_pages_exact(*pack, *pack_size);
-		goto err;
-	}
+	hyp_buffer->desc = desc;
+	hyp_buffer->desc_size = desc_size;
 
 	return 0;
-err:
-	ring_buffer_free(hyp_trace_buffer);
-	hyp_trace_buffer = NULL;
+
+err_teardown_tracing:
+	kvm_call_hyp_nvhe(__pkvm_teardown_tracing);
+err_teardown_pages:
+	hyp_trace_teardown_pages(desc, INT_MAX);
+err_free_pages:
+	hyp_trace_free_pages(desc);
+err_free_desc:
+	free_pages_exact(desc, desc_size);
 
 	return ret;
 }
 
-static void trace_buffer_teardown(struct trace_buffer_pack *trace_pack)
+static void hyp_trace_buffer_teardown(struct hyp_trace_buffer *hyp_buffer)
 {
-	bool alloc_trace_pack = !trace_pack;
+	struct hyp_trace_desc *desc = hyp_buffer->desc;
+	size_t desc_size = hyp_buffer->desc_size;
 
-	if (alloc_trace_pack) {
-		trace_pack = kzalloc(trace_buffer_pack_size(hyp_trace_buffer), GFP_KERNEL);
-		if (!trace_pack) {
-			WARN_ON(1);
-			goto end;
-		}
-	}
-
-	WARN_ON(trace_buffer_pack(hyp_trace_buffer, trace_pack));
-	WARN_ON(trace_pack_pages_apply(trace_pack, unshare_page));
-
-	if (alloc_trace_pack)
-		kfree(trace_pack);
-end:
-	ring_buffer_free(hyp_trace_buffer);
-	hyp_trace_buffer = NULL;
-}
-
-static int hyp_load_tracing(void)
-{
-	struct hyp_trace_pack *pack;
-	size_t pack_size;
-	int ret;
-
-	ret = trace_buffer_setup(&pack, &pack_size);
-	if (ret)
-		return ret;
-
-	hyp_clock_setup(pack);
-
-	ret = bpage_backing_setup(pack);
-	if (ret)
-		goto end_buffer_teardown;
-
-	ret = kvm_call_hyp_nvhe(__pkvm_load_tracing, (unsigned long)pack, pack_size);
-	if (!ret)
-		goto end_free_pack;
-
-	bpage_backing_teardown();
-end_buffer_teardown:
-	trace_buffer_teardown(&pack->trace_buffer_pack);
-end_free_pack:
-	free_pages_exact(pack, pack_size);
-
-	return ret;
-}
-
-static void hyp_free_tracing(void)
-{
-	WARN_ON(hyp_trace_readers || hyp_trace_on);
-
-	if (WARN_ON(kvm_call_hyp_nvhe(__pkvm_teardown_tracing)))
+	if (kvm_call_hyp_nvhe(__pkvm_teardown_tracing))
 		return;
-
-	trace_buffer_teardown(NULL);
-	bpage_backing_teardown();
+	ring_buffer_free(hyp_buffer->trace_buffer);
+	hyp_trace_teardown_pages(desc, INT_MAX);
+	hyp_trace_free_pages(desc);
+	free_pages_exact(desc, desc_size);
+	hyp_buffer->trace_buffer = NULL;
 }
 
-void hyp_poke_tracing(int cpu, const struct cpumask *cpus)
+static int hyp_tracing_teardown(void)
 {
-	if (cpu == RING_BUFFER_ALL_CPUS) {
-		for_each_cpu(cpu, cpus)
-			WARN_ON_ONCE(ring_buffer_poke(hyp_trace_buffer, cpu));
-	} else {
-		WARN_ON_ONCE(ring_buffer_poke(hyp_trace_buffer, cpu));
-	}
-}
-
-static int hyp_start_tracing(void)
-{
+	struct hyp_trace_buffer *hyp_buffer = &hyp_trace_buffer;
 	int ret = 0;
 
-	if (hyp_trace_on)
-		return -EBUSY;
+	mutex_lock(&hyp_buffer->lock);
+	if (!hyp_trace_buffer_loaded(hyp_buffer))
+		goto out;
 
-	if (!hyp_trace_buffer) {
-		ret = hyp_load_tracing();
-		if (ret)
-			return ret;
+	if (hyp_buffer->tracing_on || hyp_buffer->nr_readers) {
+		ret = -EBUSY;
+		goto out;
 	}
 
-	ret = kvm_call_hyp_nvhe(__pkvm_enable_tracing, true);
-	if (!ret) {
-		struct ht_iterator *iter;
-
-		list_for_each_entry(iter, &hyp_pipe_readers, list)
-			schedule_delayed_work(&iter->poke_work,
-					      msecs_to_jiffies(RB_POLL_MS));
-		hyp_trace_on = true;
-	}
+	hyp_trace_buffer_teardown(hyp_buffer);
+out:
+	mutex_unlock(&hyp_buffer->lock);
 
 	return ret;
 }
 
-static void hyp_stop_tracing(void)
+static int hyp_tracing_start(void)
 {
-	struct ht_iterator *iter;
+	struct hyp_trace_buffer *hyp_buffer = &hyp_trace_buffer;
 	int ret;
 
-	if (!hyp_trace_buffer || !hyp_trace_on)
-		return;
+	mutex_lock(&hyp_buffer->lock);
+
+	ret = hyp_trace_buffer_load(hyp_buffer, hyp_trace_buffer_size);
+	if (ret)
+		goto out;
+
+	ret = kvm_call_hyp_nvhe(__pkvm_enable_tracing, true);
+	if (!ret)
+		hyp_buffer->tracing_on = true;
+out:
+	mutex_unlock(&hyp_buffer->lock);
+
+	return ret;
+}
+
+static void hyp_tracing_stop(void)
+{
+	struct hyp_trace_buffer *hyp_buffer = &hyp_trace_buffer;
+	int ret;
+
+	mutex_lock(&hyp_buffer->lock);
+	if (!hyp_trace_buffer_loaded(hyp_buffer))
+		goto end;
 
 	ret = kvm_call_hyp_nvhe(__pkvm_enable_tracing, false);
-	if (ret) {
-		WARN_ON(1);
-		return;
+	if (!ret) {
+		/*
+		 * There are no way to flush the remaining data on reader
+		 * release. So instead, do it when tracing stops.
+		 */
+		ring_buffer_poll_writer(hyp_buffer->trace_buffer,
+					RING_BUFFER_ALL_CPUS);
+		hyp_buffer->tracing_on = false;
 	}
-
-	hyp_trace_on = false;
-
-	list_for_each_entry(iter, &hyp_pipe_readers, list) {
-		cancel_delayed_work_sync(&iter->poke_work);
-		hyp_poke_tracing(iter->cpu, iter->cpus);
-	}
+end:
+	mutex_unlock(&hyp_buffer->lock);
 }
 
 static ssize_t
@@ -312,20 +351,16 @@ hyp_tracing_on(struct file *filp, const char __user *ubuf, size_t cnt, loff_t *p
 	if (get_user(c, ubuf))
 		return -EFAULT;
 
-	mutex_lock(&hyp_trace_lock);
-
 	switch (c) {
 	case '1':
-		err = hyp_start_tracing();
+		err = hyp_tracing_start();
 		break;
 	case '0':
-		hyp_stop_tracing();
+		hyp_tracing_stop();
 		break;
 	default:
 		err = -EINVAL;
 	}
-
-	mutex_unlock(&hyp_trace_lock);
 
 	return err ? err : cnt;
 }
@@ -336,9 +371,9 @@ static ssize_t hyp_tracing_on_read(struct file *filp, char __user *ubuf,
 	char buf[3];
 	int r;
 
-	mutex_lock(&hyp_trace_lock);
-	r = sprintf(buf, "%d\n", hyp_trace_on);
-	mutex_unlock(&hyp_trace_lock);
+	mutex_lock(&hyp_trace_buffer.lock);
+	r = sprintf(buf, "%d\n", hyp_trace_buffer.tracing_on);
+	mutex_unlock(&hyp_trace_buffer.lock);
 
 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, r);
 }
@@ -361,9 +396,9 @@ static ssize_t hyp_buffer_size(struct file *filp, const char __user *ubuf,
 	if (!val)
 		return -EINVAL;
 
-	mutex_lock(&hyp_trace_lock);
+	mutex_lock(&hyp_trace_buffer.lock);
 	hyp_trace_buffer_size = val << 10; /* KB to B */
-	mutex_unlock(&hyp_trace_lock);
+	mutex_unlock(&hyp_trace_buffer.lock);
 
 	return cnt;
 }
@@ -374,9 +409,9 @@ static ssize_t hyp_buffer_size_read(struct file *filp, char __user *ubuf,
 	char buf[64];
 	int r;
 
-	mutex_lock(&hyp_trace_lock);
+	mutex_lock(&hyp_trace_buffer.lock);
 	r = sprintf(buf, "%lu\n", hyp_trace_buffer_size >> 10);
-	mutex_unlock(&hyp_trace_lock);
+	mutex_unlock(&hyp_trace_buffer.lock);
 
 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, r);
 }
@@ -385,28 +420,6 @@ static const struct file_operations hyp_buffer_size_fops = {
 	.write	= hyp_buffer_size,
 	.read	= hyp_buffer_size_read,
 };
-
-static inline void hyp_trace_read_start(int cpu)
-{
-	if (cpu != RING_BUFFER_ALL_CPUS) {
-		mutex_lock(&per_cpu(hyp_trace_reader_lock, cpu));
-		return;
-	}
-
-	for_each_possible_cpu(cpu)
-		mutex_lock(&per_cpu(hyp_trace_reader_lock, cpu));
-}
-
-static inline void hyp_trace_read_stop(int cpu)
-{
-	if (cpu != RING_BUFFER_ALL_CPUS) {
-		mutex_unlock(&per_cpu(hyp_trace_reader_lock, cpu));
-		return;
-	}
-
-	for_each_possible_cpu(cpu)
-		mutex_unlock(&per_cpu(hyp_trace_reader_lock, cpu));
-}
 
 static void ht_print_trace_time(struct ht_iterator *iter)
 {
@@ -425,11 +438,9 @@ static void ht_print_trace_cpu(struct ht_iterator *iter)
 	trace_seq_printf(&iter->seq, "[%03d]\t", iter->ent_cpu);
 }
 
-extern struct trace_event *ftrace_find_event(int type);
-
 static int ht_print_trace_fmt(struct ht_iterator *iter)
 {
-	struct trace_event *e;
+	struct hyp_event *e;
 
 	if (iter->lost_events)
 		trace_seq_printf(&iter->seq, "CPU:%d [LOST %lu EVENTS]\n",
@@ -438,271 +449,41 @@ static int ht_print_trace_fmt(struct ht_iterator *iter)
 	ht_print_trace_cpu(iter);
 	ht_print_trace_time(iter);
 
-	e = ftrace_find_event(iter->ent->id);
+	e = hyp_trace_find_event(iter->ent->id);
 	if (e)
-		e->funcs->trace((struct trace_iterator *)iter, 0, e);
+		e->trace_func(iter);
 	else
 		trace_seq_printf(&iter->seq, "Unknown event id %d\n", iter->ent->id);
 
 	return trace_seq_has_overflowed(&iter->seq) ? -EOVERFLOW : 0;
 };
 
-static struct ring_buffer_event *ht_next_event(struct ht_iterator *iter,
-					       u64 *ts, int *cpu)
-{
-	struct ring_buffer_event *evt = NULL;
-	int _cpu;
-	u64 _ts;
-
-	if (!iter->buf_iter)
-		return NULL;
-
-	if (iter->cpu != RING_BUFFER_ALL_CPUS) {
-		evt = ring_buffer_iter_peek(iter->buf_iter[iter->cpu], ts);
-		if (!evt)
-			return NULL;
-
-		*cpu = iter->cpu;
-		ring_buffer_iter_advance(iter->buf_iter[*cpu]);
-
-		return evt;
-	}
-
-	*ts = LLONG_MAX;
-	for_each_cpu(_cpu, iter->cpus) {
-		struct ring_buffer_event *_evt;
-
-		_evt = ring_buffer_iter_peek(iter->buf_iter[_cpu], &_ts);
-		if (!_evt)
-			continue;
-
-		if (_ts >= *ts)
-			continue;
-
-		*ts = _ts;
-		*cpu = _cpu;
-		evt = _evt;
-	}
-
-	if (evt)
-		ring_buffer_iter_advance(iter->buf_iter[*cpu]);
-
-	return evt;
-}
-
-static void *ht_next(struct seq_file *m, void *v, loff_t *pos)
-{
-	struct ht_iterator *iter = m->private;
-	struct ring_buffer_event *evt;
-	int cpu;
-	u64 ts;
-
-	(*pos)++;
-
-	evt = ht_next_event(iter, &ts, &cpu);
-	if (!evt)
-		return NULL;
-
-	iter->ent = (struct hyp_entry_hdr *)&evt->array[1];
-	iter->ts = ts;
-	iter->ent_size = evt->array[0];
-	iter->ent_cpu = cpu;
-
-	return iter;
-}
-
-static void ht_iter_reset(struct ht_iterator *iter)
-{
-	int cpu = iter->cpu;
-
-	if (!iter->buf_iter)
-		return;
-
-	if (cpu != RING_BUFFER_ALL_CPUS) {
-		ring_buffer_iter_reset(iter->buf_iter[cpu]);
-		return;
-	}
-
-	for_each_cpu(cpu, iter->cpus)
-		ring_buffer_iter_reset(iter->buf_iter[cpu]);
-}
-
-static void *ht_start(struct seq_file *m, loff_t *pos)
-{
-	struct ht_iterator *iter = m->private;
-
-	if (*pos == 0) {
-		ht_iter_reset(iter);
-		(*pos)++;
-		iter->ent = NULL;
-
-		return iter;
-	}
-
-	hyp_trace_read_start(iter->cpu);
-
-	return ht_next(m, NULL, pos);
-}
-
-static void ht_stop(struct seq_file *m, void *v)
-{
-	struct ht_iterator *iter = m->private;
-
-	hyp_trace_read_stop(iter->cpu);
-}
-
-static void ht_total_entries(struct ht_iterator *iter, unsigned long *entries,
-			     unsigned long *overrun)
-{
-	int cpu = iter->cpu;
-
-	*entries = 0;
-	*overrun = 0;
-
-	if (!hyp_trace_buffer)
-		return;
-
-	if (cpu != RING_BUFFER_ALL_CPUS) {
-		*entries = ring_buffer_entries_cpu(hyp_trace_buffer, cpu);
-		*overrun = ring_buffer_overrun_cpu(hyp_trace_buffer, cpu);
-		return;
-	}
-
-	for_each_cpu(cpu, iter->cpus) {
-		*entries += ring_buffer_entries_cpu(hyp_trace_buffer, cpu);
-		*overrun += ring_buffer_overrun_cpu(hyp_trace_buffer, cpu);
-	}
-}
-
-static int ht_show(struct seq_file *m, void *v)
-{
-	struct ht_iterator *iter = v;
-
-	if (!iter->ent) {
-		unsigned long entries, overrun;
-
-		ht_total_entries(iter, &entries, &overrun);
-		seq_printf(m, "# entries-in-buffer/entries-written: %lu/%lu\n",
-			  entries, overrun + entries);
-	} else {
-		ht_print_trace_fmt(iter);
-		trace_print_seq(m, &iter->seq);
-	}
-
-	return 0;
-}
-
-static const struct seq_operations hyp_trace_ops = {
-	.start	= ht_start,
-	.next	= ht_next,
-	.stop	= ht_stop,
-	.show	= ht_show,
-};
-
-static int hyp_trace_reset(int cpu)
-{
-	if (!hyp_trace_buffer)
-		return 0;
-
-	if (hyp_trace_on)
-		return -EBUSY;
-
-	if (cpu == RING_BUFFER_ALL_CPUS) {
-		if (hyp_trace_readers)
-			hyp_free_tracing_deferred = true;
-		else
-			hyp_free_tracing();
-
-		return 0;
-	}
-
-	ring_buffer_reset_cpu(hyp_trace_buffer, cpu);
-
-	return 0;
-}
-
-static void hyp_inc_readers(void)
-{
-	hyp_trace_readers++;
-}
-
-static void hyp_dec_readers(void)
-{
-	hyp_trace_readers--;
-
-	WARN_ON(hyp_trace_readers < 0);
-
-	if (hyp_trace_readers)
-		return;
-
-	if (hyp_free_tracing_deferred) {
-		hyp_free_tracing();
-		hyp_free_tracing_deferred = false;
-	}
-}
-
-static int hyp_trace_open(struct inode *inode, struct file *file)
-{
-	int cpu = (s64)inode->i_private;
-	int ret = 0;
-
-	mutex_lock(&hyp_trace_lock);
-
-	if (file->f_mode & FMODE_WRITE)
-		ret = hyp_trace_reset(cpu);
-
-	mutex_unlock(&hyp_trace_lock);
-
-	return ret;
-}
-
-static ssize_t hyp_trace_read(struct file *filp, char __user *ubuf,
-			      size_t cnt, loff_t *ppos)
-{
-	char buf[] = "** Reading trace not yet supported **\n";
-
-	return simple_read_from_buffer(ubuf, cnt, ppos, buf, strlen(buf));
-}
-
-static ssize_t hyp_trace_write(struct file *filp, const char __user *ubuf,
-			       size_t count, loff_t *ppos)
-{
-	/* No matter the input, writing resets the buffer */
-	return count;
-}
-
-static const struct file_operations hyp_trace_fops = {
-	.open		= hyp_trace_open,
-	.read		= hyp_trace_read,
-	.write		= hyp_trace_write,
-	.release	= NULL,
-};
-
 static struct ring_buffer_event *__ht_next_pipe_event(struct ht_iterator *iter)
 {
+	struct trace_buffer *trace_buffer = iter->hyp_buffer->trace_buffer;
 	struct ring_buffer_event *evt = NULL;
 	int cpu = iter->cpu;
 
 	if (cpu != RING_BUFFER_ALL_CPUS) {
-		if (ring_buffer_empty_cpu(hyp_trace_buffer, cpu))
+		if (ring_buffer_empty_cpu(trace_buffer, cpu))
 			return NULL;
 
 		iter->ent_cpu = cpu;
 
-		return ring_buffer_peek(hyp_trace_buffer, cpu, &iter->ts,
+		return ring_buffer_peek(trace_buffer, cpu, &iter->ts,
 					&iter->lost_events);
 	}
 
 	iter->ts = LLONG_MAX;
-	for_each_cpu(cpu, iter->cpus) {
+	for_each_possible_cpu(cpu) {
 		struct ring_buffer_event *_evt;
 		unsigned long lost_events;
 		u64 ts;
 
-		if (ring_buffer_empty_cpu(hyp_trace_buffer, cpu))
+		if (ring_buffer_empty_cpu(trace_buffer, cpu))
 			continue;
 
-		_evt = ring_buffer_peek(hyp_trace_buffer, cpu, &ts,
+		_evt = ring_buffer_peek(trace_buffer, cpu, &ts,
 					&lost_events);
 		if (!_evt)
 			continue;
@@ -714,7 +495,6 @@ static struct ring_buffer_event *__ht_next_pipe_event(struct ht_iterator *iter)
 		iter->ent_cpu = cpu;
 		iter->lost_events = lost_events;
 		evt = _evt;
-
 	}
 
 	return evt;
@@ -739,19 +519,15 @@ hyp_trace_pipe_read(struct file *file, char __user *ubuf,
 		    size_t cnt, loff_t *ppos)
 {
 	struct ht_iterator *iter = (struct ht_iterator *)file->private_data;
+	struct trace_buffer *trace_buffer = iter->hyp_buffer->trace_buffer;
 	int ret;
-
-	/* seq_buf buffer size */
-	if (cnt != PAGE_SIZE)
-		return -EINVAL;
 
 	trace_seq_init(&iter->seq);
 again:
-	ret = ring_buffer_wait(hyp_trace_buffer, iter->cpu, 0);
+	ret = ring_buffer_wait(trace_buffer, iter->cpu, 0);
 	if (ret < 0)
 		return ret;
 
-	hyp_trace_read_start(iter->cpu);
 	while (ht_next_pipe_event(iter)) {
 		int prev_len = iter->seq.seq.len;
 
@@ -760,10 +536,8 @@ again:
 			break;
 		}
 
-		ring_buffer_consume(hyp_trace_buffer, iter->ent_cpu, NULL,
-				    NULL);
+		ring_buffer_consume(trace_buffer, iter->ent_cpu, NULL, NULL);
 	}
-	hyp_trace_read_stop(iter->cpu);
 
 	ret = trace_seq_to_user(&iter->seq, ubuf, cnt);
 	if (ret == -EBUSY)
@@ -772,98 +546,106 @@ again:
 	return ret;
 }
 
-static void __poke_reader(struct work_struct *work)
+static void hyp_trace_buffer_printk(struct hyp_trace_buffer *hyp_buffer);
+
+static void __poll_writer(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct ht_iterator *iter;
 
-	iter = container_of(dwork, struct ht_iterator, poke_work);
+	iter = container_of(dwork, struct ht_iterator, poll_work);
 
-	hyp_poke_tracing(iter->cpu, iter->cpus);
+	ring_buffer_poll_writer(iter->hyp_buffer->trace_buffer, iter->cpu);
+
+	hyp_trace_buffer_printk(iter->hyp_buffer);
 
 	schedule_delayed_work((struct delayed_work *)work,
 			      msecs_to_jiffies(RB_POLL_MS));
 }
 
-static int hyp_trace_pipe_open(struct inode *inode, struct file *file)
+static struct ht_iterator *
+ht_iterator_create(struct hyp_trace_buffer *hyp_buffer, int cpu)
 {
-	int cpu = (s64)inode->i_private;
-	struct ht_iterator *iter;
+	struct ht_iterator *iter = NULL;
+	bool need_loading = false;
 	int ret;
 
-	mutex_lock(&hyp_trace_lock);
+	WARN_ON(!mutex_is_locked(&hyp_buffer->lock));
 
-	if (!hyp_trace_buffer) {
-		ret = hyp_load_tracing();
+	need_loading = !hyp_trace_buffer_loaded(hyp_buffer);
+	if (need_loading) {
+		ret = hyp_trace_buffer_load(hyp_buffer, hyp_trace_buffer_size);
 		if (ret)
-			goto unlock;
+			return NULL;
 	}
 
 	iter = kzalloc(sizeof(*iter), GFP_KERNEL);
 	if (!iter) {
 		ret = -ENOMEM;
-		goto unlock;
+		goto end;
 	}
-
+	iter->hyp_buffer = hyp_buffer;
 	iter->cpu = cpu;
-	file->private_data = iter;
 
-	if (cpu == RING_BUFFER_ALL_CPUS) {
-		if (!zalloc_cpumask_var(&iter->cpus, GFP_KERNEL)) {
-			ret = -ENOMEM;
-			goto unlock;
-		}
-		for_each_possible_cpu(cpu) {
-			if (!ring_buffer_poke(hyp_trace_buffer, cpu))
-				cpumask_set_cpu(cpu, iter->cpus);
-		}
-	} else {
-		ret = ring_buffer_poke(hyp_trace_buffer, cpu);
-		if (ret)
-			goto unlock;
+	ret = ring_buffer_poll_writer(hyp_buffer->trace_buffer, cpu);
+	if (ret)
+		goto end;
+
+	INIT_DELAYED_WORK(&iter->poll_work, __poll_writer);
+	schedule_delayed_work(&iter->poll_work, msecs_to_jiffies(RB_POLL_MS));
+
+	hyp_buffer->nr_readers++;
+end:
+	if (ret) {
+		if (need_loading)
+			hyp_trace_buffer_teardown(hyp_buffer);
+		kfree(iter);
+		iter = NULL;
 	}
 
-	INIT_DELAYED_WORK(&iter->poke_work, __poke_reader);
-	if (hyp_trace_on)
-		schedule_delayed_work(&iter->poke_work,
-				      msecs_to_jiffies(RB_POLL_MS));
-	list_add(&iter->list, &hyp_pipe_readers);
-	hyp_inc_readers();
-unlock:
-	mutex_unlock(&hyp_trace_lock);
-	if (ret)
-		kfree(iter);
+	return iter;
+}
 
-	return ret;
+static int hyp_trace_pipe_open(struct inode *inode, struct file *file)
+{
+	struct hyp_trace_buffer *hyp_buffer = &hyp_trace_buffer;
+	int cpu = (s64)inode->i_private;
+
+	mutex_lock(&hyp_buffer->lock);
+
+	file->private_data = ht_iterator_create(hyp_buffer, cpu);
+
+	mutex_unlock(&hyp_buffer->lock);
+
+	return file->private_data ? 0 : -EINVAL;
 }
 
 static int hyp_trace_pipe_release(struct inode *inode, struct file *file)
 {
+	struct hyp_trace_buffer *hyp_buffer = &hyp_trace_buffer;
 	struct ht_iterator *iter = file->private_data;
 
-	mutex_lock(&hyp_trace_lock);
-	hyp_dec_readers();
-	list_del(&iter->list);
-	mutex_unlock(&hyp_trace_lock);
+	cancel_delayed_work_sync(&iter->poll_work);
 
-	cancel_delayed_work_sync(&iter->poke_work);
+	mutex_lock(&hyp_buffer->lock);
+	WARN_ON(--hyp_buffer->nr_readers < 0);
+	mutex_unlock(&hyp_buffer->lock);
 
-	free_cpumask_var(iter->cpus);
 	kfree(iter);
 
 	return 0;
 }
 
 static const struct file_operations hyp_trace_pipe_fops = {
-	.open		= hyp_trace_pipe_open,
-	.read		= hyp_trace_pipe_read,
-	.release	= hyp_trace_pipe_release,
-	.llseek		= no_llseek,
+	.open           = hyp_trace_pipe_open,
+	.read           = hyp_trace_pipe_read,
+	.release        = hyp_trace_pipe_release,
+	.llseek         = no_llseek,
 };
 
 static ssize_t
 hyp_trace_raw_read(struct file *file, char __user *ubuf,
-		    size_t cnt, loff_t *ppos)
+		   size_t cnt, loff_t *ppos)
 {
 	struct ht_iterator *iter = (struct ht_iterator *)file->private_data;
 	size_t size;
@@ -872,15 +654,15 @@ hyp_trace_raw_read(struct file *file, char __user *ubuf,
 	if (iter->copy_leftover)
 		goto read;
 again:
-	hyp_trace_read_start(iter->cpu);
-	ret = ring_buffer_read_page(hyp_trace_buffer, &iter->spare,
+	ret = ring_buffer_read_page(iter->hyp_buffer->trace_buffer, &iter->spare,
 				    cnt, iter->cpu, 0);
-	hyp_trace_read_stop(iter->cpu);
 	if (ret < 0) {
-		if (!ring_buffer_empty_cpu(hyp_trace_buffer, iter->cpu))
+		if (!ring_buffer_empty_cpu(iter->hyp_buffer->trace_buffer,
+					   iter->cpu))
 			return 0;
 
-		ret = ring_buffer_wait(hyp_trace_buffer, iter->cpu, 0);
+		ret = ring_buffer_wait(iter->hyp_buffer->trace_buffer,
+				       iter->cpu, 0);
 		if (ret < 0)
 			return ret;
 
@@ -913,7 +695,8 @@ static int hyp_trace_raw_open(struct inode *inode, struct file *file)
 		return ret;
 
 	iter = file->private_data;
-	iter->spare = ring_buffer_alloc_read_page(hyp_trace_buffer, iter->cpu);
+	iter->spare = ring_buffer_alloc_read_page(iter->hyp_buffer->trace_buffer,
+						  iter->cpu);
 	if (IS_ERR(iter->spare)) {
 		ret = PTR_ERR(iter->spare);
 		iter->spare = NULL;
@@ -927,21 +710,22 @@ static int hyp_trace_raw_release(struct inode *inode, struct file *file)
 {
 	struct ht_iterator *iter = file->private_data;
 
-	ring_buffer_free_read_page(hyp_trace_buffer, iter->cpu, iter->spare);
+	ring_buffer_free_read_page(iter->hyp_buffer->trace_buffer, iter->cpu,
+				   iter->spare);
 
 	return hyp_trace_pipe_release(inode, file);
 }
 
 static const struct file_operations hyp_trace_raw_fops = {
-	.open		= hyp_trace_raw_open,
-	.read		= hyp_trace_raw_read,
-	.release	= hyp_trace_raw_release,
-	.llseek		= no_llseek,
+	.open           = hyp_trace_raw_open,
+	.read           = hyp_trace_raw_read,
+	.release        = hyp_trace_raw_release,
+	.llseek         = no_llseek,
 };
 
 static int hyp_trace_clock_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "[boot]\n");
+	seq_puts(m, "[boot]\n");
 	return 0;
 }
 
@@ -957,91 +741,137 @@ static const struct file_operations hyp_trace_clock_fops = {
 	.release = single_release,
 };
 
-static void hyp_tracefs_create_cpu_file(const char *file_name,
-					int cpu,
-					umode_t mode,
-					const struct file_operations *fops,
-					struct dentry *parent)
+static int hyp_trace_open(struct inode *inode, struct file *file)
 {
-	if (!tracefs_create_file(file_name, mode, parent, (void *)(s64)cpu, fops))
-		pr_warn("Failed to create tracefs %pd/%s\n", parent, file_name);
+	return file->f_mode & FMODE_WRITE ? hyp_tracing_teardown() : 0;
 }
 
-void kvm_hyp_init_events_tracefs(struct dentry *parent);
-bool kvm_hyp_events_enable_early(void);
-
-int init_hyp_tracefs(void)
+static ssize_t hyp_trace_read(struct file *filp, char __user *ubuf,
+			      size_t cnt, loff_t *ppos)
 {
-	struct dentry *d, *root_dir, *per_cpu_root_dir;
+	char buf[] = "** Reading trace not yet supported **\n";
+
+	return simple_read_from_buffer(ubuf, cnt, ppos, buf, strlen(buf));
+}
+
+static ssize_t hyp_trace_write(struct file *filp, const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	return count;
+}
+
+static const struct file_operations hyp_trace_fops = {
+	.open           = hyp_trace_open,
+	.read           = hyp_trace_read,
+	.write          = hyp_trace_write,
+	.release        = NULL,
+};
+
+static int hyp_trace_buffer_printk_init(struct hyp_trace_buffer *hyp_buffer)
+{
+	int ret = 0;
+
+	mutex_lock(&hyp_buffer->lock);
+
+	if (hyp_buffer->printk_iter)
+		goto unlock;
+
+	hyp_buffer->printk_iter = ht_iterator_create(hyp_buffer,
+						     RING_BUFFER_ALL_CPUS);
+	if (!hyp_buffer->printk_iter)
+		ret = -EINVAL;
+unlock:
+	mutex_unlock(&hyp_buffer->lock);
+
+	return ret;
+}
+
+static void hyp_trace_buffer_printk(struct hyp_trace_buffer *hyp_buffer)
+{
+	struct ht_iterator *ht_iter = hyp_buffer->printk_iter;
+
+	if (!hyp_trace_buffer.printk_on)
+		return;
+
+	trace_seq_init(&ht_iter->seq);
+
+	while (ht_next_pipe_event(ht_iter)) {
+		ht_print_trace_fmt(ht_iter);
+
+		/* Nothing has been written in the seq_buf */
+		if (!ht_iter->seq.seq.len)
+			return;
+
+		ht_iter->seq.buffer[ht_iter->seq.seq.len] = '\0';
+		printk("%s", ht_iter->seq.buffer);
+
+		ht_iter->seq.seq.len = 0;
+		ring_buffer_consume(hyp_buffer->trace_buffer, ht_iter->ent_cpu,
+				    NULL, NULL);
+	}
+}
+
+int hyp_trace_init_tracefs(void)
+{
+	struct dentry *root, *per_cpu_root;
 	char per_cpu_name[16];
-	int err, cpu;
+	long cpu;
+	int err;
 
 	if (!is_protected_kvm_enabled())
 		return 0;
 
-	for_each_possible_cpu(cpu)
-		mutex_init(&per_cpu(hyp_trace_reader_lock, cpu));
-
-	root_dir = tracefs_create_dir(TRACEFS_DIR, NULL);
-	if (!root_dir) {
+	root = tracefs_create_dir(TRACEFS_DIR, NULL);
+	if (!root) {
 		pr_err("Failed to create tracefs "TRACEFS_DIR"/\n");
 		return -ENODEV;
 	}
 
-	d = tracefs_create_file("tracing_on", TRACEFS_MODE_WRITE, root_dir,
-				NULL, &hyp_tracing_on_fops);
-	if (!d) {
-		pr_err("Failed to create tracefs "TRACEFS_DIR"/tracing_on\n");
-		return -ENODEV;
-	}
+	tracefs_create_file("tracing_on", TRACEFS_MODE_WRITE, root, NULL,
+			    &hyp_tracing_on_fops);
 
-	d = tracefs_create_file("buffer_size_kb", TRACEFS_MODE_WRITE, root_dir,
-				NULL, &hyp_buffer_size_fops);
-	if (!d)
-		pr_err("Failed to create tracefs "TRACEFS_DIR"/buffer_size_kb\n");
+	tracefs_create_file("buffer_size_kb", TRACEFS_MODE_WRITE, root, NULL,
+			    &hyp_buffer_size_fops);
 
-	d = tracefs_create_file("trace_clock", TRACEFS_MODE_READ, root_dir, NULL,
-				&hyp_trace_clock_fops);
-	if (!d)
-		pr_err("Failed to create tracefs "TRACEFS_DIR"/trace_clock\n");
+	tracefs_create_file("trace_clock", TRACEFS_MODE_READ, root, NULL,
+			    &hyp_trace_clock_fops);
 
-	hyp_tracefs_create_cpu_file("trace", RING_BUFFER_ALL_CPUS,
-				    TRACEFS_MODE_WRITE, &hyp_trace_fops,
-				    root_dir);
+	tracefs_create_file("trace_pipe", TRACEFS_MODE_WRITE, root,
+			    (void *)RING_BUFFER_ALL_CPUS, &hyp_trace_pipe_fops);
 
-	hyp_tracefs_create_cpu_file("trace_pipe", RING_BUFFER_ALL_CPUS,
-				    TRACEFS_MODE_READ, &hyp_trace_pipe_fops,
-				    root_dir);
+	tracefs_create_file("trace", TRACEFS_MODE_WRITE, root, NULL,
+			    &hyp_trace_fops);
 
-	per_cpu_root_dir = tracefs_create_dir("per_cpu", root_dir);
-	if (!per_cpu_root_dir) {
-		pr_err("Failed to create tracefs "TRACEFS_DIR"/per_cpu/\n");
+	per_cpu_root = tracefs_create_dir("per_cpu", root);
+	if (!per_cpu_root) {
+		pr_err("Failed to create tracefs folder "TRACEFS_DIR"/per_cpu/\n");
 		return -ENODEV;
 	}
 
 	for_each_possible_cpu(cpu) {
-		struct dentry *dir;
+		struct dentry *per_cpu_dir;
 
-		snprintf(per_cpu_name, sizeof(per_cpu_name), "cpu%d", cpu);
-		dir = tracefs_create_dir(per_cpu_name, per_cpu_root_dir);
-		if (!dir) {
-			pr_warn("Failed to create tracefs "TRACEFS_DIR"/per_cpu/cpu%d\n",
+		snprintf(per_cpu_name, sizeof(per_cpu_name), "cpu%ld", cpu);
+		per_cpu_dir = tracefs_create_dir(per_cpu_name, per_cpu_root);
+		if (!per_cpu_dir) {
+			pr_warn("Failed to create tracefs "TRACEFS_DIR"/per_cpu/cpu%ld\n",
 				cpu);
 			continue;
 		}
-
-		hyp_tracefs_create_cpu_file("trace", cpu, TRACEFS_MODE_WRITE,
-					    &hyp_trace_fops, dir);
-		hyp_tracefs_create_cpu_file("trace_pipe", cpu, TRACEFS_MODE_READ,
-					    &hyp_trace_pipe_fops, dir);
-		hyp_tracefs_create_cpu_file("trace_pipe_raw", cpu,
-					    TRACEFS_MODE_READ,
-					    &hyp_trace_raw_fops, dir);
+		tracefs_create_file("trace_pipe", TRACEFS_MODE_READ, per_cpu_dir,
+				    (void *)cpu, &hyp_trace_pipe_fops);
+		tracefs_create_file("trace_pipe_raw", TRACEFS_MODE_READ, per_cpu_dir,
+				    (void *)cpu, &hyp_trace_pipe_fops);
 	}
 
-	kvm_hyp_init_events_tracefs(root_dir);
-	if (kvm_hyp_events_enable_early()) {
-		err = hyp_start_tracing();
+	hyp_trace_init_event_tracefs(root);
+
+	if (hyp_trace_buffer.printk_on &&
+	    hyp_trace_buffer_printk_init(&hyp_trace_buffer))
+		pr_warn("Failed to init ht_printk");
+
+	if (hyp_trace_init_event_early()) {
+		err = hyp_tracing_start();
 		if (err)
 			pr_warn("Failed to start early events tracing: %d\n", err);
 	}

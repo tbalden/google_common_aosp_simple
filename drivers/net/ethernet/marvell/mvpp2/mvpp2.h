@@ -16,7 +16,7 @@
 #include <linux/phy.h>
 #include <linux/phylink.h>
 #include <net/flow_offload.h>
-#include <net/page_pool.h>
+#include <net/page_pool/types.h>
 #include <linux/bpf.h>
 #include <net/xdp.h>
 
@@ -1108,9 +1108,6 @@ struct mvpp2 {
 
 	/* Spinlocks for CM3 shared memory configuration */
 	spinlock_t mss_spinlock;
-
-	/* Spinlock for shared PRS parser memory and shadow table */
-	spinlock_t prs_spinlock;
 };
 
 struct mvpp2_pcpu_stats {

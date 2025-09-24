@@ -8,9 +8,8 @@
  * Author: Subbaraya Sundeep <sundeep.lkml@gmail.com>
  * Author: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
  *
- * This driver is tested for USB, SATA and Display Port currently.
- * Other controllers PCIe and SGMII should also work but that is
- * experimental as of now.
+ * This driver is tested for USB, SGMII, SATA and Display Port currently.
+ * PCIe should also work but that is experimental as of now.
  */
 
 #include <linux/clk.h>
@@ -958,7 +957,10 @@ static int xpsgtr_get_ref_clocks(struct xpsgtr_dev *gtr_dev)
 		rate = clk_get_rate(clk);
 
 		for (i = 0 ; i < ARRAY_SIZE(ssc_lookup); i++) {
-			if (rate == ssc_lookup[i].refclk_rate) {
+			/* Allow an error of 100 ppm */
+			unsigned long error = ssc_lookup[i].refclk_rate / 10000;
+
+			if (abs(rate - ssc_lookup[i].refclk_rate) < error) {
 				gtr_dev->refclk_sscs[refclk] = &ssc_lookup[i];
 				break;
 			}

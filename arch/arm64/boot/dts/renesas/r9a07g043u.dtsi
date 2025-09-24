@@ -31,7 +31,13 @@
 			compatible = "cache";
 			cache-unified;
 			cache-size = <0x40000>;
+			cache-level = <3>;
 		};
+	};
+
+	pmu {
+		compatible = "arm,cortex-a55-pmu";
+		interrupts-extended = <&gic GIC_PPI 7 IRQ_TYPE_LEVEL_LOW>;
 	};
 
 	psci {
@@ -49,6 +55,10 @@
 		interrupt-names = "sec-phys", "phys", "virt", "hyp-phys",
 				  "hyp-virt";
 	};
+};
+
+&pinctrl {
+	interrupt-parent = <&irqc>;
 };
 
 &soc {

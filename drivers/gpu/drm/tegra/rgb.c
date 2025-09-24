@@ -5,6 +5,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/of.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge_connector.h>
@@ -258,12 +259,12 @@ remove:
 	return err;
 }
 
-int tegra_dc_rgb_remove(struct tegra_dc *dc)
+void tegra_dc_rgb_remove(struct tegra_dc *dc)
 {
 	struct tegra_rgb *rgb;
 
 	if (!dc->rgb)
-		return 0;
+		return;
 
 	rgb = to_rgb(dc->rgb);
 	clk_put(rgb->pll_d2_out0);
@@ -271,8 +272,6 @@ int tegra_dc_rgb_remove(struct tegra_dc *dc)
 
 	tegra_output_remove(dc->rgb);
 	dc->rgb = NULL;
-
-	return 0;
 }
 
 int tegra_dc_rgb_init(struct drm_device *drm, struct tegra_dc *dc)

@@ -297,9 +297,11 @@ static int dp_altmode_vdm(struct typec_altmode *alt,
 	case CMDT_RSP_ACK:
 		switch (cmd) {
 		case CMD_ENTER_MODE:
+			typec_altmode_update_active(alt, true);
 			dp->state = DP_STATE_UPDATE;
 			break;
 		case CMD_EXIT_MODE:
+			typec_altmode_update_active(alt, false);
 			dp->data.status = 0;
 			dp->data.conf = 0;
 			if (dp->hpd) {
@@ -451,7 +453,7 @@ static const char * const pin_assignments[] = {
  */
 static u8 get_current_pin_assignments(struct dp_altmode *dp)
 {
-	if (DP_CONF_CURRENTLY(dp->data.conf) == DP_CONF_DFP_D)
+	if (DP_CONF_CURRENTLY(dp->data.conf) == DP_CONF_UFP_U_AS_DFP_D)
 		return DP_CAP_PIN_ASSIGN_DFP_D(dp->alt->vdo);
 	else
 		return DP_CAP_PIN_ASSIGN_UFP_D(dp->alt->vdo);
@@ -597,7 +599,10 @@ int dp_altmode_probe(struct typec_altmode *alt)
 	alt->ops = &dp_altmode_ops;
 
 	fwnode = dev_fwnode(alt->dev.parent->parent); /* typec_port fwnode */
-	dp->connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	if (fwnode_property_present(fwnode, "displayport"))
+		dp->connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	else
+		dp->connector_fwnode = fwnode_handle_get(fwnode); /* embedded DP */
 	if (IS_ERR(dp->connector_fwnode))
 		dp->connector_fwnode = NULL;
 

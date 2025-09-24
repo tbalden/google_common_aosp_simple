@@ -37,10 +37,10 @@
 #include <linux/file.h>
 #include <linux/module.h>
 #include <drm/drm_cache.h>
-#ifndef __GENKSYMS__
 #include <drm/drm_device.h>
-#endif
-#include <drm/ttm/ttm_bo_driver.h>
+#include <drm/drm_util.h>
+#include <drm/ttm/ttm_bo.h>
+#include <drm/ttm/ttm_tt.h>
 
 #include "ttm_module.h"
 
@@ -150,7 +150,6 @@ static void ttm_tt_init_fields(struct ttm_tt *ttm,
 			       unsigned long extra_pages)
 {
 	ttm->num_pages = (PAGE_ALIGN(bo->base.size) >> PAGE_SHIFT) + extra_pages;
-	ttm->caching = ttm_cached;
 	ttm->page_flags = page_flags;
 	ttm->dma_address = NULL;
 	ttm->swap_storage = NULL;
@@ -384,7 +383,6 @@ void ttm_tt_unpopulate(struct ttm_device *bdev, struct ttm_tt *ttm)
 
 	ttm->page_flags &= ~TTM_TT_FLAG_PRIV_POPULATED;
 }
-EXPORT_SYMBOL_GPL(ttm_tt_unpopulate);
 
 #ifdef CONFIG_DEBUG_FS
 
@@ -464,3 +462,9 @@ ttm_kmap_iter_tt_init(struct ttm_kmap_iter_tt *iter_tt,
 	return &iter_tt->base;
 }
 EXPORT_SYMBOL(ttm_kmap_iter_tt_init);
+
+unsigned long ttm_tt_pages_limit(void)
+{
+	return ttm_pages_limit;
+}
+EXPORT_SYMBOL(ttm_tt_pages_limit);

@@ -1451,6 +1451,8 @@ int dasd_start_IO(struct dasd_ccw_req *cqr)
 	case -ENODEV:
 		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
 			      "start_IO: -ENODEV device gone, retry");
+		/* this is equivalent to CC=3 for SSCH report this to EER */
+		dasd_handle_autoquiesce(device, cqr, DASD_EER_STARTIO);
 		break;
 	case -EIO:
 		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
@@ -1960,6 +1962,16 @@ static void __dasd_device_process_final_queue(struct dasd_device *device,
 }
 
 /*
+ * check if device should be autoquiesced due to too many timeouts
+ */
+static void __dasd_device_check_autoquiesce_timeout(struct dasd_device *device,
+						    struct dasd_ccw_req *cqr)
+{
+	if ((device->default_retries - cqr->retries) >= device->aq_timeouts)
+		dasd_handle_autoquiesce(device, cqr, DASD_EER_TIMEOUTS);
+}
+
+/*
  * Take a look at the first request on the ccw queue and check
  * if it reached its expire time. If so, terminate the IO.
  */
@@ -1993,6 +2005,7 @@ static void __dasd_device_check_expire(struct dasd_device *device)
 				"remaining\n", cqr, (cqr->expires/HZ),
 				cqr->retries);
 		}
+		__dasd_device_check_autoquiesce_timeout(device, cqr);
 	}
 }
 
@@ -2733,7 +2746,12 @@ static void __dasd_cleanup_cqr(struct dasd_ccw_req *cqr)
 	else if (status == 0) {
 		switch (cqr->intrc) {
 		case -EPERM:
-			error = BLK_STS_NEXUS;
+			/*
+			 * DASD doesn't implement SCSI/NVMe reservations, but it
+			 * implements a locking scheme similar to them. We
+			 * return this error when we no longer have the lock.
+			 */
+			error = BLK_STS_RESV_CONFLICT;
 			break;
 		case -ENOLINK:
 			error = BLK_STS_TRANSPORT;
@@ -3240,12 +3258,12 @@ struct blk_mq_ops dasd_mq_ops = {
 	.exit_hctx = dasd_exit_hctx,
 };
 
-static int dasd_open(struct block_device *bdev, fmode_t mode)
+static int dasd_open(struct gendisk *disk, blk_mode_t mode)
 {
 	struct dasd_device *base;
 	int rc;
 
-	base = dasd_device_from_gendisk(bdev->bd_disk);
+	base = dasd_device_from_gendisk(disk);
 	if (!base)
 		return -ENODEV;
 
@@ -3274,14 +3292,12 @@ static int dasd_open(struct block_device *bdev, fmode_t mode)
 		rc = -ENODEV;
 		goto out;
 	}
-
-	if ((mode & FMODE_WRITE) &&
+	if ((mode & BLK_OPEN_WRITE) &&
 	    (test_bit(DASD_FLAG_DEVICE_RO, &base->flags) ||
 	     (base->features & DASD_FEATURE_READONLY))) {
 		rc = -EROFS;
 		goto out;
 	}
-
 	dasd_put_device(base);
 	return 0;
 
@@ -3293,7 +3309,7 @@ unlock:
 	return rc;
 }
 
-static void dasd_release(struct gendisk *disk, fmode_t mode)
+static void dasd_release(struct gendisk *disk)
 {
 	struct dasd_device *base = dasd_device_from_gendisk(disk);
 	if (base) {
@@ -3627,11 +3643,8 @@ int dasd_generic_set_offline(struct ccw_device *cdev)
 		 * so sync bdev first and then wait for our queues to become
 		 * empty
 		 */
-		if (device->block) {
-			rc = fsync_bdev(device->block->bdev);
-			if (rc != 0)
-				goto interrupted;
-		}
+		if (device->block)
+			bdev_mark_dead(device->block->bdev, false);
 		dasd_schedule_device_bh(device);
 		rc = wait_event_interruptible(shutdown_waitq,
 					      _wait_for_empty_queues(device));
@@ -3982,7 +3995,7 @@ static struct dasd_ccw_req *dasd_generic_build_rdc(struct dasd_device *device,
 
 	ccw = cqr->cpaddr;
 	ccw->cmd_code = CCW_CMD_RDC;
-	ccw->cda = (__u32)(addr_t) cqr->data;
+	ccw->cda = (__u32)virt_to_phys(cqr->data);
 	ccw->flags = 0;
 	ccw->count = rdc_buffer_size;
 	cqr->startdev = device;
@@ -4026,8 +4039,7 @@ char *dasd_get_sense(struct irb *irb)
 
 	if (scsw_is_tm(&irb->scsw) && (irb->scsw.tm.fcxs == 0x01)) {
 		if (irb->scsw.tm.tcw)
-			tsb = tcw_get_tsb((struct tcw *)(unsigned long)
-					  irb->scsw.tm.tcw);
+			tsb = tcw_get_tsb(phys_to_virt(irb->scsw.tm.tcw));
 		if (tsb && tsb->length == 64 && tsb->flags)
 			switch (tsb->flags & 0x07) {
 			case 1:	/* tsa_iostat */

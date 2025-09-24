@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Internal header file _only_ for device mapper core
  *
@@ -205,20 +206,22 @@ struct dm_table {
 
 	bool integrity_supported:1;
 	bool singleton:1;
-	unsigned integrity_added:1;
+	bool integrity_added:1;
+	/* set if all the targets in the table have "flush_bypasses_map" set */
+	bool flush_bypasses_map:1;
 
 	/*
-	 * Indicates the rw permissions for the new logical
-	 * device.  This should be a combination of FMODE_READ
-	 * and FMODE_WRITE.
+	 * Indicates the rw permissions for the new logical device.  This
+	 * should be a combination of BLK_OPEN_READ and BLK_OPEN_WRITE.
 	 */
-	fmode_t mode;
+	blk_mode_t mode;
 
 	/* a list of devices used by this table */
 	struct list_head devices;
+	struct rw_semaphore devices_lock;
 
 	/* events get handed up using this callback */
-	void (*event_fn)(void *);
+	void (*event_fn)(void *data);
 	void *event_context;
 
 	struct dm_md_mempools *mempools;
@@ -308,7 +311,8 @@ struct dm_io {
  */
 enum {
 	DM_IO_ACCOUNTED,
-	DM_IO_WAS_SPLIT
+	DM_IO_WAS_SPLIT,
+	DM_IO_BLK_STAT
 };
 
 static inline bool dm_io_flagged(struct dm_io *io, unsigned int bit)

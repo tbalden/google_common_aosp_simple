@@ -9,7 +9,7 @@
  * Copyright 2007, Michael Wu <flamingice@sourmilk.net>
  * Copyright 2013-2015  Intel Mobile Communications GmbH
  * Copyright 2016-2017  Intel Deutschland GmbH
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2024 Intel Corporation
  */
 
 #include <linux/if_arp.h>
@@ -55,27 +55,45 @@ static bool is_uapsd_supported(struct ieee802_11_elems *elems)
 	return qos_info & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD;
 }
 
-static void
-ieee80211_update_bss_from_elems(struct ieee80211_local *local,
-				struct ieee80211_bss *bss,
-				struct ieee802_11_elems *elems,
-				struct ieee80211_rx_status *rx_status,
-				bool beacon)
+struct inform_bss_update_data {
+	struct ieee80211_rx_status *rx_status;
+	bool beacon;
+};
+
+void ieee80211_inform_bss(struct wiphy *wiphy,
+			  struct cfg80211_bss *cbss,
+			  const struct cfg80211_bss_ies *ies,
+			  void *data)
 {
+	struct ieee80211_local *local = wiphy_priv(wiphy);
+	struct inform_bss_update_data *update_data = data;
+	struct ieee80211_bss *bss = (void *)cbss->priv;
+	struct ieee80211_rx_status *rx_status;
+	struct ieee802_11_elems *elems;
 	int clen, srlen;
 
-	if (beacon)
+	/* This happens while joining an IBSS */
+	if (!update_data)
+		return;
+
+	elems = ieee802_11_parse_elems(ies->data, ies->len, false, NULL);
+	if (!elems)
+		return;
+
+	rx_status = update_data->rx_status;
+
+	if (update_data->beacon)
 		bss->device_ts_beacon = rx_status->device_timestamp;
 	else
 		bss->device_ts_presp = rx_status->device_timestamp;
 
 	if (elems->parse_error) {
-		if (beacon)
+		if (update_data->beacon)
 			bss->corrupt_data |= IEEE80211_BSS_CORRUPT_BEACON;
 		else
 			bss->corrupt_data |= IEEE80211_BSS_CORRUPT_PROBE_RESP;
 	} else {
-		if (beacon)
+		if (update_data->beacon)
 			bss->corrupt_data &= ~IEEE80211_BSS_CORRUPT_BEACON;
 		else
 			bss->corrupt_data &= ~IEEE80211_BSS_CORRUPT_PROBE_RESP;
@@ -124,7 +142,7 @@ ieee80211_update_bss_from_elems(struct ieee80211_local *local,
 			bss->valid_data |= IEEE80211_BSS_VALID_WMM;
 	}
 
-	if (beacon) {
+	if (update_data->beacon) {
 		struct ieee80211_supported_band *sband =
 			local->hw.wiphy->bands[rx_status->band];
 		if (!(rx_status->encoding == RX_ENC_HT) &&
@@ -138,6 +156,8 @@ ieee80211_update_bss_from_elems(struct ieee80211_local *local,
 			le32_to_cpu(elems->vht_cap_elem->vht_cap_info);
 	else
 		bss->vht_cap_info = 0;
+
+	kfree(elems);
 }
 
 struct ieee80211_bss *
@@ -148,16 +168,17 @@ ieee80211_bss_info_update(struct ieee80211_local *local,
 {
 	bool beacon = ieee80211_is_beacon(mgmt->frame_control) ||
 		      ieee80211_is_s1g_beacon(mgmt->frame_control);
-	struct cfg80211_bss *cbss, *non_tx_cbss;
-	struct ieee80211_bss *bss, *non_tx_bss;
+	struct cfg80211_bss *cbss;
+	struct inform_bss_update_data update_data = {
+		.rx_status = rx_status,
+		.beacon = beacon,
+	};
 	struct cfg80211_inform_bss bss_meta = {
 		.boottime_ns = rx_status->boottime_ns,
+		.drv_data = (void *)&update_data,
 	};
 	bool signal_valid;
 	struct ieee80211_sub_if_data *scan_sdata;
-	struct ieee802_11_elems *elems;
-	size_t baselen;
-	u8 *elements;
 
 	if (rx_status->flag & RX_FLAG_NO_SIGNAL_VAL)
 		bss_meta.signal = 0; /* invalid signal indication */
@@ -165,12 +186,6 @@ ieee80211_bss_info_update(struct ieee80211_local *local,
 		bss_meta.signal = rx_status->signal * 100;
 	else if (ieee80211_hw_check(&local->hw, SIGNAL_UNSPEC))
 		bss_meta.signal = (rx_status->signal * 100) / local->hw.max_signal;
-
-	bss_meta.scan_width = NL80211_BSS_CHAN_WIDTH_20;
-	if (rx_status->bw == RATE_INFO_BW_5)
-		bss_meta.scan_width = NL80211_BSS_CHAN_WIDTH_5;
-	else if (rx_status->bw == RATE_INFO_BW_10)
-		bss_meta.scan_width = NL80211_BSS_CHAN_WIDTH_10;
 
 	bss_meta.chan = channel;
 
@@ -192,61 +207,27 @@ ieee80211_bss_info_update(struct ieee80211_local *local,
 	if (!cbss)
 		return NULL;
 
-	if (ieee80211_is_probe_resp(mgmt->frame_control)) {
-		elements = mgmt->u.probe_resp.variable;
-		baselen = offsetof(struct ieee80211_mgmt,
-				   u.probe_resp.variable);
-	} else if (ieee80211_is_s1g_beacon(mgmt->frame_control)) {
-		struct ieee80211_ext *ext = (void *) mgmt;
-
-		baselen = offsetof(struct ieee80211_ext, u.s1g_beacon.variable);
-		elements = ext->u.s1g_beacon.variable;
-	} else {
-		baselen = offsetof(struct ieee80211_mgmt, u.beacon.variable);
-		elements = mgmt->u.beacon.variable;
-	}
-
-	if (baselen > len)
-		return NULL;
-
-	elems = ieee802_11_parse_elems(elements, len - baselen, false, cbss);
-	if (!elems)
-		return NULL;
-
 	/* In case the signal is invalid update the status */
 	signal_valid = channel == cbss->channel;
 	if (!signal_valid)
 		rx_status->flag |= RX_FLAG_NO_SIGNAL_VAL;
 
-	bss = (void *)cbss->priv;
-	ieee80211_update_bss_from_elems(local, bss, elems, rx_status, beacon);
-	kfree(elems);
-
-	list_for_each_entry(non_tx_cbss, &cbss->nontrans_list, nontrans_list) {
-		non_tx_bss = (void *)non_tx_cbss->priv;
-
-		elems = ieee802_11_parse_elems(elements, len - baselen, false,
-					       non_tx_cbss);
-		if (!elems)
-			continue;
-
-		ieee80211_update_bss_from_elems(local, non_tx_bss, elems,
-						rx_status, beacon);
-		kfree(elems);
-	}
-
-	return bss;
+	return (void *)cbss->priv;
 }
 
 static bool ieee80211_scan_accept_presp(struct ieee80211_sub_if_data *sdata,
+					struct ieee80211_channel *channel,
 					u32 scan_flags, const u8 *da)
 {
 	if (!sdata)
 		return false;
-	/* accept broadcast for OCE */
-	if (scan_flags & NL80211_SCAN_FLAG_ACCEPT_BCAST_PROBE_RESP &&
-	    is_broadcast_ether_addr(da))
+
+	/* accept broadcast on 6 GHz and for OCE */
+	if (is_broadcast_ether_addr(da) &&
+	    (channel->band == NL80211_BAND_6GHZ ||
+	     scan_flags & NL80211_SCAN_FLAG_ACCEPT_BCAST_PROBE_RESP))
 		return true;
+
 	if (scan_flags & NL80211_SCAN_FLAG_RANDOM_ADDR)
 		return true;
 	return ether_addr_equal(da, sdata->vif.addr);
@@ -295,6 +276,12 @@ void ieee80211_scan_rx(struct ieee80211_local *local, struct sk_buff *skb)
 		wiphy_delayed_work_queue(local->hw.wiphy, &local->scan_work, 0);
 	}
 
+	channel = ieee80211_get_channel_khz(local->hw.wiphy,
+					    ieee80211_rx_status_to_khz(rx_status));
+
+	if (!channel || channel->flags & IEEE80211_CHAN_DISABLED)
+		return;
+
 	if (ieee80211_is_probe_resp(mgmt->frame_control)) {
 		struct cfg80211_scan_request *scan_req;
 		struct cfg80211_sched_scan_request *sched_scan_req;
@@ -312,18 +299,14 @@ void ieee80211_scan_rx(struct ieee80211_local *local, struct sk_buff *skb)
 		/* ignore ProbeResp to foreign address or non-bcast (OCE)
 		 * unless scanning with randomised address
 		 */
-		if (!ieee80211_scan_accept_presp(sdata1, scan_req_flags,
+		if (!ieee80211_scan_accept_presp(sdata1, channel,
+						 scan_req_flags,
 						 mgmt->da) &&
-		    !ieee80211_scan_accept_presp(sdata2, sched_scan_req_flags,
+		    !ieee80211_scan_accept_presp(sdata2, channel,
+						 sched_scan_req_flags,
 						 mgmt->da))
 			return;
 	}
-
-	channel = ieee80211_get_channel_khz(local->hw.wiphy,
-					ieee80211_rx_status_to_khz(rx_status));
-
-	if (!channel || channel->flags & IEEE80211_CHAN_DISABLED)
-		return;
 
 	bss = ieee80211_bss_info_update(local, rx_status,
 					mgmt, skb->len,
@@ -332,22 +315,11 @@ void ieee80211_scan_rx(struct ieee80211_local *local, struct sk_buff *skb)
 		ieee80211_rx_bss_put(local, bss);
 }
 
-static void
-ieee80211_prepare_scan_chandef(struct cfg80211_chan_def *chandef,
-			       enum nl80211_bss_scan_width scan_width)
+static void ieee80211_prepare_scan_chandef(struct cfg80211_chan_def *chandef)
 {
 	memset(chandef, 0, sizeof(*chandef));
-	switch (scan_width) {
-	case NL80211_BSS_CHAN_WIDTH_5:
-		chandef->width = NL80211_CHAN_WIDTH_5;
-		break;
-	case NL80211_BSS_CHAN_WIDTH_10:
-		chandef->width = NL80211_CHAN_WIDTH_10;
-		break;
-	default:
-		chandef->width = NL80211_CHAN_WIDTH_20_NOHT;
-		break;
-	}
+
+	chandef->width = NL80211_CHAN_WIDTH_20_NOHT;
 }
 
 /* return false if no more work */
@@ -396,7 +368,7 @@ static bool ieee80211_prep_hw_scan(struct ieee80211_sub_if_data *sdata)
 		} while (!*n_chans);
 	}
 
-	ieee80211_prepare_scan_chandef(&chandef, req->scan_width);
+	ieee80211_prepare_scan_chandef(&chandef);
 
 	if (req->flags & NL80211_SCAN_FLAG_MIN_PREQ_CONTENT)
 		flags |= IEEE80211_PROBE_FLAG_MIN_CONTENT;
@@ -503,7 +475,7 @@ static void __ieee80211_scan_completed(struct ieee80211_hw *hw, bool aborted)
 	 */
 	list_for_each_entry_rcu(sdata, &local->interfaces, list) {
 		if (ieee80211_sdata_running(sdata))
-			ieee80211_queue_work(&sdata->local->hw, &sdata->work);
+			wiphy_work_queue(sdata->local->hw.wiphy, &sdata->work);
 	}
 
 	if (was_scanning)
@@ -946,7 +918,6 @@ static void ieee80211_scan_state_set_channel(struct ieee80211_local *local,
 {
 	int skip;
 	struct ieee80211_channel *chan;
-	enum nl80211_bss_scan_width oper_scan_width;
 	struct cfg80211_scan_request *scan_req;
 
 	scan_req = rcu_dereference_protected(local->scan_req,
@@ -960,42 +931,21 @@ static void ieee80211_scan_state_set_channel(struct ieee80211_local *local,
 	local->scan_chandef.freq1_offset = chan->freq_offset;
 	local->scan_chandef.center_freq2 = 0;
 
-	/* For scanning on the S1G band, ignore scan_width (which is constant
-	 * across all channels) for now since channel width is specific to each
-	 * channel. Detect the required channel width here and likely revisit
-	 * later. Maybe scan_width could be used to build the channel scan list?
+	/* For scanning on the S1G band, detect the channel width according to
+	 * the channel being scanned.
 	 */
 	if (chan->band == NL80211_BAND_S1GHZ) {
 		local->scan_chandef.width = ieee80211_s1g_channel_width(chan);
 		goto set_channel;
 	}
 
-	switch (scan_req->scan_width) {
-	case NL80211_BSS_CHAN_WIDTH_5:
-		local->scan_chandef.width = NL80211_CHAN_WIDTH_5;
-		break;
-	case NL80211_BSS_CHAN_WIDTH_10:
-		local->scan_chandef.width = NL80211_CHAN_WIDTH_10;
-		break;
-	default:
-	case NL80211_BSS_CHAN_WIDTH_20:
-		/* If scanning on oper channel, use whatever channel-type
-		 * is currently in use.
-		 */
-		oper_scan_width = cfg80211_chandef_to_scan_width(
-					&local->_oper_chandef);
-		if (chan == local->_oper_chandef.chan &&
-		    oper_scan_width == scan_req->scan_width)
-			local->scan_chandef = local->_oper_chandef;
-		else
-			local->scan_chandef.width = NL80211_CHAN_WIDTH_20_NOHT;
-		break;
-	case NL80211_BSS_CHAN_WIDTH_1:
-	case NL80211_BSS_CHAN_WIDTH_2:
-		/* shouldn't get here, S1G handled above */
-		WARN_ON(1);
-		break;
-	}
+	/* If scanning on oper channel, use whatever channel-type
+	 * is currently in use.
+	 */
+	if (chan == local->_oper_chandef.chan)
+		local->scan_chandef = local->_oper_chandef;
+	else
+		local->scan_chandef.width = NL80211_CHAN_WIDTH_20_NOHT;
 
 set_channel:
 	if (ieee80211_hw_config(local, IEEE80211_CONF_CHANGE_CHANNEL))
@@ -1186,8 +1136,7 @@ int ieee80211_request_scan(struct ieee80211_sub_if_data *sdata,
 int ieee80211_request_ibss_scan(struct ieee80211_sub_if_data *sdata,
 				const u8 *ssid, u8 ssid_len,
 				struct ieee80211_channel **channels,
-				unsigned int n_channels,
-				enum nl80211_bss_scan_width scan_width)
+				unsigned int n_channels)
 {
 	struct ieee80211_local *local = sdata->local;
 	int ret = -EBUSY, i, n_ch = 0;
@@ -1244,7 +1193,6 @@ int ieee80211_request_ibss_scan(struct ieee80211_sub_if_data *sdata,
 
 	local->int_scan_req->ssids = &local->scan_ssid;
 	local->int_scan_req->n_ssids = 1;
-	local->int_scan_req->scan_width = scan_width;
 	memcpy(local->int_scan_req->ssids[0].ssid, ssid, IEEE80211_MAX_SSID_LEN);
 	local->int_scan_req->ssids[0].ssid_len = ssid_len;
 
@@ -1254,11 +1202,11 @@ int ieee80211_request_ibss_scan(struct ieee80211_sub_if_data *sdata,
 	return ret;
 }
 
-/*
- * Only call this function when a scan can't be queued -- under RTNL.
- */
 void ieee80211_scan_cancel(struct ieee80211_local *local)
 {
+	/* ensure a new scan cannot be queued */
+	lockdep_assert_wiphy(local->hw.wiphy);
+
 	/*
 	 * We are canceling software scan, or deferred scan that was not
 	 * yet really started (see __ieee80211_start_scan ).
@@ -1349,7 +1297,7 @@ int __ieee80211_request_sched_scan_start(struct ieee80211_sub_if_data *sdata,
 		goto out;
 	}
 
-	ieee80211_prepare_scan_chandef(&chandef, req->scan_width);
+	ieee80211_prepare_scan_chandef(&chandef);
 
 	ieee80211_build_preq_ies(sdata, ie, num_bands * iebufsz,
 				 &sched_scan_ies, req->ie,

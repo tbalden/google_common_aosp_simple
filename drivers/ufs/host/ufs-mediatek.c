@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
+#include <linux/of_platform.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_qos.h>
@@ -416,9 +417,6 @@ static int ufs_mtk_wait_link_state(struct ufs_hba *hba, u32 state,
 		usleep_range(100, 200);
 	} while (ktime_before(time_checked, timeout));
 
-	if (val == state)
-		return 0;
-
 	return -ETIMEDOUT;
 }
 
@@ -668,7 +666,7 @@ static void ufs_mtk_pwr_ctrl(struct ufs_hba *hba, bool on)
  * @on: If true, enable clocks else disable them.
  * @status: PRE_CHANGE or POST_CHANGE notify
  *
- * Returns 0 on success, non-zero on failure.
+ * Return: 0 on success, non-zero on failure.
  */
 static int ufs_mtk_setup_clocks(struct ufs_hba *hba, bool on,
 				enum ufs_notify_change_status status)
@@ -864,7 +862,6 @@ static void ufs_mtk_init_mcq_irq(struct ufs_hba *hba)
 		irq = platform_get_irq(pdev, i + 1);
 		if (irq < 0) {
 			host->mcq_intr_info[i].irq = MTK_MCQ_INVALID_IRQ;
-			dev_err(hba->dev, "get platform mcq irq fail: %d\n", i);
 			goto failed;
 		}
 		host->mcq_intr_info[i].hba = hba;
@@ -888,7 +885,7 @@ failed:
  * Binds PHY with controller and powers up PHY enabling clocks
  * and regulators.
  *
- * Returns -EPROBE_DEFER if binding fails, returns negative error
+ * Return: -EPROBE_DEFER if binding fails, returns negative error
  * on phy power up failure and returns zero on success.
  */
 static int ufs_mtk_init(struct ufs_hba *hba)
@@ -896,6 +893,7 @@ static int ufs_mtk_init(struct ufs_hba *hba)
 	const struct of_device_id *id;
 	struct device *dev = hba->dev;
 	struct ufs_mtk_host *host;
+	struct Scsi_Host *shost = hba->host;
 	int err = 0;
 
 	host = devm_kzalloc(dev, sizeof(*host), GFP_KERNEL);
@@ -939,6 +937,9 @@ static int ufs_mtk_init(struct ufs_hba *hba)
 
 	/* Enable clk scaling*/
 	hba->caps |= UFSHCD_CAP_CLK_SCALING;
+
+	/* Set runtime pm delay to replace default */
+	shost->rpm_autosuspend_delay = MTK_RPM_AUTOSUSPEND_DELAY_MS;
 
 	hba->quirks |= UFSHCI_QUIRK_SKIP_MANUAL_WB_FLUSH_CTRL;
 	hba->quirks |= UFSHCD_QUIRK_MCQ_BROKEN_INTR;
@@ -1699,7 +1700,7 @@ static const struct ufs_hba_variant_ops ufs_hba_mtk_vops = {
  * ufs_mtk_probe - probe routine of the driver
  * @pdev: pointer to Platform device handle
  *
- * Return zero for success and non-zero for failure
+ * Return: zero for success and non-zero for failure.
  */
 static int ufs_mtk_probe(struct platform_device *pdev)
 {
@@ -1822,7 +1823,6 @@ static const struct dev_pm_ops ufs_mtk_pm_ops = {
 static struct platform_driver ufs_mtk_pltform = {
 	.probe      = ufs_mtk_probe,
 	.remove     = ufs_mtk_remove,
-	.shutdown   = ufshcd_pltfrm_shutdown,
 	.driver = {
 		.name   = "ufshcd-mtk",
 		.pm     = &ufs_mtk_pm_ops,

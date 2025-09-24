@@ -111,7 +111,6 @@ enum scmi_optee_pta_cmd {
  * @cinfo: SCMI channel information
  * @shmem: Virtual base address of the shared memory
  * @req: Shared memory protocol handle for SCMI request and synchronous response
- * @io_ops: Transport specific I/O operations
  * @tee_shm: TEE shared memory handle @req or NULL if using IOMEM shmem
  * @link: Reference in agent's channel list
  */
@@ -126,7 +125,6 @@ struct scmi_optee_channel {
 		struct scmi_shared_mem __iomem *shmem;
 		struct scmi_msg_payld *msg;
 	} req;
-	struct scmi_shmem_io_ops *io_ops;
 	struct tee_shm *tee_shm;
 	struct list_head link;
 };
@@ -330,11 +328,11 @@ static int scmi_optee_link_supplier(struct device *dev)
 	return 0;
 }
 
-static bool scmi_optee_chan_available(struct device *dev, int idx)
+static bool scmi_optee_chan_available(struct device_node *of_node, int idx)
 {
 	u32 channel_id;
 
-	return !of_property_read_u32_index(dev->of_node, "linaro,optee-channel-id",
+	return !of_property_read_u32_index(of_node, "linaro,optee-channel-id",
 					   idx, &channel_id);
 }
 
@@ -394,8 +392,6 @@ static int setup_static_shmem(struct device *dev, struct scmi_chan_info *cinfo,
 		goto out;
 	}
 
-	channel->io_ops = shmem_get_io_ops(np);
-
 	ret = 0;
 
 out:
@@ -407,7 +403,7 @@ out:
 static int setup_shmem(struct device *dev, struct scmi_chan_info *cinfo,
 		       struct scmi_optee_channel *channel)
 {
-	if (of_find_property(cinfo->dev->of_node, "shmem", NULL))
+	if (of_property_present(cinfo->dev->of_node, "shmem"))
 		return setup_static_shmem(dev, cinfo, channel);
 	else
 		return setup_dynamic_shmem(dev, channel);
@@ -492,8 +488,6 @@ static int scmi_optee_chan_free(int id, void *p, void *data)
 	cinfo->transport_info = NULL;
 	channel->cinfo = NULL;
 
-	scmi_free_channel(cinfo, data, id);
-
 	return 0;
 }
 
@@ -509,8 +503,7 @@ static int scmi_optee_send_message(struct scmi_chan_info *cinfo,
 		msg_tx_prepare(channel->req.msg, xfer);
 		ret = invoke_process_msg_channel(channel, msg_command_size(xfer));
 	} else {
-		shmem_tx_prepare(channel->req.shmem, xfer, cinfo,
-				 channel->io_ops->toio);
+		shmem_tx_prepare(channel->req.shmem, xfer, cinfo);
 		ret = invoke_process_smt_channel(channel);
 	}
 
@@ -528,8 +521,7 @@ static void scmi_optee_fetch_response(struct scmi_chan_info *cinfo,
 	if (channel->tee_shm)
 		msg_fetch_response(channel->req.msg, channel->rx_len, xfer);
 	else
-		shmem_fetch_response(channel->req.shmem, xfer,
-				     channel->io_ops->fromio);
+		shmem_fetch_response(channel->req.shmem, xfer);
 }
 
 static void scmi_optee_mark_txdone(struct scmi_chan_info *cinfo, int ret,

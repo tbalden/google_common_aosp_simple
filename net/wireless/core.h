@@ -75,7 +75,7 @@ struct cfg80211_registered_device {
 	struct sk_buff *scan_msg;
 	struct list_head sched_scan_req_list;
 	time64_t suspend_at;
-	struct work_struct scan_done_wk;
+	struct wiphy_work scan_done_wk;
 
 	struct genl_info *cur_cmd_info;
 
@@ -95,7 +95,7 @@ struct cfg80211_registered_device {
 	struct cfg80211_coalesce *coalesce;
 
 	struct work_struct destroy_work;
-	struct work_struct sched_scan_stop_wk;
+	struct wiphy_work sched_scan_stop_wk;
 	struct work_struct sched_scan_res_wk;
 
 	struct cfg80211_chan_def radar_chandef;
@@ -160,6 +160,12 @@ extern struct workqueue_struct *cfg80211_wq;
 extern struct list_head cfg80211_rdev_list;
 extern int cfg80211_rdev_list_generation;
 
+enum bss_source_type {
+	BSS_SOURCE_DIRECT = 0,
+	BSS_SOURCE_MBSSID,
+	BSS_SOURCE_STA_PROFILE,
+};
+
 struct cfg80211_internal_bss {
 	struct list_head list;
 	struct list_head hidden_list;
@@ -180,6 +186,8 @@ struct cfg80211_internal_bss {
 	 * when the beacon/probe was received.
 	 */
 	u8 parent_bssid[ETH_ALEN] __aligned(2);
+
+	enum bss_source_type bss_source;
 
 	/* must be last because of priv member */
 	struct cfg80211_bss pub;
@@ -284,8 +292,8 @@ struct cfg80211_event {
 };
 
 struct cfg80211_cached_keys {
-	struct key_params params[CFG80211_MAX_WEP_KEYS];
-	u8 data[CFG80211_MAX_WEP_KEYS][WLAN_KEY_LEN_WEP104];
+	struct key_params params[4];
+	u8 data[4][WLAN_KEY_LEN_WEP104];
 	int def;
 };
 
@@ -295,11 +303,17 @@ struct cfg80211_beacon_registration {
 };
 
 struct cfg80211_cqm_config {
+	struct rcu_head rcu_head;
 	u32 rssi_hyst;
 	s32 last_rssi_event_value;
+	enum nl80211_cqm_rssi_threshold_event last_rssi_event_type;
+	bool use_range_api;
 	int n_rssi_thresholds;
-	s32 rssi_thresholds[];
+	s32 rssi_thresholds[] __counted_by(n_rssi_thresholds);
 };
+
+void cfg80211_cqm_rssi_notify_work(struct wiphy *wiphy,
+				   struct wiphy_work *work);
 
 void cfg80211_destroy_ifaces(struct cfg80211_registered_device *rdev);
 
@@ -441,7 +455,7 @@ bool cfg80211_valid_key_idx(struct cfg80211_registered_device *rdev,
 int cfg80211_validate_key_settings(struct cfg80211_registered_device *rdev,
 				   struct key_params *params, int key_idx,
 				   bool pairwise, const u8 *mac_addr);
-void __cfg80211_scan_done(struct work_struct *wk);
+void __cfg80211_scan_done(struct wiphy *wiphy, struct wiphy_work *wk);
 void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev,
 			   bool send_message);
 void cfg80211_add_sched_scan_req(struct cfg80211_registered_device *rdev,
@@ -482,6 +496,9 @@ extern struct work_struct cfg80211_disconnect_work;
  */
 bool cfg80211_chandef_dfs_usable(struct wiphy *wiphy,
 				 const struct cfg80211_chan_def *chandef);
+
+#define NL80211_BSS_USE_FOR_ALL	(NL80211_BSS_USE_FOR_NORMAL | \
+				 NL80211_BSS_USE_FOR_MLD_LINK)
 
 void cfg80211_set_dfs_state(struct wiphy *wiphy,
 			    const struct cfg80211_chan_def *chandef,
@@ -567,8 +584,6 @@ cfg80211_bss_update(struct cfg80211_registered_device *rdev,
 #define CFG80211_DEV_WARN_ON(cond)	({bool __r = (cond); __r; })
 #endif
 
-void cfg80211_cqm_config_free(struct wireless_dev *wdev);
-
 void cfg80211_release_pmsr(struct wireless_dev *wdev, u32 portid);
 void cfg80211_pmsr_wdev_down(struct wireless_dev *wdev);
 void cfg80211_pmsr_free_wk(struct work_struct *work);
@@ -577,5 +592,6 @@ void cfg80211_remove_link(struct wireless_dev *wdev, unsigned int link_id);
 void cfg80211_remove_links(struct wireless_dev *wdev);
 int cfg80211_remove_virtual_intf(struct cfg80211_registered_device *rdev,
 				 struct wireless_dev *wdev);
+void cfg80211_wdev_release_link_bsses(struct wireless_dev *wdev, u16 link_mask);
 
 #endif /* __NET_WIRELESS_CORE_H */

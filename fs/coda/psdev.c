@@ -361,7 +361,7 @@ static int __init init_coda_psdev(void)
 		       __func__, CODA_PSDEV_MAJOR);
 		return -EIO;
 	}
-	coda_psdev_class = class_create(THIS_MODULE, "coda");
+	coda_psdev_class = class_create("coda");
 	if (IS_ERR(coda_psdev_class)) {
 		err = PTR_ERR(coda_psdev_class);
 		goto out_chrdev;
@@ -384,6 +384,7 @@ MODULE_AUTHOR("Jan Harkes, Peter J. Braam");
 MODULE_DESCRIPTION("Coda Distributed File System VFS interface");
 MODULE_ALIAS_CHARDEV_MAJOR(CODA_PSDEV_MAJOR);
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
 MODULE_VERSION("7.2");
 
 static int __init init_coda(void)
