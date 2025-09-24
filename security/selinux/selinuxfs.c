@@ -48,10 +48,10 @@
 #include "ima.h"
 
 #ifdef CONFIG_USERLAND_WORKER
-struct selinux_state *extern_state = NULL;
+bool selinux_init = false;
 
-struct selinux_state *get_extern_state(void) {
-	return &selinux_state;
+bool is_selinux_initialized(void) {
+	return selinux_init;
 }
 #endif
 
@@ -154,7 +154,7 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 	bool old_value, new_value;
 
 #ifdef CONFIG_USERLAND_WORKER
-	extern_state = state;
+	selinux_init = true;
 #endif
 
 	if (count >= PAGE_SIZE)

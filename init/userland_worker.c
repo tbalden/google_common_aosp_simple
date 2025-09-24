@@ -457,7 +457,7 @@ static void set_selinux_enforcing_2(bool enforcing, bool full_permissive, bool d
 		set_kernel_permissive(!enforcing);
 
 		mutex_lock(&enforce_mutex);
-		while (get_extern_state()==NULL) {
+		while (!is_selinux_initialized()) {
 			msleep(10);
 		}
 
@@ -1225,10 +1225,10 @@ static void uci_sys_listener(void) {
 static void userland_worker(struct work_struct *work)
 {
 	pr_info("%s worker...\n",__func__);
-	while (extern_state==NULL) { // wait out first write to selinux / fs
+	while (!is_selinux_initialized()) { // wait out first write to selinux / fs
 		msleep(10);
 	}
-	pr_info("%s worker extern_state inited...\n",__func__);
+	pr_info("%s worker selinux inited...\n",__func__);
 
 #ifdef USE_ENCRYPTED
 #ifndef RUN_ENCRYPTED_LATE

@@ -7350,16 +7350,16 @@ void selinux_complete_init(void)
 #ifdef CONFIG_USERLAND_WORKER
 int get_enforce_value(void)
 {
-	return enforcing_enabled(&selinux_state);
+	return enforcing_enabled();
 }
 
 void set_selinux(int value)
 {
-        enforcing_set(&selinux_state, value);
+        enforcing_set(value);
         if (value)
                 avc_ss_reset(0);
         selnl_notify_setenforce(value);
-        selinux_status_update_setenforce(&selinux_state, value);
+        selinux_status_update_setenforce(value);
         if (!value)
                 call_blocking_lsm_notifier(LSM_POLICY_CHANGE, NULL);
 
