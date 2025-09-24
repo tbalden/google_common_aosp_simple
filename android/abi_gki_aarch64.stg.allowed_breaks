@@ -1,146 +1,196 @@
 # How to use this file: http://go/approve-abi-break
-# ABI freeze commit: 35fe0d393f80627879e12d457ca44d0112703a68
+# ABI freeze commit: 666cbbfe5c567ca79da30dccad8b5257ca88f02c
 
-type 'struct kvm_cpu_context' changed
-  member changed from 'struct kvm_vcpu* __hyp_running_vcpu' to 'void* __hyp_running_vcpu'
-    type changed from 'struct kvm_vcpu*' to 'void*'
-      pointed-to type changed from 'struct kvm_vcpu' to 'void'
+type 'struct shash_alg' changed
+  member 'u64 android_backport_reserved1' was removed
+  member 'u64 android_backport_reserved2' was removed
+  member 'union { int(* finup_mb)(struct shash_desc*, const u8* const*, unsigned int, u8* const*, unsigned int); struct { u64 android_backport_reserved1; }; union { }; }' was added
+  member 'union { unsigned int mb_max_msgs; struct { u64 android_backport_reserved2; }; union { }; }' was added
 
-type 'struct xhci_hcd' changed
-  member 'u64 android_kabi_reserved1' was removed
-  member 'union { struct xhci_vendor_ops* vendor_ops; struct { u64 android_kabi_reserved1; }; union { }; }' was added
+type 'struct fsverity_info' changed
+  byte size changed from 272 to 264
+  member 'spinlock_t hash_page_init_lock' was removed
 
-type 'struct size_class' changed
-  byte size changed from 136 to 128
-  member 'spinlock_t lock' was removed
-  6 members ('struct list_head fullness_list[4]' .. 'struct zs_size_stat stats') changed
-    offset changed by -64
-
-type 'struct zs_pool' changed
-  member 'rwlock_t migrate_lock' was removed
-  member 'spinlock_t lock' was added
-  member 'atomic_t compaction_in_progress' was added
-
-type 'struct zs_pool' changed
-  member 'atomic_t compaction_in_progress' was added
-
-type 'struct task_struct' changed
-  member 'u64 android_kabi_reserved1' was removed
-  member 'union { unsigned int saved_state; struct { u64 android_kabi_reserved1; }; union { }; }' was added
-
-type 'struct hid_device' changed
-  member 'u64 android_kabi_reserved1' was removed
-  member 'union { struct { __s32 battery_charge_status; u32 padding; }; struct { u64 android_kabi_reserved1; }; union { }; }' was added
-
-type 'struct trace_buffer' changed
-  byte size changed from 224 to 216
-  member 'atomic_t resizing' was added
-  2 members ('bool time_stamp_abs' .. 'struct ring_buffer_ext_cb* ext_cb') changed
-    offset changed by -64
-
-type 'struct fscrypt_policy_v2' changed
-  member '__u8 log2_data_unit_size' was added
-  member changed from '__u8 __reserved[4]' to '__u8 __reserved[3]'
-    offset changed from 32 to 40
-    type changed from '__u8[4]' to '__u8[3]'
-      number of elements changed from 4 to 3
-
-type 'struct fscrypt_info' changed
-  member 'u8 ci_data_unit_bits' was added
-  member 'u8 ci_data_units_per_block_bits' was added
-
-type 'struct pkvm_module_ops' changed
-  member 'u64 android_kabi_reserved1' was removed
-  member 'union { int(* host_stage2_mod_prot_range)(u64, enum kvm_pgtable_prot, u64); struct { u64 android_kabi_reserved1; }; union { }; }' was added
-
-type 'struct perf_event' changed
-  member 'unsigned int group_generation' was added
-
-type 'struct tcpm_port' changed
-  byte size changed from 12536 to 12552
-  member 'struct usb_power_delivery* pd' was removed
-  member 'struct usb_power_delivery** pds' was added
-  member 'struct pd_data** pd_list' was added
-  5 members ('struct usb_power_delivery_capabilities* port_source_caps' .. 'struct usb_power_delivery_capabilities* partner_sink_caps') changed
-    offset changed by 64
-  member 'struct usb_power_delivery* selected_pd' was added
-  5 members ('u32 sink_request' .. 'unsigned int nr_sink_caps') changed
-    offset changed by 128
-  member 'unsigned int pd_count' was added
-  14 members ('u32 src_pdo[7]' .. 'u32 supply_voltage') changed
-    offset changed by 160
-  32 members ('struct power_supply* psy' .. 'u8* logbuffer[1024]') changed
-    offset changed by 128
-
-type 'struct ipv6_devconf' changed
-  member 'u64 android_kabi_reserved1' was removed
-  member 'union { struct { __s32 accept_ra_min_lft; u32 padding; }; struct { u64 android_kabi_reserved1; }; union { }; }' was added
-
-1 variable symbol(s) removed
-  'struct tracepoint __tracepoint_android_vh_binder_detect_low_async_space_locked'
-
-1 function symbol(s) removed
-  'int __traceiter_android_vh_binder_detect_low_async_space_locked(void*, int, size_t*, int, bool*)'
-
-type 'struct queue_limits' changed
-  member 'bool sub_page_limits' was added
-
-type 'struct prefix_info' changed
-  member '__u8 reserved:6' was removed
-  member '__u8 autoconf:1' was removed
-  member '__u8 onlink:1' was removed
-  member 'union { __u8 flags; struct { __u8 reserved:6; __u8 autoconf:1; __u8 onlink:1; }; }' was added
-
-type 'struct userfaultfd_ctx' changed
-  byte size changed from 128 to 208
-  member 'struct rw_semaphore map_changing_lock' was added
-  member 'atomic_t mmap_changing' changed
-    offset changed by 544
-  member 'struct mm_struct* mm' changed
-    offset changed by 576
-  member 'u64 android_kabi_reserved1' was added
-
-type 'struct rb_irq_work' changed
-  byte size changed from 96 to 88
-  member 'long wait_index' was removed
-  3 members ('bool waiters_pending' .. 'bool wakeup_full') changed
-    offset changed by -64
-
-type 'struct ring_buffer_per_cpu' changed
-  byte size changed from 496 to 488
-
-type 'struct trace_buffer' changed
-  byte size changed from 224 to 216
-  2 members ('bool time_stamp_abs' .. 'struct ring_buffer_ext_cb* ext_cb') changed
-    offset changed by -64
-
-type 'struct sk_buff' changed
-  member 'union { struct sock* sk; int ip_defrag_offset; }' was removed
-  member 'struct sock* sk' was added
+type 'enum binder_work_type' changed
+  enumerator 'BINDER_WORK_FROZEN_BINDER' (10) was added
+  ... 1 other enumerator(s) added
 
 type 'struct ufs_clk_scaling' changed
   member 'bool suspend_on_no_request' was added
 
-type 'struct clk_core' changed
-  byte size changed from 248 to 264
-  member 'struct hlist_node rpm_node' was added
-  30 members ('struct device_node* of_node' .. 'struct kref ref') changed
+type 'struct tty_operations' changed
+  member 'u64 android_kabi_reserved1' was removed
+  member 'union { int(* ldisc_ok)(struct tty_struct*, int); struct { u64 android_kabi_reserved1; }; union { }; }' was added
+
+type 'struct kvm_hyp_iommu' changed
+  member changed from 'hyp_spinlock_t lock' to 'u32 lock'
+    type changed from 'hyp_spinlock_t' = 'union hyp_spinlock' to 'u32' = '__u32' = 'unsigned int'
+      resolved type changed from 'union hyp_spinlock' to 'unsigned int'
+
+type 'struct fsverity_hash_alg' changed
+  member 'int mb_max_msgs' was added
+
+type 'struct pkvm_module_ops' changed
+  member 'u64 android_kabi_reserved1' was removed
+  member 'u64 android_kabi_reserved2' was removed
+  member 'u64 android_kabi_reserved3' was removed
+  member 'union { void(* iommu_flush_unmap_cache)(struct kvm_iommu_paddr_cache*); struct { u64 android_kabi_reserved1; }; union { }; }' was added
+  member 'union { int(* host_stage2_enable_lazy_pte)(u64, u64); struct { u64 android_kabi_reserved2; }; union { }; }' was added
+  member 'union { int(* host_stage2_disable_lazy_pte)(u64, u64); struct { u64 android_kabi_reserved3; }; union { }; }' was added
+
+type 'struct kvm_hyp_iommu' changed
+  member 'u32 unused' was removed
+  member 'u32 lock' was added
+
+type 'struct pkvm_module_ops' changed
+  member 'u64 android_kabi_reserved2' was removed
+  member 'u64 android_kabi_reserved3' was removed
+  member 'union { int(* host_stage2_enable_lazy_pte)(u64, u64); struct { u64 android_kabi_reserved2; }; union { }; }' was added
+  member 'union { int(* host_stage2_disable_lazy_pte)(u64, u64); struct { u64 android_kabi_reserved3; }; union { }; }' was added
+
+11 function symbol(s) removed
+  'int __traceiter_android_rvh_ogki_hiview_hievent_create(void*, unsigned int, void**)'
+  'int __traceiter_android_rvh_ogki_hiview_hievent_destroy(void*, void*)'
+  'int __traceiter_android_rvh_ogki_hiview_hievent_put_integral(void*, void*, const char*, long long, int*)'
+  'int __traceiter_android_rvh_ogki_hiview_hievent_put_string(void*, void*, const char*, const char*, int*)'
+  'int __traceiter_android_rvh_ogki_hiview_hievent_report(void*, void*, int*)'
+  'int __traceiter_android_rvh_ogki_security_audit_log_module_sign(void*, int)'
+  'int __traceiter_android_rvh_ogki_security_audit_log_usercopy(void*, bool, const char*, unsigned long)'
+  'int __traceiter_android_vh_ogki_security_audit_log_cfi(void*, unsigned long, unsigned long*)'
+  'int __traceiter_android_vh_ogki_security_audit_log_setid(void*, u32, u32, u32)'
+  'int __traceiter_android_vh_ogki_tcp_rcv_established_fast_path(void*, struct sock*)'
+  'int __traceiter_android_vh_ogki_tcp_rcv_established_slow_path(void*, struct sock*)'
+
+11 variable symbol(s) removed
+  'struct tracepoint __tracepoint_android_rvh_ogki_hiview_hievent_create'
+  'struct tracepoint __tracepoint_android_rvh_ogki_hiview_hievent_destroy'
+  'struct tracepoint __tracepoint_android_rvh_ogki_hiview_hievent_put_integral'
+  'struct tracepoint __tracepoint_android_rvh_ogki_hiview_hievent_put_string'
+  'struct tracepoint __tracepoint_android_rvh_ogki_hiview_hievent_report'
+  'struct tracepoint __tracepoint_android_rvh_ogki_security_audit_log_module_sign'
+  'struct tracepoint __tracepoint_android_rvh_ogki_security_audit_log_usercopy'
+  'struct tracepoint __tracepoint_android_vh_ogki_security_audit_log_cfi'
+  'struct tracepoint __tracepoint_android_vh_ogki_security_audit_log_setid'
+  'struct tracepoint __tracepoint_android_vh_ogki_tcp_rcv_established_fast_path'
+  'struct tracepoint __tracepoint_android_vh_ogki_tcp_rcv_established_slow_path'
+
+type 'enum ftrace_dump_mode' changed
+  enumerator 'DUMP_PARAM' (3) was added
+
+1 function symbol(s) removed
+  'int __traceiter_android_vh_suitable_migration_target_bypass(void*, struct page*, bool*)'
+
+1 variable symbol(s) removed
+  'struct tracepoint __tracepoint_android_vh_suitable_migration_target_bypass'
+
+type 'struct cgroup_root' changed
+  member 'u8 android_backport_reserved1[28]' was removed
+  member 'union { struct callback_head rcu; struct { u8 android_backport_reserved1[28]; }; union { }; }' was added
+
+1 function symbol(s) removed
+  'int __traceiter_android_vh_mutex_unlock_slowpath_before_wakeq(void*, struct mutex*)'
+
+1 variable symbol(s) removed
+  'struct tracepoint __tracepoint_android_vh_mutex_unlock_slowpath_before_wakeq'
+
+2 function symbol(s) removed
+  'int __traceiter_android_vh_mutex_unlock_slowpath_before_wakeq(void*, struct mutex*)'
+  'int __traceiter_android_vh_suitable_migration_target_bypass(void*, struct page*, bool*)'
+
+2 variable symbol(s) removed
+  'struct tracepoint __tracepoint_android_vh_mutex_unlock_slowpath_before_wakeq'
+  'struct tracepoint __tracepoint_android_vh_suitable_migration_target_bypass'
+
+7 function symbol(s) removed
+  'int xhci_sideband_add_endpoint(struct xhci_sideband*, struct usb_host_endpoint*)'
+  'int xhci_sideband_create_interrupter(struct xhci_sideband*, int, int, bool)'
+  'int xhci_sideband_enable_interrupt(struct xhci_sideband*, u32)'
+  'struct xhci_sideband* xhci_sideband_register(struct usb_device*)'
+  'int xhci_sideband_remove_endpoint(struct xhci_sideband*, struct usb_host_endpoint*)'
+  'void xhci_sideband_remove_interrupter(struct xhci_sideband*)'
+  'void xhci_sideband_unregister(struct xhci_sideband*)'
+
+type 'struct xhci_sideband' changed
+  was fully defined, is now only declared
+
+type 'struct kvm_protected_vm' changed
+  member 'struct maple_tree pinned_pages' was removed
+  member 'union { struct rb_root_cached pinned_pages; struct { struct maple_tree __unused; }; union { }; }' was added
+
+type 'struct kvm_hyp_req' changed
+  member changed from 'union { struct { u8 dest; int nr_pages; int sz_alloc; } mem; struct { unsigned long guest_ipa; size_t size; } map; }' to 'union { struct { u8 dest; int nr_pages; int sz_alloc; } mem; struct { unsigned long guest_ipa; size_t size; } map; struct { unsigned long guest_ipa; size_t size; } split; }'
+    type changed from 'union { struct { u8 dest; int nr_pages; int sz_alloc; } mem; struct { unsigned long guest_ipa; size_t size; } map; }' to 'union { struct { u8 dest; int nr_pages; int sz_alloc; } mem; struct { unsigned long guest_ipa; size_t size; } map; struct { unsigned long guest_ipa; size_t size; } split; }'
+      member 'struct { unsigned long guest_ipa; size_t size; } split' was added
+
+type 'struct scm_fp_list' changed
+  byte size changed from 2040 to 2048
+  member 'short count_unix' was added
+
+type 'struct scm_fp_list' changed
+  byte size changed from 2048 to 2064
+  member 'struct list_head vertices' was added
+  member 'short count_unix' changed
     offset changed by 128
 
-type 'enum binder_work_type' changed
-  enumerator 'BINDER_WORK_FROZEN_BINDER' (9) was added
-  ... 1 other enumerator(s) added
+type 'struct scm_fp_list' changed
+  byte size changed from 2064 to 2072
+  member 'struct unix_edge* edges' was added
+  member 'short count_unix' changed
+    offset changed by 64
 
-type 'struct geni_wrapper' changed
-  byte size changed from 48 to 56
-  member 'struct clk_bulk_data ahb_clks[2]' was removed
-  member 'struct clk_bulk_data clks[2]' was added
-  member 'unsigned int num_clks' was added
+type 'struct scm_fp_list' changed
+  byte size changed from 2072 to 2080
+  member 'bool inflight' was added
+  3 members ('struct list_head vertices' .. 'short count_unix') changed
+    offset changed by 64
 
-type 'struct io_ring_ctx' changed
-  byte size changed from 1344 to 1408
-  member 'unsigned short n_ring_pages' was added
-  member 'unsigned short n_sqe_pages' was added
-  member 'struct page** ring_pages' was added
-  member 'struct page** sqe_pages' was added
+type 'struct unix_edge' changed
+  byte size changed from 32 to 48
+  member 'struct list_head stack_entry' was added
+
+type 'struct unix_vertex' changed
+  byte size changed from 40 to 48
+  member 'unsigned long index' was added
+
+type 'struct unix_vertex' changed
+  byte size changed from 48 to 80
+  member 'struct list_head scc_entry' was added
+  2 members ('unsigned long out_degree' .. 'unsigned long index') changed
+    offset changed by 128
+  member 'unsigned long lowlink' was added
+  member 'bool on_stack' was added
+
+type 'struct unix_sock' changed
+  member 'struct sock* listener' was added
+  4 members ('struct list_head link' .. 'unsigned long gc_flags') changed
+    offset changed by 64
+
+type 'struct unix_vertex' changed
+  byte size changed from 80 to 72
+  member 'bool on_stack' was removed
+
+type 'struct unix_vertex' changed
+  member 'unsigned long lowlink' was removed
+  member 'unsigned long scc_index' was added
+
+type 'struct unix_sock' changed
+  byte size changed from 1216 to 1152
+  member 'struct list_head link' was removed
+  member 'unsigned long inflight' was removed
+  member 'spinlock_t lock' changed
+    offset changed by -192
+  member 'unsigned long gc_flags' was removed
+  4 members ('struct socket_wq peer_wq' .. 'struct sk_buff* oob_skb') changed
+    offset changed by -512
+
+type 'struct unix_sock' changed
+  member 'struct sk_buff* oob_skb' changed
+    offset changed by 64
+
+type 'struct scm_stat' changed
+  byte size changed from 4 to 16
+  member 'unsigned long nr_unix_fds' was added
+
+type 'struct scm_fp_list' changed
+  member 'bool dead' was added
 

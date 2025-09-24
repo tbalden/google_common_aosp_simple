@@ -267,7 +267,6 @@ static int handle_response(int type, void *payload, size_t sz)
 		if (entry->type + 1 != type) {
 			pr_err("Waiting for IPC type %d, got %d. Ignore.\n",
 			       entry->type + 1, type);
-			continue;
 		}
 
 		entry->response = kvzalloc(sz, GFP_KERNEL);
@@ -306,8 +305,11 @@ static int ipc_server_config_on_startup(struct ksmbd_startup_request *req)
 		init_smb2_max_write_size(req->smb2_max_write);
 	if (req->smb2_max_trans)
 		init_smb2_max_trans_size(req->smb2_max_trans);
-	if (req->smb2_max_credits)
+	if (req->smb2_max_credits) {
 		init_smb2_max_credits(req->smb2_max_credits);
+		server_conf.max_inflight_req =
+			req->smb2_max_credits;
+	}
 	if (req->smbd_max_io_size)
 		init_smbd_max_io_size(req->smbd_max_io_size);
 

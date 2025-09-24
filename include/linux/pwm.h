@@ -98,8 +98,8 @@ struct pwm_device {
  * @state: state to fill with the current PWM state
  *
  * The returned PWM state represents the state that was applied by a previous call to
- * pwm_apply_state(). Drivers may have to slightly tweak that state before programming it to
- * hardware. If pwm_apply_state() was never called, this returns either the current hardware
+ * pwm_apply_might_sleep(). Drivers may have to slightly tweak that state before programming it to
+ * hardware. If pwm_apply_might_sleep() was never called, this returns either the current hardware
  * state (if supported) or the default settings.
  */
 static inline void pwm_get_state(const struct pwm_device *pwm,
@@ -163,20 +163,20 @@ static inline void pwm_get_args(const struct pwm_device *pwm,
 }
 
 /**
- * pwm_init_state() - prepare a new state to be applied with pwm_apply_state()
+ * pwm_init_state() - prepare a new state to be applied with pwm_apply_might_sleep()
  * @pwm: PWM device
  * @state: state to fill with the prepared PWM state
  *
  * This functions prepares a state that can later be tweaked and applied
- * to the PWM device with pwm_apply_state(). This is a convenient function
+ * to the PWM device with pwm_apply_might_sleep(). This is a convenient function
  * that first retrieves the current PWM state and the replaces the period
  * and polarity fields with the reference values defined in pwm->args.
  * Once the function returns, you can adjust the ->enabled and ->duty_cycle
- * fields according to your needs before calling pwm_apply_state().
+ * fields according to your needs before calling pwm_apply_might_sleep().
  *
  * ->duty_cycle is initially set to zero to avoid cases where the current
  * ->duty_cycle value exceed the pwm_args->period one, which would trigger
- * an error if the user calls pwm_apply_state() without adjusting ->duty_cycle
+ * an error if the user calls pwm_apply_might_sleep() without adjusting ->duty_cycle
  * first.
  */
 static inline void pwm_init_state(const struct pwm_device *pwm,
@@ -232,7 +232,7 @@ pwm_get_relative_duty_cycle(const struct pwm_state *state, unsigned int scale)
  *
  * pwm_init_state(pwm, &state);
  * pwm_set_relative_duty_cycle(&state, 50, 100);
- * pwm_apply_state(pwm, &state);
+ * pwm_apply_might_sleep(pwm, &state);
  *
  * This functions returns -EINVAL if @duty_cycle and/or @scale are
  * inconsistent (@scale == 0 or @duty_cycle > @scale).
@@ -302,7 +302,7 @@ struct pwm_chip {
 	int base;
 	unsigned int npwm;
 
-	struct pwm_device * (*of_xlate)(struct pwm_chip *pc,
+	struct pwm_device * (*of_xlate)(struct pwm_chip *chip,
 					const struct of_phandle_args *args);
 	unsigned int of_pwm_n_cells;
 
@@ -315,10 +315,17 @@ struct pwm_chip {
 
 #if IS_ENABLED(CONFIG_PWM)
 /* PWM user APIs */
-struct pwm_device *pwm_request(int pwm_id, const char *label);
-void pwm_free(struct pwm_device *pwm);
-int pwm_apply_state(struct pwm_device *pwm, const struct pwm_state *state);
+int pwm_apply_might_sleep(struct pwm_device *pwm, const struct pwm_state *state);
 int pwm_adjust_config(struct pwm_device *pwm);
+
+/*
+ * ANDROID ONLY:
+ * pwm_apply_state() was renamed to pwm_apply_might_sleep() in commit
+ * a10c3d5ff9a3 ("pwm: Rename pwm_apply_state() to pwm_apply_might_sleep()")
+ * but many external modules were already expecting to use this function.  So
+ * put it back as a wrapper so that things continue to build properly.
+ */
+int pwm_apply_state(struct pwm_device *pwm, const struct pwm_state *state);
 
 /**
  * pwm_config() - change a PWM device configuration
@@ -345,7 +352,7 @@ static inline int pwm_config(struct pwm_device *pwm, int duty_ns,
 
 	state.duty_cycle = duty_ns;
 	state.period = period_ns;
-	return pwm_apply_state(pwm, &state);
+	return pwm_apply_might_sleep(pwm, &state);
 }
 
 /**
@@ -366,7 +373,7 @@ static inline int pwm_enable(struct pwm_device *pwm)
 		return 0;
 
 	state.enabled = true;
-	return pwm_apply_state(pwm, &state);
+	return pwm_apply_might_sleep(pwm, &state);
 }
 
 /**
@@ -385,7 +392,7 @@ static inline void pwm_disable(struct pwm_device *pwm)
 		return;
 
 	state.enabled = false;
-	pwm_apply_state(pwm, &state);
+	pwm_apply_might_sleep(pwm, &state);
 }
 
 /* PWM provider APIs */
@@ -403,9 +410,9 @@ struct pwm_device *pwm_request_from_chip(struct pwm_chip *chip,
 					 unsigned int index,
 					 const char *label);
 
-struct pwm_device *of_pwm_xlate_with_flags(struct pwm_chip *pc,
+struct pwm_device *of_pwm_xlate_with_flags(struct pwm_chip *chip,
 		const struct of_phandle_args *args);
-struct pwm_device *of_pwm_single_xlate(struct pwm_chip *pc,
+struct pwm_device *of_pwm_single_xlate(struct pwm_chip *chip,
 				       const struct of_phandle_args *args);
 
 struct pwm_device *pwm_get(struct device *dev, const char *con_id);
@@ -416,19 +423,8 @@ struct pwm_device *devm_fwnode_pwm_get(struct device *dev,
 				       struct fwnode_handle *fwnode,
 				       const char *con_id);
 #else
-static inline struct pwm_device *pwm_request(int pwm_id, const char *label)
-{
-	might_sleep();
-	return ERR_PTR(-ENODEV);
-}
-
-static inline void pwm_free(struct pwm_device *pwm)
-{
-	might_sleep();
-}
-
-static inline int pwm_apply_state(struct pwm_device *pwm,
-				  const struct pwm_state *state)
+static inline int pwm_apply_might_sleep(struct pwm_device *pwm,
+					const struct pwm_state *state)
 {
 	might_sleep();
 	return -ENOTSUPP;
@@ -446,13 +442,6 @@ static inline int pwm_config(struct pwm_device *pwm, int duty_ns,
 	return -EINVAL;
 }
 
-static inline int pwm_capture(struct pwm_device *pwm,
-			      struct pwm_capture *result,
-			      unsigned long timeout)
-{
-	return -EINVAL;
-}
-
 static inline int pwm_enable(struct pwm_device *pwm)
 {
 	might_sleep();
@@ -462,6 +451,13 @@ static inline int pwm_enable(struct pwm_device *pwm)
 static inline void pwm_disable(struct pwm_device *pwm)
 {
 	might_sleep();
+}
+
+static inline int pwm_capture(struct pwm_device *pwm,
+			      struct pwm_capture *result,
+			      unsigned long timeout)
+{
+	return -EINVAL;
 }
 
 static inline int pwm_set_chip_data(struct pwm_device *pwm, void *data)
@@ -555,7 +551,7 @@ static inline void pwm_apply_args(struct pwm_device *pwm)
 	state.period = pwm->args.period;
 	state.usage_power = false;
 
-	pwm_apply_state(pwm, &state);
+	pwm_apply_might_sleep(pwm, &state);
 }
 
 struct pwm_lookup {

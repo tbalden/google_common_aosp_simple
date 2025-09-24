@@ -7,7 +7,6 @@
 
 #include <linux/types.h>
 #include <linux/percpu.h>
-#include <linux/android_vendor.h>
 
 void topology_normalize_cpu_scale(void);
 int topology_update_cpu_topology(void);
@@ -43,6 +42,7 @@ enum scale_freq_source {
 	SCALE_FREQ_SOURCE_CPUFREQ = 0,
 	SCALE_FREQ_SOURCE_ARCH,
 	SCALE_FREQ_SOURCE_CPPC,
+	SCALE_FREQ_SOURCE_VIRT,
 };
 
 struct scale_freq_data {
@@ -73,8 +73,6 @@ struct cpu_topology {
 	cpumask_t core_sibling;
 	cpumask_t cluster_sibling;
 	cpumask_t llc_sibling;
-
-	ANDROID_VENDOR_DATA_ARRAY(1, 1);
 };
 
 #ifdef CONFIG_GENERIC_ARCH_TOPOLOGY

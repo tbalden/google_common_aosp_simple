@@ -31,7 +31,6 @@
 #include <linux/mmc/card.h>
 #include <linux/mmc/sdio.h>
 #include <linux/mmc/slot-gpio.h>
-#include <trace/hooks/mmc.h>
 
 #include "sdhci.h"
 
@@ -532,7 +531,6 @@ static inline bool sdhci_has_requests(struct sdhci_host *host)
 
 static void sdhci_read_block_pio(struct sdhci_host *host)
 {
-	unsigned long flags;
 	size_t blksize, len, chunk;
 	u32 scratch;
 	u8 *buf;
@@ -541,8 +539,6 @@ static void sdhci_read_block_pio(struct sdhci_host *host)
 
 	blksize = host->data->blksz;
 	chunk = 0;
-
-	local_irq_save(flags);
 
 	while (blksize) {
 		BUG_ON(!sg_miter_next(&host->sg_miter));
@@ -570,13 +566,10 @@ static void sdhci_read_block_pio(struct sdhci_host *host)
 	}
 
 	sg_miter_stop(&host->sg_miter);
-
-	local_irq_restore(flags);
 }
 
 static void sdhci_write_block_pio(struct sdhci_host *host)
 {
-	unsigned long flags;
 	size_t blksize, len, chunk;
 	u32 scratch;
 	u8 *buf;
@@ -586,8 +579,6 @@ static void sdhci_write_block_pio(struct sdhci_host *host)
 	blksize = host->data->blksz;
 	chunk = 0;
 	scratch = 0;
-
-	local_irq_save(flags);
 
 	while (blksize) {
 		BUG_ON(!sg_miter_next(&host->sg_miter));
@@ -615,8 +606,6 @@ static void sdhci_write_block_pio(struct sdhci_host *host)
 	}
 
 	sg_miter_stop(&host->sg_miter);
-
-	local_irq_restore(flags);
 }
 
 static void sdhci_transfer_pio(struct sdhci_host *host)
@@ -712,16 +701,14 @@ static int sdhci_pre_dma_transfer(struct sdhci_host *host,
 	return sg_count;
 }
 
-static char *sdhci_kmap_atomic(struct scatterlist *sg, unsigned long *flags)
+static char *sdhci_kmap_atomic(struct scatterlist *sg)
 {
-	local_irq_save(*flags);
-	return kmap_atomic(sg_page(sg)) + sg->offset;
+	return kmap_local_page(sg_page(sg)) + sg->offset;
 }
 
-static void sdhci_kunmap_atomic(void *buffer, unsigned long *flags)
+static void sdhci_kunmap_atomic(void *buffer)
 {
-	kunmap_atomic(buffer);
-	local_irq_restore(*flags);
+	kunmap_local(buffer);
 }
 
 void sdhci_adma_write_desc(struct sdhci_host *host, void **desc,
@@ -763,7 +750,6 @@ static void sdhci_adma_table_pre(struct sdhci_host *host,
 	struct mmc_data *data, int sg_count)
 {
 	struct scatterlist *sg;
-	unsigned long flags;
 	dma_addr_t addr, align_addr;
 	void *desc, *align;
 	char *buffer;
@@ -795,9 +781,9 @@ static void sdhci_adma_table_pre(struct sdhci_host *host,
 			 SDHCI_ADMA2_MASK;
 		if (offset) {
 			if (data->flags & MMC_DATA_WRITE) {
-				buffer = sdhci_kmap_atomic(sg, &flags);
+				buffer = sdhci_kmap_atomic(sg);
 				memcpy(align, buffer, offset);
-				sdhci_kunmap_atomic(buffer, &flags);
+				sdhci_kunmap_atomic(buffer);
 			}
 
 			/* tran, valid */
@@ -858,7 +844,6 @@ static void sdhci_adma_table_post(struct sdhci_host *host,
 	int i, size;
 	void *align;
 	char *buffer;
-	unsigned long flags;
 
 	if (data->flags & MMC_DATA_READ) {
 		bool has_unaligned = false;
@@ -881,9 +866,9 @@ static void sdhci_adma_table_post(struct sdhci_host *host,
 					size = SDHCI_ADMA2_ALIGN -
 					       (sg_dma_address(sg) & SDHCI_ADMA2_MASK);
 
-					buffer = sdhci_kmap_atomic(sg, &flags);
+					buffer = sdhci_kmap_atomic(sg);
 					memcpy(buffer, align, size);
-					sdhci_kunmap_atomic(buffer, &flags);
+					sdhci_kunmap_atomic(buffer);
 
 					align += SDHCI_ADMA2_ALIGN;
 				}
@@ -1472,7 +1457,7 @@ static void sdhci_set_transfer_mode(struct sdhci_host *host,
 		if (host->quirks2 &
 			SDHCI_QUIRK2_CLEAR_TRANSFERMODE_REG_BEFORE_CMD) {
 			/* must not clear SDHCI_TRANSFER_MODE when tuning */
-			if (cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200)
+			if (!mmc_op_tuning(cmd->opcode))
 				sdhci_writew(host, 0x0, SDHCI_TRANSFER_MODE);
 		} else {
 		/* clear Auto CMD settings for no data CMDs */
@@ -2309,7 +2294,7 @@ static bool sdhci_timing_has_preset(unsigned char timing)
 	case MMC_TIMING_UHS_DDR50:
 	case MMC_TIMING_MMC_DDR52:
 		return true;
-	};
+	}
 	return false;
 }
 
@@ -2423,8 +2408,21 @@ void sdhci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	if (host->version >= SDHCI_SPEC_300) {
 		u16 clk, ctrl_2;
 
+		/*
+		 * According to SDHCI Spec v3.00, if the Preset Value
+		 * Enable in the Host Control 2 register is set, we
+		 * need to reset SD Clock Enable before changing High
+		 * Speed Enable to avoid generating clock glitches.
+		 */
+		clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+		if (clk & SDHCI_CLOCK_CARD_EN) {
+			clk &= ~SDHCI_CLOCK_CARD_EN;
+			sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+		}
+
+		sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
+
 		if (!host->preset_enabled) {
-			sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
 			/*
 			 * We only need to set Driver Strength if the
 			 * preset value enable is not set.
@@ -2447,29 +2445,7 @@ void sdhci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 
 			sdhci_writew(host, ctrl_2, SDHCI_HOST_CONTROL2);
 			host->drv_type = ios->drv_type;
-		} else {
-			/*
-			 * According to SDHC Spec v3.00, if the Preset Value
-			 * Enable in the Host Control 2 register is set, we
-			 * need to reset SD Clock Enable before changing High
-			 * Speed Enable to avoid generating clock gliches.
-			 */
-
-			/* Reset SD Clock Enable */
-			clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
-			clk &= ~SDHCI_CLOCK_CARD_EN;
-			sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
-
-			sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
-
-			/* Re-enable SD Clock */
-			host->ops->set_clock(host, host->clock);
 		}
-
-		/* Reset SD Clock Enable */
-		clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
-		clk &= ~SDHCI_CLOCK_CARD_EN;
-		sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
 
 		host->ops->set_uhs_signaling(host, ios->timing);
 		host->timing = ios->timing;
@@ -2502,8 +2478,6 @@ static int sdhci_get_cd(struct mmc_host *mmc)
 	/* If nonremovable, assume that the card is always present. */
 	if (!mmc_card_is_removable(mmc))
 		return 1;
-
-	trace_android_vh_sdhci_get_cd(host);
 
 	/*
 	 * Try slot gpio detect, if defined it take precedence
@@ -4155,9 +4129,6 @@ void __sdhci_read_caps(struct sdhci_host *host, const u16 *ver,
 
 	v = ver ? *ver : sdhci_readw(host, SDHCI_HOST_VERSION);
 	host->version = (v & SDHCI_SPEC_VER_MASK) >> SDHCI_SPEC_VER_SHIFT;
-
-	if (host->quirks & SDHCI_QUIRK_MISSING_CAPS)
-		return;
 
 	if (caps) {
 		host->caps = *caps;

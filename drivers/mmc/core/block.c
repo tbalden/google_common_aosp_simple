@@ -50,8 +50,6 @@
 
 #include <linux/uaccess.h>
 
-#include <trace/hooks/mmc.h>
-
 #include "queue.h"
 #include "block.h"
 #include "core.h"
@@ -79,8 +77,6 @@ MODULE_ALIAS("mmc:block");
 #define MMC_EXTRACT_INDEX_FROM_ARG(x) ((x & 0x00FF0000) >> 16)
 #define MMC_EXTRACT_VALUE_FROM_ARG(x) ((x & 0x0000FF00) >> 8)
 
-#define mmc_req_rel_wr(req)	((req->cmd_flags & REQ_FUA) && \
-				  (rq_data_dir(req) == WRITE))
 static DEFINE_MUTEX(block_mutex);
 
 /*
@@ -365,15 +361,15 @@ static const struct attribute_group *mmc_disk_attr_groups[] = {
 	NULL,
 };
 
-static int mmc_blk_open(struct block_device *bdev, fmode_t mode)
+static int mmc_blk_open(struct gendisk *disk, blk_mode_t mode)
 {
-	struct mmc_blk_data *md = mmc_blk_get(bdev->bd_disk);
+	struct mmc_blk_data *md = mmc_blk_get(disk);
 	int ret = -ENXIO;
 
 	mutex_lock(&block_mutex);
 	if (md) {
 		ret = 0;
-		if ((mode & FMODE_WRITE) && md->read_only) {
+		if ((mode & BLK_OPEN_WRITE) && md->read_only) {
 			mmc_blk_put(md);
 			ret = -EROFS;
 		}
@@ -383,7 +379,7 @@ static int mmc_blk_open(struct block_device *bdev, fmode_t mode)
 	return ret;
 }
 
-static void mmc_blk_release(struct gendisk *disk, fmode_t mode)
+static void mmc_blk_release(struct gendisk *disk)
 {
 	struct mmc_blk_data *md = disk->private_data;
 
@@ -533,19 +529,6 @@ static int __mmc_blk_ioctl_cmd(struct mmc_card *card, struct mmc_blk_data *md,
 		/* Allow overriding the timeout_ns for empirical tuning. */
 		if (idata->ic.data_timeout_ns)
 			data.timeout_ns = idata->ic.data_timeout_ns;
-
-		if ((cmd.flags & MMC_RSP_R1B) == MMC_RSP_R1B) {
-			/*
-			 * Pretend this is a data transfer and rely on the
-			 * host driver to compute timeout.  When all host
-			 * drivers support cmd.cmd_timeout for R1B, this
-			 * can be changed to:
-			 *
-			 *     mrq.data = NULL;
-			 *     cmd.cmd_timeout = idata->ic.cmd_timeout_ms;
-			 */
-			data.timeout_ns = idata->ic.cmd_timeout_ms * 1000000;
-		}
 
 		mrq.data = &data;
 	}
@@ -813,7 +796,7 @@ static int mmc_blk_check_blkdev(struct block_device *bdev)
 	return 0;
 }
 
-static int mmc_blk_ioctl(struct block_device *bdev, fmode_t mode,
+static int mmc_blk_ioctl(struct block_device *bdev, blk_mode_t mode,
 	unsigned int cmd, unsigned long arg)
 {
 	struct mmc_blk_data *md;
@@ -850,7 +833,7 @@ static int mmc_blk_ioctl(struct block_device *bdev, fmode_t mode,
 }
 
 #ifdef CONFIG_COMPAT
-static int mmc_blk_compat_ioctl(struct block_device *bdev, fmode_t mode,
+static int mmc_blk_compat_ioctl(struct block_device *bdev, blk_mode_t mode,
 	unsigned int cmd, unsigned long arg)
 {
 	return mmc_blk_ioctl(bdev, mode, cmd, (unsigned long) compat_ptr(arg));
@@ -972,17 +955,9 @@ static int mmc_sd_num_wr_blocks(struct mmc_card *card, u32 *written_blocks)
 
 	struct scatterlist sg;
 
-	cmd.opcode = MMC_APP_CMD;
-	cmd.arg = card->rca << 16;
-	cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_AC;
-
-	err = mmc_wait_for_cmd(card->host, &cmd, 0);
+	err = mmc_app_cmd(card->host, card);
 	if (err)
 		return err;
-	if (!mmc_host_is_spi(card->host) && !(cmd.resp[0] & R1_APP_CMD))
-		return -EIO;
-
-	memset(&cmd, 0, sizeof(struct mmc_command));
 
 	cmd.opcode = SD_APP_SEND_NUM_WR_BLKS;
 	cmd.arg = 0;
@@ -1068,10 +1043,8 @@ static int mmc_blk_reset(struct mmc_blk_data *md, struct mmc_host *host,
 	 * in that case.
 	 */
 	main_md->part_curr = err ? MMC_BLK_PART_INVALID : main_md->part_type;
-	if (err) {
-		trace_android_vh_mmc_blk_reset(host, err);
+	if (err)
 		return err;
-	}
 	/* Ensure we switch back to the correct partition */
 	if (mmc_blk_part_switch(host->card, md->part_type))
 		/*
@@ -1586,7 +1559,7 @@ void mmc_blk_cqe_recovery(struct mmc_queue *mq)
 	pr_debug("%s: CQE recovery start\n", mmc_hostname(host));
 
 	err = mmc_cqe_recovery(host);
-	if (err)
+	if (err || host->cqe_recovery_reset_always)
 		mmc_blk_reset(mq->blkdata, host, MMC_BLK_CQE_RECOVERY);
 	mmc_blk_reset_success(mq->blkdata, MMC_BLK_CQE_RECOVERY);
 
@@ -1945,7 +1918,6 @@ static void mmc_blk_mq_rw_recovery(struct mmc_queue *mq, struct request *req)
 	    err && mmc_blk_reset(md, card->host, type)) {
 		pr_err("%s: recovery failed!\n", req->q->disk->disk_name);
 		mqrq->retries = MMC_NO_RETRIES;
-		trace_android_vh_mmc_blk_mq_rw_recovery(card);
 		return;
 	}
 
@@ -2456,8 +2428,10 @@ enum mmc_issued mmc_blk_mq_issue_rq(struct mmc_queue *mq, struct request *req)
 			}
 			ret = mmc_blk_cqe_issue_flush(mq, req);
 			break;
-		case REQ_OP_READ:
 		case REQ_OP_WRITE:
+			card->written_flag = true;
+			fallthrough;
+		case REQ_OP_READ:
 			if (host->cqe_enabled)
 				ret = mmc_blk_cqe_issue_rw_rq(mq, req);
 			else
@@ -2588,9 +2562,9 @@ static struct mmc_blk_data *mmc_blk_alloc_req(struct mmc_card *card,
 
 	string_get_size((u64)size, 512, STRING_UNITS_2,
 			cap_str, sizeof(cap_str));
-	pr_info("%s: %s %s %s %s\n",
+	pr_info("%s: %s %s %s%s\n",
 		md->disk->disk_name, mmc_card_id(card), mmc_card_name(card),
-		cap_str, md->read_only ? "(ro)" : "");
+		cap_str, md->read_only ? " (ro)" : "");
 
 	/* used in ->open, must be set before add_disk: */
 	if (area_type == MMC_BLK_DATA_AREA_MAIN)
@@ -2982,12 +2956,12 @@ static const struct file_operations mmc_dbg_ext_csd_fops = {
 	.llseek		= default_llseek,
 };
 
-static int mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
+static void mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
 {
 	struct dentry *root;
 
 	if (!card->debugfs_root)
-		return 0;
+		return;
 
 	root = card->debugfs_root;
 
@@ -2996,19 +2970,13 @@ static int mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
 			debugfs_create_file_unsafe("status", 0400, root,
 						   card,
 						   &mmc_dbg_card_status_fops);
-		if (!md->status_dentry)
-			return -EIO;
 	}
 
 	if (mmc_card_mmc(card)) {
 		md->ext_csd_dentry =
 			debugfs_create_file("ext_csd", S_IRUSR, root, card,
 					    &mmc_dbg_ext_csd_fops);
-		if (!md->ext_csd_dentry)
-			return -EIO;
 	}
-
-	return 0;
 }
 
 static void mmc_blk_remove_debugfs(struct mmc_card *card,
@@ -3017,22 +2985,17 @@ static void mmc_blk_remove_debugfs(struct mmc_card *card,
 	if (!card->debugfs_root)
 		return;
 
-	if (!IS_ERR_OR_NULL(md->status_dentry)) {
-		debugfs_remove(md->status_dentry);
-		md->status_dentry = NULL;
-	}
+	debugfs_remove(md->status_dentry);
+	md->status_dentry = NULL;
 
-	if (!IS_ERR_OR_NULL(md->ext_csd_dentry)) {
-		debugfs_remove(md->ext_csd_dentry);
-		md->ext_csd_dentry = NULL;
-	}
+	debugfs_remove(md->ext_csd_dentry);
+	md->ext_csd_dentry = NULL;
 }
 
 #else
 
-static int mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
+static void mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
 {
-	return 0;
 }
 
 static void mmc_blk_remove_debugfs(struct mmc_card *card,
@@ -3114,7 +3077,6 @@ static void mmc_blk_remove(struct mmc_card *card)
 		pm_runtime_disable(&card->dev);
 	pm_runtime_put_noidle(&card->dev);
 	mmc_blk_remove_req(md);
-	dev_set_drvdata(&card->dev, NULL);
 	destroy_workqueue(card->complete_wq);
 }
 

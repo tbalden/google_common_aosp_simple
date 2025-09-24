@@ -81,7 +81,7 @@ static struct attribute *damon_sysfs_region_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_region);
 
-static struct kobj_type damon_sysfs_region_ktype = {
+static const struct kobj_type damon_sysfs_region_ktype = {
 	.release = damon_sysfs_region_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_region_groups,
@@ -198,7 +198,7 @@ static struct attribute *damon_sysfs_regions_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_regions);
 
-static struct kobj_type damon_sysfs_regions_ktype = {
+static const struct kobj_type damon_sysfs_regions_ktype = {
 	.release = damon_sysfs_regions_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_regions_groups,
@@ -277,7 +277,7 @@ static struct attribute *damon_sysfs_target_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_target);
 
-static struct kobj_type damon_sysfs_target_ktype = {
+static const struct kobj_type damon_sysfs_target_ktype = {
 	.release = damon_sysfs_target_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_target_groups,
@@ -402,7 +402,7 @@ static struct attribute *damon_sysfs_targets_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_targets);
 
-static struct kobj_type damon_sysfs_targets_ktype = {
+static const struct kobj_type damon_sysfs_targets_ktype = {
 	.release = damon_sysfs_targets_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_targets_groups,
@@ -530,7 +530,7 @@ static struct attribute *damon_sysfs_intervals_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_intervals);
 
-static struct kobj_type damon_sysfs_intervals_ktype = {
+static const struct kobj_type damon_sysfs_intervals_ktype = {
 	.release = damon_sysfs_intervals_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_intervals_groups,
@@ -612,7 +612,7 @@ static struct attribute *damon_sysfs_attrs_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_attrs);
 
-static struct kobj_type damon_sysfs_attrs_ktype = {
+static const struct kobj_type damon_sysfs_attrs_ktype = {
 	.release = damon_sysfs_attrs_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_attrs_groups,
@@ -800,7 +800,7 @@ static struct attribute *damon_sysfs_context_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_context);
 
-static struct kobj_type damon_sysfs_context_ktype = {
+static const struct kobj_type damon_sysfs_context_ktype = {
 	.release = damon_sysfs_context_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_context_groups,
@@ -926,7 +926,7 @@ static struct attribute *damon_sysfs_contexts_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_contexts);
 
-static struct kobj_type damon_sysfs_contexts_ktype = {
+static const struct kobj_type damon_sysfs_contexts_ktype = {
 	.release = damon_sysfs_contexts_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_contexts_groups,
@@ -1355,11 +1355,13 @@ static int damon_sysfs_commit_input(struct damon_sysfs_kdamond *kdamond)
  * damon_sysfs_cmd_request_callback() - DAMON callback for handling requests.
  * @c:		The DAMON context of the callback.
  * @active:	Whether @c is not deactivated due to watermarks.
+ * @after_aggr:        Whether this is called from after_aggregation() callback.
  *
  * This function is periodically called back from the kdamond thread for @c.
  * Then, it checks if there is a waiting DAMON sysfs request and handles it.
  */
-static int damon_sysfs_cmd_request_callback(struct damon_ctx *c, bool active)
+static int damon_sysfs_cmd_request_callback(struct damon_ctx *c, bool active,
+		 bool after_aggregation)
 {
 	struct damon_sysfs_kdamond *kdamond;
 	bool total_bytes_only = false;
@@ -1377,6 +1379,8 @@ static int damon_sysfs_cmd_request_callback(struct damon_ctx *c, bool active)
 		err = damon_sysfs_upd_schemes_stats(kdamond);
 		break;
 	case DAMON_SYSFS_CMD_COMMIT:
+		if (!after_aggregation)
+			goto out;
 		err = damon_sysfs_commit_input(kdamond);
 		break;
 	case DAMON_SYSFS_CMD_UPDATE_SCHEMES_TRIED_BYTES:
@@ -1391,6 +1395,7 @@ static int damon_sysfs_cmd_request_callback(struct damon_ctx *c, bool active)
 				goto keep_lock_out;
 			}
 		} else {
+			damos_sysfs_mark_finished_regions_updates(c);
 			/*
 			 * Continue regions updating if DAMON is till
 			 * active and the update for all schemes is not
@@ -1423,7 +1428,16 @@ static int damon_sysfs_after_wmarks_check(struct damon_ctx *c)
 	 * after_wmarks_check() is called back while the context is deactivated
 	 * by watermarks.
 	 */
-	return damon_sysfs_cmd_request_callback(c, false);
+	return damon_sysfs_cmd_request_callback(c, false, false);
+}
+
+static int damon_sysfs_after_sampling(struct damon_ctx *c)
+{
+       /*
+        * after_sampling() is called back only while the context is not
+        * deactivated by watermarks.
+        */
+       return damon_sysfs_cmd_request_callback(c, true, false);
 }
 
 static int damon_sysfs_after_aggregation(struct damon_ctx *c)
@@ -1432,7 +1446,7 @@ static int damon_sysfs_after_aggregation(struct damon_ctx *c)
 	 * after_aggregation() is called back only while the context is not
 	 * deactivated by watermarks.
 	 */
-	return damon_sysfs_cmd_request_callback(c, true);
+	return damon_sysfs_cmd_request_callback(c, true, true);
 }
 
 static struct damon_ctx *damon_sysfs_build_ctx(
@@ -1451,6 +1465,7 @@ static struct damon_ctx *damon_sysfs_build_ctx(
 	}
 
 	ctx->callback.after_wmarks_check = damon_sysfs_after_wmarks_check;
+	ctx->callback.after_sampling = damon_sysfs_after_sampling;
 	ctx->callback.after_aggregation = damon_sysfs_after_aggregation;
 	ctx->callback.before_terminate = damon_sysfs_before_terminate;
 	return ctx;
@@ -1624,7 +1639,7 @@ static struct attribute *damon_sysfs_kdamond_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_kdamond);
 
-static struct kobj_type damon_sysfs_kdamond_ktype = {
+static const struct kobj_type damon_sysfs_kdamond_ktype = {
 	.release = damon_sysfs_kdamond_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_kdamond_groups,
@@ -1767,7 +1782,7 @@ static struct attribute *damon_sysfs_kdamonds_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_kdamonds);
 
-static struct kobj_type damon_sysfs_kdamonds_ktype = {
+static const struct kobj_type damon_sysfs_kdamonds_ktype = {
 	.release = damon_sysfs_kdamonds_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_kdamonds_groups,
@@ -1817,7 +1832,7 @@ static struct attribute *damon_sysfs_ui_dir_attrs[] = {
 };
 ATTRIBUTE_GROUPS(damon_sysfs_ui_dir);
 
-static struct kobj_type damon_sysfs_ui_dir_ktype = {
+static const struct kobj_type damon_sysfs_ui_dir_ktype = {
 	.release = damon_sysfs_ui_dir_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = damon_sysfs_ui_dir_groups,

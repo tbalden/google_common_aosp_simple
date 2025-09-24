@@ -192,6 +192,18 @@ struct nix_hw *get_nix_hw(struct rvu_hwinfo *hw, int blkaddr)
 	return NULL;
 }
 
+int nix_get_dwrr_mtu_reg(struct rvu_hwinfo *hw, int smq_link_type)
+{
+	if (hw->cap.nix_multiple_dwrr_mtu)
+		return NIX_AF_DWRR_MTUX(smq_link_type);
+
+	if (smq_link_type == SMQ_LINK_TYPE_SDP)
+		return NIX_AF_DWRR_SDP_MTU;
+
+	/* Here it's same reg for RPM and LBK */
+	return NIX_AF_DWRR_RPM_MTU;
+}
+
 u32 convert_dwrr_mtu_to_bytes(u8 dwrr_mtu)
 {
 	dwrr_mtu &= 0x1FULL;
@@ -2243,6 +2255,13 @@ static int nix_smq_flush(struct rvu *rvu, int blkaddr,
 	u8 link, link_level;
 	u64 cfg, bmap = 0;
 
+	if (!is_rvu_otx2(rvu)) {
+		/* Skip SMQ flush if pkt count is zero */
+		cfg = rvu_read64(rvu, blkaddr, NIX_AF_MDQX_IN_MD_COUNT(smq));
+		if (!cfg)
+			return 0;
+	}
+
 	/* enable cgx tx if disabled */
 	if (is_pf_cgxmapped(rvu, pf)) {
 		rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
@@ -2621,17 +2640,19 @@ static int nix_txschq_cfg_read(struct rvu *rvu, struct nix_hw *nix_hw,
 	return 0;
 }
 
-static void rvu_nix_tx_tl2_cfg(struct rvu *rvu, int blkaddr,
-			       u16 pcifunc, struct nix_txsch *txsch)
+void rvu_nix_tx_tl2_cfg(struct rvu *rvu, int blkaddr, u16 pcifunc,
+			struct nix_txsch *txsch, bool enable)
 {
 	struct rvu_hwinfo *hw = rvu->hw;
 	int lbk_link_start, lbk_links;
 	u8 pf = rvu_get_pf(pcifunc);
 	int schq;
+	u64 cfg;
 
 	if (!is_pf_cgxmapped(rvu, pf))
 		return;
 
+	cfg = enable ? (BIT_ULL(12) | RVU_SWITCH_LBK_CHAN) : 0;
 	lbk_link_start = hw->cgx_links;
 
 	for (schq = 0; schq < txsch->schq.max; schq++) {
@@ -2645,8 +2666,7 @@ static void rvu_nix_tx_tl2_cfg(struct rvu *rvu, int blkaddr,
 			rvu_write64(rvu, blkaddr,
 				    NIX_AF_TL3_TL2X_LINKX_CFG(schq,
 							      lbk_link_start +
-							      lbk_links),
-				    BIT_ULL(12) | RVU_SWITCH_LBK_CHAN);
+							      lbk_links), cfg);
 	}
 }
 
@@ -2752,8 +2772,6 @@ int rvu_mbox_handler_nix_txschq_cfg(struct rvu *rvu,
 		rvu_write64(rvu, blkaddr, reg, regval);
 	}
 
-	rvu_nix_tx_tl2_cfg(rvu, blkaddr, pcifunc,
-			   &nix_hw->txsch[NIX_TXSCH_LVL_TL2]);
 	return 0;
 }
 
@@ -3364,10 +3382,16 @@ static int nix_setup_txschq(struct rvu *rvu, struct nix_hw *nix_hw, int blkaddr)
 	}
 
 	/* Setup a default value of 8192 as DWRR MTU */
-	if (rvu->hw->cap.nix_common_dwrr_mtu) {
-		rvu_write64(rvu, blkaddr, NIX_AF_DWRR_RPM_MTU,
+	if (rvu->hw->cap.nix_common_dwrr_mtu ||
+	    rvu->hw->cap.nix_multiple_dwrr_mtu) {
+		rvu_write64(rvu, blkaddr,
+			    nix_get_dwrr_mtu_reg(rvu->hw, SMQ_LINK_TYPE_RPM),
 			    convert_bytes_to_dwrr_mtu(8192));
-		rvu_write64(rvu, blkaddr, NIX_AF_DWRR_SDP_MTU,
+		rvu_write64(rvu, blkaddr,
+			    nix_get_dwrr_mtu_reg(rvu->hw, SMQ_LINK_TYPE_LBK),
+			    convert_bytes_to_dwrr_mtu(8192));
+		rvu_write64(rvu, blkaddr,
+			    nix_get_dwrr_mtu_reg(rvu->hw, SMQ_LINK_TYPE_SDP),
 			    convert_bytes_to_dwrr_mtu(8192));
 	}
 
@@ -3436,8 +3460,12 @@ static void rvu_get_lbk_link_max_frs(struct rvu *rvu,  u16 *max_mtu)
 
 static void rvu_get_lmac_link_max_frs(struct rvu *rvu, u16 *max_mtu)
 {
-	/* RPM supports FIFO len 128 KB */
-	if (rvu_cgx_get_fifolen(rvu) == 0x20000)
+	int fifo_size = rvu_cgx_get_fifolen(rvu);
+
+	/* RPM supports FIFO len 128 KB and RPM2 supports double the
+	 * FIFO len to accommodate 8 LMACS
+	 */
+	if (fifo_size == 0x20000 || fifo_size == 0x40000)
 		*max_mtu = CN10K_LMAC_LINK_MAX_FRS;
 	else
 		*max_mtu = NIC_HW_MAX_FRS;
@@ -3461,18 +3489,27 @@ int rvu_mbox_handler_nix_get_hw_info(struct rvu *rvu, struct msg_req *req,
 
 	rsp->min_mtu = NIC_HW_MIN_FRS;
 
-	if (!rvu->hw->cap.nix_common_dwrr_mtu) {
+	if (!rvu->hw->cap.nix_common_dwrr_mtu &&
+	    !rvu->hw->cap.nix_multiple_dwrr_mtu) {
 		/* Return '1' on OTx2 */
 		rsp->rpm_dwrr_mtu = 1;
 		rsp->sdp_dwrr_mtu = 1;
+		rsp->lbk_dwrr_mtu = 1;
 		return 0;
 	}
 
-	dwrr_mtu = rvu_read64(rvu, BLKADDR_NIX0, NIX_AF_DWRR_RPM_MTU);
+	/* Return DWRR_MTU for TLx_SCHEDULE[RR_WEIGHT] config */
+	dwrr_mtu = rvu_read64(rvu, blkaddr,
+			      nix_get_dwrr_mtu_reg(rvu->hw, SMQ_LINK_TYPE_RPM));
 	rsp->rpm_dwrr_mtu = convert_dwrr_mtu_to_bytes(dwrr_mtu);
 
-	dwrr_mtu = rvu_read64(rvu, BLKADDR_NIX0, NIX_AF_DWRR_SDP_MTU);
+	dwrr_mtu = rvu_read64(rvu, blkaddr,
+			      nix_get_dwrr_mtu_reg(rvu->hw, SMQ_LINK_TYPE_SDP));
 	rsp->sdp_dwrr_mtu = convert_dwrr_mtu_to_bytes(dwrr_mtu);
+
+	dwrr_mtu = rvu_read64(rvu, blkaddr,
+			      nix_get_dwrr_mtu_reg(rvu->hw, SMQ_LINK_TYPE_LBK));
+	rsp->lbk_dwrr_mtu = convert_dwrr_mtu_to_bytes(dwrr_mtu);
 
 	return 0;
 }
@@ -4233,6 +4270,11 @@ int rvu_mbox_handler_nix_set_rx_cfg(struct rvu *rvu, struct nix_rx_cfg *req,
 	else
 		cfg &= ~BIT_ULL(40);
 
+	if (req->len_verify & NIX_RX_DROP_RE)
+		cfg |= BIT_ULL(32);
+	else
+		cfg &= ~BIT_ULL(32);
+
 	if (req->csum_verify & BIT(0))
 		cfg |= BIT_ULL(37);
 	else
@@ -4437,8 +4479,11 @@ static void rvu_nix_setup_capabilities(struct rvu *rvu, int blkaddr)
 	 * Check if HW uses a common MTU for all DWRR quantum configs.
 	 * On OcteonTx2 this register field is '0'.
 	 */
-	if (((hw_const >> 56) & 0x10) == 0x10)
+	if ((((hw_const >> 56) & 0x10) == 0x10) && !(hw_const & BIT_ULL(61)))
 		hw->cap.nix_common_dwrr_mtu = true;
+
+	if (hw_const & BIT_ULL(61))
+		hw->cap.nix_multiple_dwrr_mtu = true;
 }
 
 static int rvu_nix_block_init(struct rvu *rvu, struct nix_hw *nix_hw)
@@ -4497,6 +4542,9 @@ static int rvu_nix_block_init(struct rvu *rvu, struct nix_hw *nix_hw)
 		cfg |= NIX_PTP_1STEP_EN;
 
 	rvu_write64(rvu, blkaddr, NIX_AF_SEB_CFG, cfg);
+
+	if (!is_rvu_otx2(rvu))
+		rvu_nix_block_cn10k_init(rvu, nix_hw);
 
 	if (is_block_implemented(hw, blkaddr)) {
 		err = nix_setup_txschq(rvu, nix_hw, blkaddr);
@@ -4926,6 +4974,10 @@ int rvu_mbox_handler_nix_lso_format_cfg(struct rvu *rvu,
 #define CPT_INST_QSEL_PF_FUNC GENMASK_ULL(23, 8)
 #define CPT_INST_QSEL_SLOT    GENMASK_ULL(7, 0)
 
+#define CPT_INST_CREDIT_TH    GENMASK_ULL(53, 32)
+#define CPT_INST_CREDIT_BPID  GENMASK_ULL(30, 22)
+#define CPT_INST_CREDIT_CNT   GENMASK_ULL(21, 0)
+
 static void nix_inline_ipsec_cfg(struct rvu *rvu, struct nix_inline_ipsec_cfg *req,
 				 int blkaddr)
 {
@@ -4962,14 +5014,23 @@ static void nix_inline_ipsec_cfg(struct rvu *rvu, struct nix_inline_ipsec_cfg *r
 			    val);
 
 		/* Set CPT credit */
-		rvu_write64(rvu, blkaddr, NIX_AF_RX_CPTX_CREDIT(cpt_idx),
-			    req->cpt_credit);
+		val = rvu_read64(rvu, blkaddr, NIX_AF_RX_CPTX_CREDIT(cpt_idx));
+		if ((val & 0x3FFFFF) != 0x3FFFFF)
+			rvu_write64(rvu, blkaddr, NIX_AF_RX_CPTX_CREDIT(cpt_idx),
+				    0x3FFFFF - val);
+
+		val = FIELD_PREP(CPT_INST_CREDIT_CNT, req->cpt_credit);
+		val |= FIELD_PREP(CPT_INST_CREDIT_BPID, req->bpid);
+		val |= FIELD_PREP(CPT_INST_CREDIT_TH, req->credit_th);
+		rvu_write64(rvu, blkaddr, NIX_AF_RX_CPTX_CREDIT(cpt_idx), val);
 	} else {
 		rvu_write64(rvu, blkaddr, NIX_AF_RX_IPSEC_GEN_CFG, 0x0);
 		rvu_write64(rvu, blkaddr, NIX_AF_RX_CPTX_INST_QSEL(cpt_idx),
 			    0x0);
-		rvu_write64(rvu, blkaddr, NIX_AF_RX_CPTX_CREDIT(cpt_idx),
-			    0x3FFFFF);
+		val = rvu_read64(rvu, blkaddr, NIX_AF_RX_CPTX_CREDIT(cpt_idx));
+		if ((val & 0x3FFFFF) != 0x3FFFFF)
+			rvu_write64(rvu, blkaddr, NIX_AF_RX_CPTX_CREDIT(cpt_idx),
+				    0x3FFFFF - val);
 	}
 }
 
@@ -4983,6 +5044,30 @@ int rvu_mbox_handler_nix_inline_ipsec_cfg(struct rvu *rvu,
 	nix_inline_ipsec_cfg(rvu, req, BLKADDR_NIX0);
 	if (is_block_implemented(rvu->hw, BLKADDR_CPT1))
 		nix_inline_ipsec_cfg(rvu, req, BLKADDR_NIX1);
+
+	return 0;
+}
+
+int rvu_mbox_handler_nix_read_inline_ipsec_cfg(struct rvu *rvu,
+					       struct msg_req *req,
+					       struct nix_inline_ipsec_cfg *rsp)
+
+{
+	u64 val;
+
+	if (!is_block_implemented(rvu->hw, BLKADDR_CPT0))
+		return 0;
+
+	val = rvu_read64(rvu, BLKADDR_NIX0, NIX_AF_RX_IPSEC_GEN_CFG);
+	rsp->gen_cfg.egrp = FIELD_GET(IPSEC_GEN_CFG_EGRP, val);
+	rsp->gen_cfg.opcode = FIELD_GET(IPSEC_GEN_CFG_OPCODE, val);
+	rsp->gen_cfg.param1 = FIELD_GET(IPSEC_GEN_CFG_PARAM1, val);
+	rsp->gen_cfg.param2 = FIELD_GET(IPSEC_GEN_CFG_PARAM2, val);
+
+	val = rvu_read64(rvu, BLKADDR_NIX0, NIX_AF_RX_CPTX_CREDIT(0));
+	rsp->cpt_credit = FIELD_GET(CPT_INST_CREDIT_CNT, val);
+	rsp->credit_th = FIELD_GET(CPT_INST_CREDIT_TH, val);
+	rsp->bpid = FIELD_GET(CPT_INST_CREDIT_BPID, val);
 
 	return 0;
 }
@@ -5030,6 +5115,7 @@ int rvu_mbox_handler_nix_inline_ipsec_lf_cfg(struct rvu *rvu,
 
 	return 0;
 }
+
 void rvu_nix_reset_mac(struct rvu_pfvf *pfvf, int pcifunc)
 {
 	bool from_vf = !!(pcifunc & RVU_PFVF_FUNC_MASK);

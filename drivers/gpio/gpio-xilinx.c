@@ -15,8 +15,8 @@
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
-#include <linux/of_platform.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
@@ -52,6 +52,7 @@
  * @dir: GPIO direction shadow register
  * @gpio_lock: Lock used for synchronization
  * @irq: IRQ used by GPIO device
+ * @irqchip: IRQ chip
  * @enable: GPIO IRQ enable/disable bitfield
  * @rising_edge: GPIO IRQ rising edge enable/disable bitfield
  * @falling_edge: GPIO IRQ falling edge enable/disable bitfield
@@ -570,7 +571,6 @@ static int xgpio_probe(struct platform_device *pdev)
 	int status = 0;
 	struct device_node *np = pdev->dev.of_node;
 	u32 is_dual = 0;
-	u32 cells = 2;
 	u32 width[2];
 	u32 state[2];
 	u32 dir[2];
@@ -603,15 +603,6 @@ static int xgpio_probe(struct platform_device *pdev)
 
 	bitmap_from_arr32(chip->dir, dir, 64);
 
-	/* Update cells with gpio-cells value */
-	if (of_property_read_u32(np, "#gpio-cells", &cells))
-		dev_dbg(&pdev->dev, "Missing gpio-cells property\n");
-
-	if (cells != 2) {
-		dev_err(&pdev->dev, "#gpio-cells mismatch\n");
-		return -EINVAL;
-	}
-
 	/*
 	 * Check device node and parent device node for device width
 	 * and assume default width of 32
@@ -642,7 +633,6 @@ static int xgpio_probe(struct platform_device *pdev)
 	chip->gc.parent = &pdev->dev;
 	chip->gc.direction_input = xgpio_dir_in;
 	chip->gc.direction_output = xgpio_dir_out;
-	chip->gc.of_gpio_n_cells = cells;
 	chip->gc.get = xgpio_get;
 	chip->gc.set = xgpio_set;
 	chip->gc.request = xgpio_request;

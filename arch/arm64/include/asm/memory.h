@@ -46,7 +46,7 @@
 #define KIMAGE_VADDR		(MODULES_END)
 #define MODULES_END		(MODULES_VADDR + MODULES_VSIZE)
 #define MODULES_VADDR		(_PAGE_END(VA_BITS_MIN))
-#define MODULES_VSIZE		(SZ_128M)
+#define MODULES_VSIZE		(SZ_2G)
 #define VMEMMAP_START		(-(UL(1) << (VA_BITS - VMEMMAP_SHIFT)))
 #define VMEMMAP_END		(VMEMMAP_START + VMEMMAP_SIZE)
 #define PCI_IO_END		(VMEMMAP_START - SZ_8M)
@@ -150,7 +150,6 @@
 #define MT_NORMAL_NC		2
 #define MT_DEVICE_nGnRnE	3
 #define MT_DEVICE_nGnRE		4
-#define MT_NORMAL_iNC_oWB	5
 
 /*
  * Memory types for Stage-2 translation
@@ -191,6 +190,7 @@
 #include <linux/compiler.h>
 #include <linux/mmdebug.h>
 #include <linux/types.h>
+#include <asm/boot.h>
 #include <asm/bug.h>
 
 #if VA_BITS > 48
@@ -213,6 +213,18 @@ static inline unsigned long kaslr_offset(void)
 {
 	return kimage_vaddr - KIMAGE_VADDR;
 }
+
+#ifdef CONFIG_RANDOMIZE_BASE
+void kaslr_init(void);
+static inline bool kaslr_enabled(void)
+{
+	extern bool __kaslr_is_enabled;
+	return __kaslr_is_enabled;
+}
+#else
+static inline void kaslr_init(void) { }
+static inline bool kaslr_enabled(void) { return false; }
+#endif
 
 /*
  * Allow all memory at the discovery stage. We will clip it later.
@@ -331,6 +343,14 @@ static inline void *phys_to_virt(phys_addr_t x)
 	return (void *)(__phys_to_virt(x));
 }
 
+/* Needed already here for resolving __phys_to_pfn() in virt_to_pfn() */
+#include <asm-generic/memory_model.h>
+
+static inline unsigned long virt_to_pfn(const void *kaddr)
+{
+	return __phys_to_pfn(virt_to_phys(kaddr));
+}
+
 /*
  * Drivers should NOT use these either.
  */
@@ -339,7 +359,6 @@ static inline void *phys_to_virt(phys_addr_t x)
 #define __pa_nodebug(x)		__virt_to_phys_nodebug((unsigned long)(x))
 #define __va(x)			((void *)__phys_to_virt((phys_addr_t)(x)))
 #define pfn_to_kaddr(pfn)	__va((pfn) << PAGE_SHIFT)
-#define virt_to_pfn(x)		__phys_to_pfn(__virt_to_phys((unsigned long)(x)))
 #define sym_to_pfn(x)		__phys_to_pfn(__pa_symbol(x))
 
 /*
@@ -376,11 +395,6 @@ static inline void *phys_to_virt(phys_addr_t x)
 })
 
 void dump_mem_limit(void);
-
-static inline bool defer_reserve_crashkernel(void)
-{
-	return IS_ENABLED(CONFIG_ZONE_DMA) || IS_ENABLED(CONFIG_ZONE_DMA32);
-}
 #endif /* !ASSEMBLY */
 
 /*

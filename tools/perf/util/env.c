@@ -10,6 +10,7 @@
 #include <sys/utsname.h>
 #include <stdlib.h>
 #include <string.h>
+#include "pmus.h"
 #include "strbuf.h"
 
 struct perf_env perf_env;
@@ -19,15 +20,19 @@ struct perf_env perf_env;
 #include "bpf-utils.h"
 #include <bpf/libbpf.h>
 
-void perf_env__insert_bpf_prog_info(struct perf_env *env,
+bool perf_env__insert_bpf_prog_info(struct perf_env *env,
 				    struct bpf_prog_info_node *info_node)
 {
+	bool ret;
+
 	down_write(&env->bpf_progs.lock);
-	__perf_env__insert_bpf_prog_info(env, info_node);
+	ret = __perf_env__insert_bpf_prog_info(env, info_node);
 	up_write(&env->bpf_progs.lock);
+
+	return ret;
 }
 
-void __perf_env__insert_bpf_prog_info(struct perf_env *env, struct bpf_prog_info_node *info_node)
+bool __perf_env__insert_bpf_prog_info(struct perf_env *env, struct bpf_prog_info_node *info_node)
 {
 	__u32 prog_id = info_node->info_linear->info.id;
 	struct bpf_prog_info_node *node;
@@ -45,13 +50,14 @@ void __perf_env__insert_bpf_prog_info(struct perf_env *env, struct bpf_prog_info
 			p = &(*p)->rb_right;
 		} else {
 			pr_debug("duplicated bpf prog info %u\n", prog_id);
-			return;
+			return false;
 		}
 	}
 
 	rb_link_node(&info_node->rb_node, parent, p);
 	rb_insert_color(&info_node->rb_node, &env->bpf_progs.infos);
 	env->bpf_progs.infos_cnt++;
+	return true;
 }
 
 struct bpf_prog_info_node *perf_env__find_bpf_prog_info(struct perf_env *env,
@@ -163,7 +169,7 @@ static void perf_env__purge_bpf(struct perf_env *env)
 		node = rb_entry(next, struct bpf_prog_info_node, rb_node);
 		next = rb_next(&node->rb_node);
 		rb_erase(&node->rb_node, root);
-		free(node->info_linear);
+		zfree(&node->info_linear);
 		free(node);
 	}
 
@@ -337,11 +343,9 @@ int perf_env__read_pmu_mappings(struct perf_env *env)
 	u32 pmu_num = 0;
 	struct strbuf sb;
 
-	while ((pmu = perf_pmu__scan(pmu))) {
-		if (!pmu->name)
-			continue;
+	while ((pmu = perf_pmus__scan(pmu)))
 		pmu_num++;
-	}
+
 	if (!pmu_num) {
 		pr_debug("pmu mappings not available\n");
 		return -ENOENT;
@@ -351,9 +355,7 @@ int perf_env__read_pmu_mappings(struct perf_env *env)
 	if (strbuf_init(&sb, 128 * pmu_num) < 0)
 		return -ENOMEM;
 
-	while ((pmu = perf_pmu__scan(pmu))) {
-		if (!pmu->name)
-			continue;
+	while ((pmu = perf_pmus__scan(pmu))) {
 		if (strbuf_addf(&sb, "%u:%s", pmu->type, pmu->name) < 0)
 			goto error;
 		/* include a NULL character at the end */
@@ -449,6 +451,8 @@ static const char *normalize_arch(char *arch)
 		return "mips";
 	if (!strncmp(arch, "sh", 2) && isdigit(arch[2]))
 		return "sh";
+	if (!strncmp(arch, "loongarch", 9))
+		return "loongarch";
 
 	return arch;
 }

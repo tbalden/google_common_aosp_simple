@@ -24,6 +24,7 @@
 #include <asm/io.h>
 
 #include "8250.h"
+#include "8250_pcilib.h"
 
 /*
  * init function returns:
@@ -91,28 +92,7 @@ static int
 setup_port(struct serial_private *priv, struct uart_8250_port *port,
 	   u8 bar, unsigned int offset, int regshift)
 {
-	struct pci_dev *dev = priv->dev;
-
-	if (bar >= PCI_STD_NUM_BARS)
-		return -EINVAL;
-
-	if (pci_resource_flags(dev, bar) & IORESOURCE_MEM) {
-		if (!pcim_iomap(dev, bar, 0) && !pcim_iomap_table(dev))
-			return -ENOMEM;
-
-		port->port.iotype = UPIO_MEM;
-		port->port.iobase = 0;
-		port->port.mapbase = pci_resource_start(dev, bar) + offset;
-		port->port.membase = pcim_iomap_table(dev)[bar] + offset;
-		port->port.regshift = regshift;
-	} else {
-		port->port.iotype = UPIO_PORT;
-		port->port.iobase = pci_resource_start(dev, bar) + offset;
-		port->port.mapbase = 0;
-		port->port.membase = NULL;
-		port->port.regshift = 0;
-	}
-	return 0;
+	return serial8250_pci_setup_port(priv->dev, port, bar, offset, regshift);
 }
 
 /*
@@ -1252,14 +1232,6 @@ static int pci_oxsemi_tornado_setup(struct serial_private *priv,
 	}
 
 	return pci_default_setup(priv, board, up, idx);
-}
-
-static int pci_asix_setup(struct serial_private *priv,
-		  const struct pciserial_board *board,
-		  struct uart_8250_port *port, int idx)
-{
-	port->bugs |= UART_BUG_PARITY;
-	return pci_default_setup(priv, board, port, idx);
 }
 
 #define QPCR_TEST_FOR1		0x3F
@@ -2605,22 +2577,6 @@ static struct pci_serial_quirk pci_serial_quirks[] = {
 		.setup		= pci_oxsemi_tornado_setup,
 	},
 	{
-		.vendor		= PCI_VENDOR_ID_INTASHIELD,
-		.device		= 0x4026,
-		.subvendor	= PCI_ANY_ID,
-		.subdevice	= PCI_ANY_ID,
-		.init		= pci_oxsemi_tornado_init,
-		.setup		= pci_oxsemi_tornado_setup,
-	},
-	{
-		.vendor		= PCI_VENDOR_ID_INTASHIELD,
-		.device		= 0x4021,
-		.subvendor	= PCI_ANY_ID,
-		.subdevice	= PCI_ANY_ID,
-		.init		= pci_oxsemi_tornado_init,
-		.setup		= pci_oxsemi_tornado_setup,
-	},
-	{
 		.vendor         = PCI_VENDOR_ID_INTEL,
 		.device         = 0x8811,
 		.subvendor	= PCI_ANY_ID,
@@ -2783,16 +2739,6 @@ static struct pci_serial_quirk pci_serial_quirks[] = {
 		.init           = pci_wch_ch38x_init,
 		.exit		= pci_wch_ch38x_exit,
 		.setup          = pci_wch_ch38x_setup,
-	},
-	/*
-	 * ASIX devices with FIFO bug
-	 */
-	{
-		.vendor		= PCI_VENDOR_ID_ASIX,
-		.device		= PCI_ANY_ID,
-		.subvendor	= PCI_ANY_ID,
-		.subdevice	= PCI_ANY_ID,
-		.setup		= pci_asix_setup,
 	},
 	/*
 	 * Broadcom TruManage (NetXtreme)
@@ -5161,14 +5107,6 @@ static const struct pci_device_id serial_pci_tbl[] = {
 		PCI_ANY_ID, PCI_ANY_ID,
 		0, 0,
 		pbn_b2_2_115200 },
-	{       PCI_VENDOR_ID_INTASHIELD, 0x0BA2,
-		PCI_ANY_ID, PCI_ANY_ID,
-		0, 0,
-		pbn_b2_2_115200 },
-	{       PCI_VENDOR_ID_INTASHIELD, 0x0BA3,
-		PCI_ANY_ID, PCI_ANY_ID,
-		0, 0,
-		pbn_b2_2_115200 },
 	/*
 	 * Brainboxes UC-235/246
 	 */
@@ -5286,14 +5224,6 @@ static const struct pci_device_id serial_pci_tbl[] = {
 	 * Brainboxes UC-368
 	 */
 	{	PCI_VENDOR_ID_INTASHIELD, 0x0C41,
-		PCI_ANY_ID, PCI_ANY_ID,
-		0, 0,
-		pbn_b2_4_115200 },
-	{	PCI_VENDOR_ID_INTASHIELD, 0x0C42,
-		PCI_ANY_ID, PCI_ANY_ID,
-		0, 0,
-		pbn_b2_4_115200 },
-	{	PCI_VENDOR_ID_INTASHIELD, 0x0C43,
 		PCI_ANY_ID, PCI_ANY_ID,
 		0, 0,
 		pbn_b2_4_115200 },
@@ -5520,20 +5450,6 @@ static const struct pci_device_id serial_pci_tbl[] = {
 		0, 0,
 		pbn_b0_1_115200 },
 	{	PCI_VENDOR_ID_INTASHIELD, 0x4017,
-		PCI_ANY_ID, PCI_ANY_ID,
-		0, 0,
-		pbn_oxsemi_1_15625000 },
-	/*
-	 * Brainboxes XC-235
-	 */
-	{	PCI_VENDOR_ID_INTASHIELD, 0x4026,
-		PCI_ANY_ID, PCI_ANY_ID,
-		0, 0,
-		pbn_oxsemi_1_15625000 },
-	/*
-	 * Brainboxes XC-475
-	 */
-	{	PCI_VENDOR_ID_INTASHIELD, 0x4021,
 		PCI_ANY_ID, PCI_ANY_ID,
 		0, 0,
 		pbn_oxsemi_1_15625000 },
@@ -6130,3 +6046,4 @@ module_pci_driver(serial_pci_driver);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Generic 8250/16x50 PCI serial probe module");
 MODULE_DEVICE_TABLE(pci, serial_pci_tbl);
+MODULE_IMPORT_NS(SERIAL_8250_PCI);

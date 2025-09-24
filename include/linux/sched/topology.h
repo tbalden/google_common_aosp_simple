@@ -4,7 +4,6 @@
 
 #include <linux/topology.h>
 #include <linux/android_kabi.h>
-#include <linux/android_vendor.h>
 
 #include <linux/sched/idle.h>
 
@@ -84,8 +83,6 @@ struct sched_domain_shared {
 	atomic_t	nr_busy_cpus;
 	int		has_idle_cores;
 	int		nr_idle_scan;
-
-	ANDROID_VENDOR_DATA(1);
 };
 
 struct sched_domain {
@@ -212,7 +209,7 @@ struct sched_domain_topology_level {
 #endif
 };
 
-extern void set_sched_topology(struct sched_domain_topology_level *tl);
+extern void __init set_sched_topology(struct sched_domain_topology_level *tl);
 
 #ifdef CONFIG_SCHED_DEBUG
 # define SD_INIT_NAME(type)		.name = #type

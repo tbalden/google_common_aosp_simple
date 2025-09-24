@@ -16,6 +16,7 @@
 #include <linux/bitops.h>
 #include <linux/pm_qos.h>
 #include <linux/refcount.h>
+#include <linux/uio.h>
 #include <linux/android_kabi.h>
 
 #define snd_pcm_substream_chip(substream) ((substream)->private_data)
@@ -69,15 +70,13 @@ struct snd_pcm_ops {
 			struct snd_pcm_audio_tstamp_report *audio_tstamp_report);
 	int (*fill_silence)(struct snd_pcm_substream *substream, int channel,
 			    unsigned long pos, unsigned long bytes);
-	int (*copy_user)(struct snd_pcm_substream *substream, int channel,
-			 unsigned long pos, void __user *buf,
-			 unsigned long bytes);
-	int (*copy_kernel)(struct snd_pcm_substream *substream, int channel,
-			   unsigned long pos, void *buf, unsigned long bytes);
+	int (*copy)(struct snd_pcm_substream *substream, int channel,
+		    unsigned long pos, struct iov_iter *iter, unsigned long bytes);
 	struct page *(*page)(struct snd_pcm_substream *substream,
 			     unsigned long offset);
 	int (*mmap)(struct snd_pcm_substream *substream, struct vm_area_struct *vma);
 	int (*ack)(struct snd_pcm_substream *substream);
+
 	ANDROID_KABI_RESERVE(1);
 };
 
@@ -380,18 +379,18 @@ struct snd_pcm_runtime {
 	unsigned int rate_den;
 	unsigned int no_period_wakeup: 1;
 
-	/* -- SW params -- */
-	int tstamp_mode;		/* mmap timestamp is updated */
+	/* -- SW params; see struct snd_pcm_sw_params for comments -- */
+	int tstamp_mode;
   	unsigned int period_step;
 	snd_pcm_uframes_t start_threshold;
 	snd_pcm_uframes_t stop_threshold;
-	snd_pcm_uframes_t silence_threshold; /* Silence filling happens when
-						noise is nearest than this */
-	snd_pcm_uframes_t silence_size;	/* Silence filling size */
-	snd_pcm_uframes_t boundary;	/* pointers wrap point */
+	snd_pcm_uframes_t silence_threshold;
+	snd_pcm_uframes_t silence_size;
+	snd_pcm_uframes_t boundary;
 
+	/* internal data of auto-silencer */
 	snd_pcm_uframes_t silence_start; /* starting pointer to silence area */
-	snd_pcm_uframes_t silence_filled; /* size filled with silence */
+	snd_pcm_uframes_t silence_filled; /* already filled part of silence area */
 
 	union snd_pcm_sync_id sync;	/* hardware synchronization ID */
 
@@ -437,6 +436,7 @@ struct snd_pcm_runtime {
 	/* -- OSS things -- */
 	struct snd_pcm_oss_runtime oss;
 #endif
+
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 };
@@ -491,6 +491,7 @@ struct snd_pcm_substream {
 	/* misc flags */
 	unsigned int hw_opened: 1;
 	unsigned int managed_buffer_alloc:1;
+
 	ANDROID_KABI_RESERVE(1);
 };
 
@@ -515,7 +516,8 @@ struct snd_pcm_str {
 #endif
 #endif
 	struct snd_kcontrol *chmap_kctl; /* channel-mapping controls */
-	struct device dev;
+	struct device *dev;
+
 	ANDROID_KABI_RESERVE(1);
 };
 
@@ -539,6 +541,7 @@ struct snd_pcm {
 #if IS_ENABLED(CONFIG_SND_PCM_OSS)
 	struct snd_pcm_oss oss;
 #endif
+
 	ANDROID_KABI_RESERVE(1);
 };
 
@@ -1562,6 +1565,11 @@ static inline u64 pcm_format_to_bits(snd_pcm_format_t pcm_format)
 	dev_warn((pcm)->card->dev, fmt, ##args)
 #define pcm_dbg(pcm, fmt, args...) \
 	dev_dbg((pcm)->card->dev, fmt, ##args)
+
+/* helpers for copying between iov_iter and iomem */
+int copy_to_iter_fromio(struct iov_iter *itert, const void __iomem *src,
+			size_t count);
+int copy_from_iter_toio(void __iomem *dst, struct iov_iter *iter, size_t count);
 
 struct snd_pcm_status64 {
 	snd_pcm_state_t state;		/* stream state */

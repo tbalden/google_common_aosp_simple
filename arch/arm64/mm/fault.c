@@ -70,6 +70,8 @@ static inline const struct fault_info *esr_to_debug_fault_info(unsigned long esr
 
 static void data_abort_decode(unsigned long esr)
 {
+	unsigned long iss2 = ESR_ELx_ISS2(esr);
+
 	pr_alert("Data abort info:\n");
 
 	if (esr & ESR_ELx_ISV) {
@@ -82,12 +84,21 @@ static void data_abort_decode(unsigned long esr)
 			 (esr & ESR_ELx_SF) >> ESR_ELx_SF_SHIFT,
 			 (esr & ESR_ELx_AR) >> ESR_ELx_AR_SHIFT);
 	} else {
-		pr_alert("  ISV = 0, ISS = 0x%08lx\n", esr & ESR_ELx_ISS_MASK);
+		pr_alert("  ISV = 0, ISS = 0x%08lx, ISS2 = 0x%08lx\n",
+			 esr & ESR_ELx_ISS_MASK, iss2);
 	}
 
-	pr_alert("  CM = %lu, WnR = %lu\n",
+	pr_alert("  CM = %lu, WnR = %lu, TnD = %lu, TagAccess = %lu\n",
 		 (esr & ESR_ELx_CM) >> ESR_ELx_CM_SHIFT,
-		 (esr & ESR_ELx_WNR) >> ESR_ELx_WNR_SHIFT);
+		 (esr & ESR_ELx_WNR) >> ESR_ELx_WNR_SHIFT,
+		 (iss2 & ESR_ELx_TnD) >> ESR_ELx_TnD_SHIFT,
+		 (iss2 & ESR_ELx_TagAccess) >> ESR_ELx_TagAccess_SHIFT);
+
+	pr_alert("  GCS = %ld, Overlay = %lu, DirtyBit = %lu, Xs = %llu\n",
+		 (iss2 & ESR_ELx_GCS) >> ESR_ELx_GCS_SHIFT,
+		 (iss2 & ESR_ELx_Overlay) >> ESR_ELx_Overlay_SHIFT,
+		 (iss2 & ESR_ELx_DirtyBit) >> ESR_ELx_DirtyBit_SHIFT,
+		 (iss2 & ESR_ELx_Xs_MASK) >> ESR_ELx_Xs_SHIFT);
 }
 
 static void mem_abort_decode(unsigned long esr)
@@ -181,7 +192,10 @@ static void show_pte(unsigned long addr)
 			break;
 
 		ptep = pte_offset_map(pmdp, addr);
-		pte = READ_ONCE(*ptep);
+		if (!ptep)
+			break;
+
+		pte = __ptep_get(ptep);
 		pr_cont(", pte=%016llx", pte_val(pte));
 		pte_unmap(ptep);
 	} while(0);
@@ -195,16 +209,16 @@ static void show_pte(unsigned long addr)
  *
  * It needs to cope with hardware update of the accessed/dirty state by other
  * agents in the system and can safely skip the __sync_icache_dcache() call as,
- * like set_pte_at(), the PTE is never changed from no-exec to exec here.
+ * like __set_ptes(), the PTE is never changed from no-exec to exec here.
  *
  * Returns whether or not the PTE actually changed.
  */
-int ptep_set_access_flags(struct vm_area_struct *vma,
-			  unsigned long address, pte_t *ptep,
-			  pte_t entry, int dirty)
+int __ptep_set_access_flags(struct vm_area_struct *vma,
+			    unsigned long address, pte_t *ptep,
+			    pte_t entry, int dirty)
 {
 	pteval_t old_pteval, pteval;
-	pte_t pte = READ_ONCE(*ptep);
+	pte_t pte = __ptep_get(ptep);
 
 	if (pte_same(pte, entry))
 		return 0;
@@ -233,6 +247,7 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 		flush_tlb_page(vma, address);
 	return 1;
 }
+EXPORT_SYMBOL(__ptep_set_access_flags);
 
 static bool is_el1_instruction_abort(unsigned long esr)
 {
@@ -334,7 +349,7 @@ static void report_tag_fault(unsigned long addr, unsigned long esr,
 	 * find out access size.
 	 */
 	bool is_write = !!(esr & ESR_ELx_WNR);
-	kasan_report(addr, 0, is_write, regs->pc);
+	kasan_report((void *)addr, 0, is_write, regs->pc);
 }
 #else
 /* Tag faults aren't enabled without CONFIG_KASAN_HW_TAGS. */
@@ -887,9 +902,6 @@ void do_sp_pc_abort(unsigned long addr, unsigned long esr, struct pt_regs *regs)
 }
 NOKPROBE_SYMBOL(do_sp_pc_abort);
 
-int __init early_brk64(unsigned long addr, unsigned long esr,
-		       struct pt_regs *regs);
-
 /*
  * __refdata because early_brk64 is __init, but the reference to it is
  * clobbered at arch_initcall time.
@@ -962,7 +974,7 @@ NOKPROBE_SYMBOL(do_debug_exception);
 /*
  * Used during anonymous page fault handling.
  */
-struct page *alloc_zeroed_user_highpage_movable(struct vm_area_struct *vma,
+struct folio *vma_alloc_zeroed_movable_folio(struct vm_area_struct *vma,
 						unsigned long vaddr)
 {
 	gfp_t flags = GFP_HIGHUSER_MOVABLE | __GFP_ZERO | __GFP_CMA;
@@ -975,11 +987,13 @@ struct page *alloc_zeroed_user_highpage_movable(struct vm_area_struct *vma,
 	if (vma->vm_flags & VM_MTE)
 		flags |= __GFP_ZEROTAGS;
 
-	return alloc_page_vma(flags, vma, vaddr);
+	return vma_alloc_folio(flags, 0, vma, vaddr, false);
 }
 
 void tag_clear_highpage(struct page *page)
 {
+	/* Newly allocated page, shouldn't have been tagged yet */
+	WARN_ON_ONCE(!try_page_mte_tagging(page));
 	mte_zero_clear_page_tags(page_address(page));
 	set_page_mte_tagged(page);
 }

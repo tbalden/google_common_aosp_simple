@@ -66,6 +66,28 @@ const struct ecc_curve *ecc_get_curve(unsigned int curve_id)
 }
 EXPORT_SYMBOL(ecc_get_curve);
 
+void ecc_digits_from_bytes(const u8 *in, unsigned int nbytes,
+			   u64 *out, unsigned int ndigits)
+{
+	int diff = ndigits - DIV_ROUND_UP(nbytes, sizeof(u64));
+	unsigned int o = nbytes & 7;
+	__be64 msd = 0;
+
+	/* diff > 0: not enough input bytes: set most significant digits to 0 */
+	if (diff > 0) {
+		ndigits -= diff;
+		memset(&out[ndigits - 1], 0, diff * sizeof(u64));
+	}
+
+	if (o) {
+		memcpy((u8 *)&msd + sizeof(msd) - o, in, o);
+		out[--ndigits] = be64_to_cpu(msd);
+		in += o;
+	}
+	ecc_swap_digits(in, out, ndigits);
+}
+EXPORT_SYMBOL(ecc_digits_from_bytes);
+
 static u64 *ecc_alloc_digits_space(unsigned int ndigits)
 {
 	size_t len = ndigits * sizeof(u64);
@@ -1384,7 +1406,8 @@ void ecc_point_mult_shamir(const struct ecc_point *result,
 
 	num_bits = max(vli_num_bits(u1, ndigits), vli_num_bits(u2, ndigits));
 	i = num_bits - 1;
-	idx = (!!vli_test_bit(u1, i)) | ((!!vli_test_bit(u2, i)) << 1);
+	idx = !!vli_test_bit(u1, i);
+	idx |= (!!vli_test_bit(u2, i)) << 1;
 	point = points[idx];
 
 	vli_set(rx, point->x, ndigits);
@@ -1394,7 +1417,8 @@ void ecc_point_mult_shamir(const struct ecc_point *result,
 
 	for (--i; i >= 0; i--) {
 		ecc_point_double_jacobian(rx, ry, z, curve);
-		idx = (!!vli_test_bit(u1, i)) | ((!!vli_test_bit(u2, i)) << 1);
+		idx = !!vli_test_bit(u1, i);
+		idx |= (!!vli_test_bit(u2, i)) << 1;
 		point = points[idx];
 		if (point) {
 			u64 tx[ECC_MAX_DIGITS];

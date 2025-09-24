@@ -11,11 +11,14 @@
 #include <linux/android_debug_symbols.h>
 #include <asm/sections.h>
 #include <asm/stacktrace.h>
-
+#include <linux/memblock.h>
+#include <linux/mm_types.h>
+#include <linux/oom.h>
+#include <linux/fs.h>
+#include <linux/swap.h>
+#include <linux/compaction.h>
 #include <linux/cma.h>
-#include <linux/mm.h>
-#include "../../mm/slab.h"
-#include <linux/security.h>
+#include "../mm/slab.h"
 
 struct ads_entry {
 	char *name;
@@ -36,16 +39,22 @@ struct ads_entry {
  * so that vendor modules can query and to find address of non-exported symbol.
  */
 static const struct ads_entry ads_entries[ADS_END] = {
-	ADS_ENTRY(ADS_SDATA, _sdata),
-	ADS_ENTRY(ADS_BSS_END, __bss_stop),
 	ADS_ENTRY(ADS_PER_CPU_START, __per_cpu_start),
 	ADS_ENTRY(ADS_PER_CPU_END, __per_cpu_end),
 	ADS_ENTRY(ADS_TEXT, _text),
 	ADS_ENTRY(ADS_SEND, _end),
-	ADS_ENTRY(ADS_LINUX_BANNER, linux_banner),
+	ADS_ENTRY(ADS_MEM_BLOCK, &memblock),
+	ADS_ENTRY(ADS_INIT_MM, &init_mm),
+	ADS_ENTRY(ADS_ITERATE_SUPERS, iterate_supers),
+	ADS_ENTRY(ADS_DROP_SLAB, drop_slab),
+	ADS_ENTRY(ADS_FREE_PAGES, try_to_free_pages),
+	ADS_ENTRY(ADS_COMPACT_PAGES, try_to_compact_pages),
+	ADS_ENTRY(ADS_SHOW_MEM, __show_mem),
 	ADS_ENTRY(ADS_TOTAL_CMA, &totalcma_pages),
 	ADS_ENTRY(ADS_SLAB_CACHES, &slab_caches),
 	ADS_ENTRY(ADS_SLAB_MUTEX, &slab_mutex),
+	ADS_ENTRY(ADS_START_RO_AFTER_INIT, __start_ro_after_init),
+	ADS_ENTRY(ADS_END_RO_AFTER_INIT, __end_ro_after_init),
 };
 
 /*
@@ -54,9 +63,6 @@ static const struct ads_entry ads_entries[ADS_END] = {
 static const struct ads_entry ads_per_cpu_entries[ADS_DEBUG_PER_CPU_END] = {
 #ifdef CONFIG_ARM64
 	ADS_PER_CPU_ENTRY(ADS_IRQ_STACK_PTR, irq_stack_ptr),
-#endif
-#ifdef CONFIG_X86
-	ADS_PER_CPU_ENTRY(ADS_IRQ_STACK_PTR, hardirq_stack_ptr),
 #endif
 };
 

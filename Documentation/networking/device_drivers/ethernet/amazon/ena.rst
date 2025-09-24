@@ -38,6 +38,7 @@ debug logs.
 
 Some of the ENA devices support a working mode called Low-latency
 Queue (LLQ), which saves several more microseconds.
+
 ENA Source Code Directory Structure
 ===================================
 
@@ -53,6 +54,7 @@ ena_common_defs.h   Common definitions for ena_com layer.
 ena_regs_defs.h     Definition of ENA PCI memory-mapped (MMIO) registers.
 ena_netdev.[ch]     Main Linux kernel driver.
 ena_ethtool.c       ethtool callbacks.
+ena_xdp.[ch]        XDP files
 ena_pci_id_tbl.h    Supported device IDs.
 =================   ======================================================
 
@@ -206,6 +208,7 @@ More information about Adaptive Interrupt Moderation (DIM) can be found in
 Documentation/networking/net_dim.rst
 
 .. _`RX copybreak`:
+
 RX copybreak
 ============
 The rx_copybreak is initialized by default to ENA_DEFAULT_RX_COPYBREAK

@@ -34,13 +34,13 @@ struct ir_rx51 {
 static inline void ir_rx51_on(struct ir_rx51 *ir_rx51)
 {
 	ir_rx51->state.enabled = true;
-	pwm_apply_state(ir_rx51->pwm, &ir_rx51->state);
+	pwm_apply_might_sleep(ir_rx51->pwm, &ir_rx51->state);
 }
 
 static inline void ir_rx51_off(struct ir_rx51 *ir_rx51)
 {
 	ir_rx51->state.enabled = false;
-	pwm_apply_state(ir_rx51->pwm, &ir_rx51->state);
+	pwm_apply_might_sleep(ir_rx51->pwm, &ir_rx51->state);
 }
 
 static int init_timing_params(struct ir_rx51 *ir_rx51)
@@ -261,11 +261,6 @@ static int ir_rx51_probe(struct platform_device *dev)
 	return devm_rc_register_device(&dev->dev, ir_rx51.rcdev);
 }
 
-static int ir_rx51_remove(struct platform_device *dev)
-{
-	return 0;
-}
-
 static const struct of_device_id ir_rx51_match[] = {
 	{
 		.compatible = "nokia,n900-ir",
@@ -276,12 +271,11 @@ MODULE_DEVICE_TABLE(of, ir_rx51_match);
 
 static struct platform_driver ir_rx51_platform_driver = {
 	.probe		= ir_rx51_probe,
-	.remove		= ir_rx51_remove,
 	.suspend	= ir_rx51_suspend,
 	.resume		= ir_rx51_resume,
 	.driver		= {
 		.name	= KBUILD_MODNAME,
-		.of_match_table = of_match_ptr(ir_rx51_match),
+		.of_match_table = ir_rx51_match,
 	},
 };
 module_platform_driver(ir_rx51_platform_driver);

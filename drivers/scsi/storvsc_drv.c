@@ -324,8 +324,12 @@ enum storvsc_request_type {
 #define SRB_STATUS_ABORTED		0x02
 #define SRB_STATUS_ERROR		0x04
 #define SRB_STATUS_INVALID_REQUEST	0x06
+#define SRB_STATUS_TIMEOUT		0x09
+#define SRB_STATUS_SELECTION_TIMEOUT	0x0A
+#define SRB_STATUS_BUS_RESET		0x0E
 #define SRB_STATUS_DATA_OVERRUN		0x12
 #define SRB_STATUS_INVALID_LUN		0x20
+#define SRB_STATUS_INTERNAL_ERROR	0x30
 
 #define SRB_STATUS(status) \
 	(status & ~(SRB_STATUS_AUTOSENSE_VALID | SRB_STATUS_QUEUE_FROZEN))
@@ -988,6 +992,11 @@ static void storvsc_handle_error(struct vmscsi_request *vm_srb,
 	case SRB_STATUS_ERROR:
 	case SRB_STATUS_ABORTED:
 	case SRB_STATUS_INVALID_REQUEST:
+	case SRB_STATUS_INTERNAL_ERROR:
+	case SRB_STATUS_TIMEOUT:
+	case SRB_STATUS_SELECTION_TIMEOUT:
+	case SRB_STATUS_BUS_RESET:
+	case SRB_STATUS_DATA_OVERRUN:
 		if (vm_srb->srb_status & SRB_STATUS_AUTOSENSE_VALID) {
 			/* Check for capacity change */
 			if ((asc == 0x2a) && (ascq == 0x9)) {
@@ -2126,7 +2135,7 @@ static int storvsc_change_queue_depth(struct scsi_device *sdev, int queue_depth)
 	return scsi_change_queue_depth(sdev, queue_depth);
 }
 
-static int storvsc_remove(struct hv_device *dev)
+static void storvsc_remove(struct hv_device *dev)
 {
 	struct storvsc_device *stor_device = hv_get_drvdata(dev);
 	struct Scsi_Host *host = stor_device->host;
@@ -2142,8 +2151,6 @@ static int storvsc_remove(struct hv_device *dev)
 	scsi_remove_host(host);
 	storvsc_dev_remove(dev);
 	scsi_host_put(host);
-
-	return 0;
 }
 
 static int storvsc_suspend(struct hv_device *hv_dev)

@@ -58,9 +58,17 @@ const option_t on_errors_arr[] = {
 };
 
 /**
- * simple_getbool -
+ * simple_getbool - convert input string to a boolean value
+ * @s: input string to convert
+ * @setval: where to store the output boolean value
  *
  * Copied from old ntfs driver (which copied from vfat driver).
+ *
+ * "1", "yes", "true", or an empty string are converted to %true.
+ * "0", "no", and "false" are converted to %false.
+ *
+ * Return: %1 if the string is converted or was empty and *setval contains it;
+ *	   %0 if the string was not valid.
  */
 static int simple_getbool(char *s, bool *setval)
 {
@@ -1612,7 +1620,7 @@ read_partial_attrdef_page:
 		memcpy((u8*)vol->attrdef + (index++ << PAGE_SHIFT),
 				page_address(page), size);
 		ntfs_unmap_page(page);
-	};
+	}
 	if (size == PAGE_SIZE) {
 		size = i_size & ~PAGE_MASK;
 		if (size)
@@ -1681,7 +1689,7 @@ read_partial_upcase_page:
 		memcpy((char*)vol->upcase + (index++ << PAGE_SHIFT),
 				page_address(page), size);
 		ntfs_unmap_page(page);
-	};
+	}
 	if (size == PAGE_SIZE) {
 		size = i_size & ~PAGE_MASK;
 		if (size)
@@ -2657,7 +2665,7 @@ static int ntfs_write_inode(struct inode *vi, struct writeback_control *wbc)
 }
 #endif
 
-/**
+/*
  * The complete super operations.
  */
 static const struct super_operations ntfs_sops = {
@@ -3185,6 +3193,7 @@ MODULE_AUTHOR("Anton Altaparmakov <anton@tuxera.com>");
 MODULE_DESCRIPTION("NTFS 1.2/3.x driver - Copyright (c) 2001-2014 Anton Altaparmakov and Tuxera Inc.");
 MODULE_VERSION(NTFS_VERSION);
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
 #ifdef DEBUG
 module_param(debug_msgs, bint, 0);
 MODULE_PARM_DESC(debug_msgs, "Enable debug messages.");

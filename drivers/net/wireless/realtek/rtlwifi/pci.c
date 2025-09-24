@@ -2169,7 +2169,7 @@ int rtl_pci_probe(struct pci_dev *pdev,
 		err = -ENODEV;
 		goto fail2;
 	}
-	rtlpriv->cfg->ops->init_sw_leds(hw);
+	rtl_init_sw_leds(hw);
 
 	/*aspm */
 	rtl_pci_init_aspm(hw);

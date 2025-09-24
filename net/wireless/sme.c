@@ -83,6 +83,7 @@ static int cfg80211_conn_scan(struct wireless_dev *wdev)
 	if (!request)
 		return -ENOMEM;
 
+	request->n_channels = n_channels;
 	if (wdev->conn->params.channel) {
 		enum nl80211_band band = wdev->conn->params.channel->band;
 		struct ieee80211_supported_band *sband =
@@ -492,6 +493,21 @@ static void cfg80211_wdev_release_bsses(struct wireless_dev *wdev)
 	}
 }
 
+void cfg80211_wdev_release_link_bsses(struct wireless_dev *wdev, u16 link_mask)
+{
+	unsigned int link;
+
+	for_each_valid_link(wdev, link) {
+		if (!wdev->links[link].client.current_bss ||
+		    !(link_mask & BIT(link)))
+			continue;
+		cfg80211_unhold_bss(wdev->links[link].client.current_bss);
+		cfg80211_put_bss(wdev->wiphy,
+				 &wdev->links[link].client.current_bss->pub);
+		wdev->links[link].client.current_bss = NULL;
+	}
+}
+
 static int cfg80211_sme_get_conn_ies(struct wireless_dev *wdev,
 				     const u8 *ies, size_t ies_len,
 				     const u8 **out_ies, size_t *out_ies_len)
@@ -869,8 +885,7 @@ void __cfg80211_connect_result(struct net_device *dev,
 			       ETH_ALEN);
 	}
 
-	if (!(wdev->wiphy->flags & WIPHY_FLAG_HAS_STATIC_WEP))
-		cfg80211_upload_connect_keys(wdev);
+	cfg80211_upload_connect_keys(wdev);
 
 	rcu_read_lock();
 	for_each_valid_link(cr, link) {
@@ -1283,7 +1298,7 @@ out:
 EXPORT_SYMBOL(cfg80211_roamed);
 
 void __cfg80211_port_authorized(struct wireless_dev *wdev, const u8 *peer_addr,
-				const u8 *td_bitmap, u8 td_bitmap_len)
+					const u8 *td_bitmap, u8 td_bitmap_len)
 {
 	ASSERT_WDEV_LOCK(wdev);
 
@@ -1294,9 +1309,9 @@ void __cfg80211_port_authorized(struct wireless_dev *wdev, const u8 *peer_addr,
 		return;
 
 	if (wdev->iftype == NL80211_IFTYPE_STATION ||
-	    wdev->iftype == NL80211_IFTYPE_P2P_CLIENT) {
+		wdev->iftype == NL80211_IFTYPE_P2P_CLIENT) {
 		if (WARN_ON(!wdev->connected) ||
-		    WARN_ON(!ether_addr_equal(wdev->u.client.connected_addr, peer_addr)))
+			WARN_ON(!ether_addr_equal(wdev->u.client.connected_addr, peer_addr)))
 			return;
 	}
 
@@ -1499,9 +1514,6 @@ int cfg80211_connect(struct cfg80211_registered_device *rdev,
 				connect->crypto.ciphers_pairwise[0] = cipher;
 			}
 		}
-
-		connect->crypto.wep_keys = connkeys->params;
-		connect->crypto.wep_tx_key = connkeys->def;
 	} else {
 		if (WARN_ON(connkeys))
 			return -EINVAL;

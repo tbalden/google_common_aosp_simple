@@ -562,8 +562,7 @@ struct inode *qnx6_iget(struct super_block *sb, unsigned ino)
 	inode->i_mtime.tv_nsec = 0;
 	inode->i_atime.tv_sec   = fs32_to_cpu(sbi, raw_inode->di_atime);
 	inode->i_atime.tv_nsec = 0;
-	inode->i_ctime.tv_sec   = fs32_to_cpu(sbi, raw_inode->di_ctime);
-	inode->i_ctime.tv_nsec = 0;
+	inode_set_ctime(inode, fs32_to_cpu(sbi, raw_inode->di_ctime), 0);
 
 	/* calc blocks based on 512 byte blocksize */
 	inode->i_blocks = (inode->i_size + 511) >> 9;
@@ -677,3 +676,4 @@ static void __exit exit_qnx6_fs(void)
 module_init(init_qnx6_fs)
 module_exit(exit_qnx6_fs)
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);

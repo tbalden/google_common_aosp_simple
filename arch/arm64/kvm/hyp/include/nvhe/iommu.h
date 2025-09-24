@@ -1,101 +1,154 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __ARM64_KVM_NVHE_IOMMU_H__
 #define __ARM64_KVM_NVHE_IOMMU_H__
 
-#include <linux/types.h>
-#include <asm/kvm_host.h>
+#include <asm/kvm_pgtable.h>
 
-#include <nvhe/mem_protect.h>
+#include <kvm/iommu.h>
+#include <linux/io-pgtable.h>
+#include <nvhe/spinlock.h>
 
-struct pkvm_iommu;
+#if IS_ENABLED(CONFIG_ARM_SMMU_V3_PKVM)
+#include <linux/io-pgtable-arm.h>
 
-struct pkvm_iommu_ops {
-	/*
-	 * Global driver initialization called before devices are registered.
-	 * Driver-specific arguments are passed in a buffer shared by the host.
-	 * The buffer memory has been pinned in EL2 but host retains R/W access.
-	 * Extra care must be taken when reading from it to avoid TOCTOU bugs.
-	 * If the driver maintains its own page tables, it is expected to
-	 * initialize them to all memory owned by the host.
-	 * Driver initialization lock held during callback.
-	 */
-	int (*init)(void *data, size_t size);
+struct io_pgtable *kvm_arm_io_pgtable_alloc(struct io_pgtable_cfg *cfg,
+					    void *cookie,
+					    int *out_ret);
+int kvm_arm_io_pgtable_free(struct io_pgtable *iop);
+#endif /* CONFIG_ARM_SMMU_V3_PKVM */
 
-	/*
-	 * Driver-specific validation of a device that is being registered.
-	 * All fields of the device struct have been populated.
-	 * Called with the host lock held.
-	 */
-	int (*validate)(struct pkvm_iommu *dev);
+int kvm_iommu_init(struct kvm_iommu_ops *ops,
+		   struct kvm_hyp_memcache *atomic_mc,
+		   unsigned long init_arg);
+int kvm_iommu_init_device(struct kvm_hyp_iommu *iommu);
+void *kvm_iommu_donate_pages(u8 order, bool request);
+void kvm_iommu_reclaim_pages(void *p, u8 order);
+int kvm_iommu_request(struct kvm_hyp_req *req);
 
-	/*
-	 * Validation of a new child device that is being register by
-	 * the parent device the child selected. Called with the host lock held.
-	 */
-	int (*validate_child)(struct pkvm_iommu *dev, struct pkvm_iommu *child);
+#define kvm_iommu_donate_page()			kvm_iommu_donate_pages(0, true)
+#define kvm_iommu_reclaim_page(p)		kvm_iommu_reclaim_pages(p, 0)
+#define kvm_iommu_donate_pages_request(order)	kvm_iommu_donate_pages(order, true)
 
-	/*
-	 * Callback to apply a host stage-2 mapping change at driver level.
-	 * Called before 'host_stage2_idmap_apply' with host lock held.
-	 */
-	void (*host_stage2_idmap_prepare)(phys_addr_t start, phys_addr_t end,
-					  enum kvm_pgtable_prot prot);
+/* alloc/free from atomic pool. */
+void *kvm_iommu_donate_pages_atomic(u8 order);
+void kvm_iommu_reclaim_pages_atomic(void *p, u8 order);
 
-	/*
-	 * Callback to apply a host stage-2 mapping change at device level.
-	 * Called after 'host_stage2_idmap_prepare' with host lock held.
-	 */
-	void (*host_stage2_idmap_apply)(struct pkvm_iommu *dev,
-					phys_addr_t start, phys_addr_t end);
+/* Hypercall handlers */
+int kvm_iommu_alloc_domain(pkvm_handle_t domain_id, u32 type);
+int kvm_iommu_free_domain(pkvm_handle_t domain_id);
+int kvm_iommu_attach_dev(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
+			 u32 endpoint_id, u32 pasid, u32 pasid_bits);
+int kvm_iommu_detach_dev(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
+			 u32 endpoint_id, u32 pasid);
+int kvm_iommu_map_pages(pkvm_handle_t domain_id, unsigned long iova,
+			phys_addr_t paddr, size_t pgsize,
+			size_t pgcount, int prot, unsigned long *mapped);
+size_t kvm_iommu_unmap_pages(pkvm_handle_t domain_id,
+			     unsigned long iova, size_t pgsize, size_t pgcount);
+phys_addr_t kvm_iommu_iova_to_phys(pkvm_handle_t domain_id, unsigned long iova);
+bool kvm_iommu_host_dabt_handler(struct kvm_cpu_context *host_ctxt, u64 esr, u64 addr);
+void kvm_iommu_iotlb_gather_add_page(struct kvm_hyp_iommu_domain *domain,
+				     struct iommu_iotlb_gather *gather,
+				     unsigned long iova,
+				     size_t size);
+void kvm_iommu_host_stage2_idmap(phys_addr_t start, phys_addr_t end,
+				 enum kvm_pgtable_prot prot);
+int kvm_iommu_snapshot_host_stage2(struct kvm_hyp_iommu_domain *domain);
 
-	/*
-	 * Callback to finish a host stage-2 mapping change at device level.
-	 * Called after 'host_stage2_idmap_apply' with host lock held.
-	 */
-	void (*host_stage2_idmap_complete)(struct pkvm_iommu *dev);
-
-	/* Power management callbacks. Called with host lock held. */
-	int (*suspend)(struct pkvm_iommu *dev);
-	int (*resume)(struct pkvm_iommu *dev);
-
-	/*
-	 * Host data abort handler callback. Called with host lock held.
-	 * Returns true if the data abort has been handled.
-	 */
-	bool (*host_dabt_handler)(struct pkvm_iommu *dev,
-				  struct kvm_cpu_context *host_ctxt,
-				  u32 esr, size_t off);
-
-	/* Amount of memory allocated per-device for use by the driver. */
-	size_t data_size;
+#define KVM_IOMMU_PADDR_CACHE_MAX		((size_t)511)
+/**
+ * struct kvm_iommu_paddr_cache - physical address cache, passed with unmap calls
+ *  which is expected to hold all the unmapped physical addresses so the
+ *  hypervisor can keep track of available pages for donation.
+ *  It is guaranteed the unmap call will not unmap more tham KVM_IOMMU_PADDR_CACHE_MAX
+ * @ptr: Current pointer to empty entry.
+ * @paddr: Physical address.
+ * @pgsize: Size of physical address.
+ */
+struct kvm_iommu_paddr_cache {
+	unsigned short	ptr;
+	u64		paddr[KVM_IOMMU_PADDR_CACHE_MAX];
+	size_t		pgsize[KVM_IOMMU_PADDR_CACHE_MAX];
 };
 
-struct pkvm_iommu {
-	struct pkvm_iommu *parent;
-	struct list_head list;
-	struct list_head siblings;
-	struct list_head children;
-	unsigned long id;
-	const struct pkvm_iommu_ops *ops;
-	phys_addr_t pa;
-	void *va;
-	size_t size;
-	bool powered;
-	u8 flags;
-	char data[];
+void kvm_iommu_flush_unmap_cache(struct kvm_iommu_paddr_cache *cache);
+
+static inline hyp_spinlock_t *kvm_iommu_get_lock(struct kvm_hyp_iommu *iommu)
+{
+	/* See struct kvm_hyp_iommu */
+	BUILD_BUG_ON(sizeof(iommu->lock) != sizeof(hyp_spinlock_t));
+	return (hyp_spinlock_t *)(&iommu->lock);
+}
+
+static inline void kvm_iommu_lock_init(struct kvm_hyp_iommu *iommu)
+{
+	hyp_spin_lock_init(kvm_iommu_get_lock(iommu));
+}
+
+static inline void kvm_iommu_lock(struct kvm_hyp_iommu *iommu)
+{
+	hyp_spin_lock(kvm_iommu_get_lock(iommu));
+}
+
+static inline void kvm_iommu_unlock(struct kvm_hyp_iommu *iommu)
+{
+	hyp_spin_unlock(kvm_iommu_get_lock(iommu));
+}
+
+/**
+ * struct kvm_iommu_ops - KVM iommu ops
+ * @init: init the driver called once before the kernel de-privilege
+ * @get_iommu_by_id: Return kvm_hyp_iommu from an ID passed from the kernel.
+ *		     It is driver specific how the driver assign IDs.
+ * @alloc_domain: allocate iommu domain.
+ * @free_domain: free iommu domain.
+ * @attach_dev: Attach a device to a domain.
+ * @detach_dev: Detach a device from a domain.
+ * @dabt_handler: data abort for MMIO, can be used for emulating access to IOMMU.
+ * @suspend: Power suspended.
+ * @resume: Power resumed.
+ * @iotlb_sync: Sync iotlb_gather (similar to the kernel).
+ * @host_stage2_idmap: Identity map a range.
+ * @map_pages: Map pages in a domain.
+ * @unmap_pages: Unmap pages from a domain.
+ * @iova_to_phys: get physical address from IOVA in a domain.
+ */
+struct kvm_iommu_ops {
+	int (*init)(unsigned long arg);
+	struct kvm_hyp_iommu *(*get_iommu_by_id)(pkvm_handle_t smmu_id);
+	int (*alloc_domain)(struct kvm_hyp_iommu_domain *domain, u32 type);
+	void (*free_domain)(struct kvm_hyp_iommu_domain *domain);
+	int (*attach_dev)(struct kvm_hyp_iommu *iommu, struct kvm_hyp_iommu_domain *domain,
+			  u32 endpoint_id, u32 pasid, u32 pasid_bits);
+	int (*detach_dev)(struct kvm_hyp_iommu *iommu, struct kvm_hyp_iommu_domain *domain,
+			  u32 endpoint_id, u32 pasid);
+
+	bool (*dabt_handler)(struct kvm_cpu_context *host_ctxt, u64 esr, u64 addr);
+	int (*suspend)(struct kvm_hyp_iommu *iommu);
+	int (*resume)(struct kvm_hyp_iommu *iommu);
+	void (*iotlb_sync)(struct kvm_hyp_iommu_domain *domain,
+			   struct iommu_iotlb_gather *gather);
+	void (*host_stage2_idmap)(struct kvm_hyp_iommu_domain *domain,
+				  phys_addr_t start, phys_addr_t end, int prot);
+	int (*map_pages)(struct kvm_hyp_iommu_domain *domain, unsigned long iova,
+			 phys_addr_t paddr, size_t pgsize,
+			 size_t pgcount, int prot, size_t *total_mapped);
+	size_t (*unmap_pages)(struct kvm_hyp_iommu_domain *domain, unsigned long iova,
+			      size_t pgsize, size_t pgcount,
+			      struct iommu_iotlb_gather *gather,
+			      struct kvm_iommu_paddr_cache *cache);
+	phys_addr_t (*iova_to_phys)(struct kvm_hyp_iommu_domain *domain, unsigned long iova);
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
+	ANDROID_KABI_RESERVE(5);
+	ANDROID_KABI_RESERVE(6);
+	ANDROID_KABI_RESERVE(7);
+	ANDROID_KABI_RESERVE(8);
 };
 
-int __pkvm_iommu_driver_init(struct pkvm_iommu_driver *drv, void *data, size_t size);
-int __pkvm_iommu_register(unsigned long dev_id, unsigned long drv_id,
-			  phys_addr_t dev_pa, size_t dev_size,
-			  unsigned long parent_id, u8 flags,
-			  void *kern_mem_va);
-int __pkvm_iommu_pm_notify(unsigned long dev_id,
-			   enum pkvm_iommu_pm_event event);
-int __pkvm_iommu_finalize(int err);
-bool pkvm_iommu_host_dabt_handler(struct kvm_cpu_context *host_ctxt, u32 esr,
-				  phys_addr_t fault_pa);
-void pkvm_iommu_host_stage2_idmap(phys_addr_t start, phys_addr_t end,
-				  enum kvm_pgtable_prot prot);
+extern struct kvm_iommu_ops *kvm_iommu_ops;
+extern struct hyp_mgt_allocator_ops kvm_iommu_allocator_ops;
 
-#endif	/* __ARM64_KVM_NVHE_IOMMU_H__ */
+#endif /* __ARM64_KVM_NVHE_IOMMU_H__ */

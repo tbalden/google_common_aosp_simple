@@ -16,7 +16,6 @@
 #include <linux/of_address.h>
 #include <linux/of_pci.h>
 #include <linux/of_platform.h>
-#include <linux/of_irq.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/pci-ecam.h>
@@ -595,17 +594,15 @@ static int xilinx_cpm_pcie_probe(struct platform_device *pdev)
 		return err;
 
 	bus = resource_list_first_type(&bridge->windows, IORESOURCE_BUS);
-	if (!bus) {
-		err = -ENODEV;
-		goto err_free_irq_domains;
-	}
+	if (!bus)
+		return -ENODEV;
 
 	port->variant = of_device_get_match_data(dev);
 
 	err = xilinx_cpm_pcie_parse_dt(port, bus->res);
 	if (err) {
 		dev_err(dev, "Parsing DT failed\n");
-		goto err_free_irq_domains;
+		goto err_parse_dt;
 	}
 
 	xilinx_cpm_pcie_init_port(port);
@@ -629,7 +626,7 @@ err_host_bridge:
 	xilinx_cpm_free_interrupts(port);
 err_setup_irq:
 	pci_ecam_free(port->cfg);
-err_free_irq_domains:
+err_parse_dt:
 	xilinx_cpm_free_irq_domains(port);
 	return err;
 }

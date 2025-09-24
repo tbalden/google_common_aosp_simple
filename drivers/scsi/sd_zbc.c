@@ -20,6 +20,9 @@
 
 #include "sd.h"
 
+#define CREATE_TRACE_POINTS
+#include "sd_trace.h"
+
 /**
  * sd_zbc_get_zone_wp_offset - Get zone write pointer offset.
  * @zone: Zone for which to return the write pointer offset.
@@ -336,7 +339,7 @@ static blk_status_t sd_zbc_cmnd_checks(struct scsi_cmnd *cmd)
 	if (sdkp->device->changed)
 		return BLK_STS_IOERR;
 
-	if (sector & (sd_zbc_zone_sectors(sdkp) - 1))
+	if (!bdev_is_zone_start(sdkp->disk->part0, sector))
 		/* Unaligned request */
 		return BLK_STS_IOERR;
 
@@ -451,6 +454,7 @@ blk_status_t sd_zbc_prepare_zone_append(struct scsi_cmnd *cmd, sector_t *lba,
 			break;
 		}
 
+		trace_scsi_prepare_zone_append(cmd, *lba, wp_offset);
 		*lba += wp_offset;
 	}
 	spin_unlock_irqrestore(&sdkp->zones_wp_offset_lock, flags);
@@ -559,6 +563,8 @@ static unsigned int sd_zbc_zone_wp_update(struct scsi_cmnd *cmd,
 
 	switch (op) {
 	case REQ_OP_ZONE_APPEND:
+		trace_scsi_zone_wp_update(cmd, rq->__sector,
+				  sdkp->zones_wp_offset[zno], good_bytes);
 		rq->__sector += sdkp->zones_wp_offset[zno];
 		fallthrough;
 	case REQ_OP_WRITE_ZEROES:
@@ -744,13 +750,6 @@ static int sd_zbc_check_capacity(struct scsi_disk *sdkp, unsigned char *buf,
 		zone_blocks = sdkp->zone_starting_lba_gran;
 	}
 
-	if (!is_power_of_2(zone_blocks)) {
-		sd_printk(KERN_ERR, sdkp,
-			  "Zone size %llu is not a power of two.\n",
-			  zone_blocks);
-		return -EINVAL;
-	}
-
 	*zblocks = zone_blocks;
 
 	return 0;
@@ -758,10 +757,13 @@ static int sd_zbc_check_capacity(struct scsi_disk *sdkp, unsigned char *buf,
 
 static void sd_zbc_print_zones(struct scsi_disk *sdkp)
 {
+	u64 remainder;
+
 	if (!sd_is_zoned(sdkp) || !sdkp->capacity)
 		return;
 
-	if (sdkp->capacity & (sdkp->zone_info.zone_blocks - 1))
+	div64_u64_rem(sdkp->capacity, sdkp->zone_info.zone_blocks, &remainder);
+	if (remainder)
 		sd_printk(KERN_NOTICE, sdkp,
 			  "%u zones of %u logical blocks + 1 runt zone\n",
 			  sdkp->zone_info.nr_zones - 1,
@@ -824,7 +826,6 @@ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp)
 	struct request_queue *q = disk->queue;
 	u32 zone_blocks = sdkp->early_zone_info.zone_blocks;
 	unsigned int nr_zones = sdkp->early_zone_info.nr_zones;
-	u32 max_append;
 	int ret = 0;
 	unsigned int flags;
 
@@ -869,6 +870,11 @@ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp)
 		goto unlock;
 	}
 
+	blk_queue_chunk_sectors(q,
+			logical_to_sectors(sdkp->device, zone_blocks));
+	blk_queue_max_zone_append_sectors(q,
+			q->limits.max_segments << PAGE_SECTORS_SHIFT);
+
 	ret = blk_revalidate_disk_zones(disk, sd_zbc_revalidate_zones_cb);
 
 	memalloc_noio_restore(flags);
@@ -880,12 +886,6 @@ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp)
 		sdkp->capacity = 0;
 		goto unlock;
 	}
-
-	max_append = min_t(u32, logical_to_sectors(sdkp->device, zone_blocks),
-			   q->limits.max_segments << (PAGE_SHIFT - 9));
-	max_append = min_t(u32, max_append, queue_max_hw_sectors(q));
-
-	blk_queue_max_zone_append_sectors(q, max_append);
 
 	sd_zbc_print_zones(sdkp);
 
@@ -922,9 +922,10 @@ int sd_zbc_read_zones(struct scsi_disk *sdkp, u8 buf[SD_BUF_SIZE])
 		return 0;
 	}
 
-	/* READ16/WRITE16 is mandatory for ZBC disks */
+	/* READ16/WRITE16/SYNC16 is mandatory for ZBC devices */
 	sdkp->device->use_16_for_rw = 1;
 	sdkp->device->use_10_for_rw = 0;
+	sdkp->device->use_16_for_sync = 1;
 
 	if (!blk_queue_is_zoned(q)) {
 		/*
@@ -955,7 +956,7 @@ int sd_zbc_read_zones(struct scsi_disk *sdkp, u8 buf[SD_BUF_SIZE])
 	else
 		disk_set_max_open_zones(disk, sdkp->zones_max_open);
 	disk_set_max_active_zones(disk, 0);
-	nr_zones = round_up(sdkp->capacity, zone_blocks) >> ilog2(zone_blocks);
+	nr_zones = div64_u64(sdkp->capacity + zone_blocks - 1, zone_blocks);
 
 	sdkp->early_zone_info.nr_zones = nr_zones;
 	sdkp->early_zone_info.zone_blocks = zone_blocks;

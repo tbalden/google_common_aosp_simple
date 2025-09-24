@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2012 Red Hat. All rights reserved.
  *
@@ -9,6 +10,7 @@
 #include "dm-bio-record.h"
 #include "dm-cache-metadata.h"
 #include "dm-io-tracker.h"
+#include "dm-cache-background-tracker.h"
 
 #include <linux/dm-io.h>
 #include <linux/dm-kcopyd.h>
@@ -180,15 +182,15 @@ static void continue_after_commit(struct batcher *b, struct continuation *k)
  */
 static void issue_after_commit(struct batcher *b, struct bio *bio)
 {
-       bool commit_scheduled;
+	bool commit_scheduled;
 
-       spin_lock_irq(&b->lock);
-       commit_scheduled = b->commit_scheduled;
-       bio_list_add(&b->bios, bio);
-       spin_unlock_irq(&b->lock);
+	spin_lock_irq(&b->lock);
+	commit_scheduled = b->commit_scheduled;
+	bio_list_add(&b->bios, bio);
+	spin_unlock_irq(&b->lock);
 
-       if (commit_scheduled)
-	       async_commit(b);
+	if (commit_scheduled)
+		async_commit(b);
 }
 
 /*
@@ -524,13 +526,16 @@ static unsigned int lock_level(struct bio *bio)
 		READ_WRITE_LOCK_LEVEL;
 }
 
-/*----------------------------------------------------------------
+/*
+ *--------------------------------------------------------------
  * Per bio data
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------
+ */
 
 static struct per_bio_data *get_per_bio_data(struct bio *bio)
 {
 	struct per_bio_data *pb = dm_per_bio_data(bio, sizeof(struct per_bio_data));
+
 	BUG_ON(!pb);
 	return pb;
 }
@@ -687,6 +692,7 @@ static void clear_discard(struct cache *cache, dm_dblock_t b)
 static bool is_discarded(struct cache *cache, dm_dblock_t b)
 {
 	int r;
+
 	spin_lock_irq(&cache->lock);
 	r = test_bit(from_dblock(b), cache->discard_bitset);
 	spin_unlock_irq(&cache->lock);
@@ -697,6 +703,7 @@ static bool is_discarded(struct cache *cache, dm_dblock_t b)
 static bool is_discarded_oblock(struct cache *cache, dm_oblock_t b)
 {
 	int r;
+
 	spin_lock_irq(&cache->lock);
 	r = test_bit(from_dblock(oblock_to_dblock(cache, b)),
 		     cache->discard_bitset);
@@ -705,9 +712,11 @@ static bool is_discarded_oblock(struct cache *cache, dm_oblock_t b)
 	return r;
 }
 
-/*----------------------------------------------------------------
+/*
+ * -------------------------------------------------------------
  * Remapping
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------
+ */
 static void remap_to_origin(struct cache *cache, struct bio *bio)
 {
 	bio_set_dev(bio, cache->origin_dev->bdev);
@@ -809,6 +818,7 @@ static void accounted_request(struct cache *cache, struct bio *bio)
 static void issue_op(struct bio *bio, void *context)
 {
 	struct cache *cache = context;
+
 	accounted_request(cache, bio);
 }
 
@@ -833,9 +843,11 @@ static void remap_to_origin_and_cache(struct cache *cache, struct bio *bio,
 	remap_to_cache(cache, bio, cblock);
 }
 
-/*----------------------------------------------------------------
+/*
+ *--------------------------------------------------------------
  * Failure modes
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------
+ */
 static enum cache_metadata_mode get_cache_mode(struct cache *cache)
 {
 	return cache->features.mode;
@@ -848,7 +860,7 @@ static const char *cache_device_name(struct cache *cache)
 
 static void notify_mode_switch(struct cache *cache, enum cache_metadata_mode mode)
 {
-	const char *descs[] = {
+	static const char *descs[] = {
 		"write",
 		"read-only",
 		"fail"
@@ -972,13 +984,14 @@ static void update_stats(struct cache_stats *stats, enum policy_operation op)
 	}
 }
 
-/*----------------------------------------------------------------
+/*
+ *---------------------------------------------------------------------
  * Migration processing
  *
  * Migration covers moving data from the origin device to the cache, or
  * vice versa.
- *--------------------------------------------------------------*/
-
+ *---------------------------------------------------------------------
+ */
 static void inc_io_migrations(struct cache *cache)
 {
 	atomic_inc(&cache->nr_io_migrations);
@@ -1066,6 +1079,7 @@ static void quiesce(struct dm_cache_migration *mg,
 static struct dm_cache_migration *ws_to_mg(struct work_struct *ws)
 {
 	struct continuation *k = container_of(ws, struct continuation, ws);
+
 	return container_of(k, struct dm_cache_migration, k);
 }
 
@@ -1217,6 +1231,7 @@ static void mg_complete(struct dm_cache_migration *mg, bool success)
 static void mg_success(struct work_struct *ws)
 {
 	struct dm_cache_migration *mg = ws_to_mg(ws);
+
 	mg_complete(mg, mg->k.input == 0);
 }
 
@@ -1355,6 +1370,7 @@ static void mg_copy(struct work_struct *ws)
 			 * Fallback to a real full copy after doing some tidying up.
 			 */
 			bool rb = bio_detain_shared(mg->cache, mg->op->oblock, mg->overwrite_bio);
+
 			BUG_ON(rb); /* An exclussive lock must _not_ be held for this block */
 			mg->overwrite_bio = NULL;
 			inc_io_migrations(mg->cache);
@@ -1430,9 +1446,11 @@ static int mg_start(struct cache *cache, struct policy_work *op, struct bio *bio
 	return mg_lock_writes(mg);
 }
 
-/*----------------------------------------------------------------
+/*
+ *--------------------------------------------------------------
  * invalidation processing
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------
+ */
 
 static void invalidate_complete(struct dm_cache_migration *mg, bool success)
 {
@@ -1455,12 +1473,15 @@ static void invalidate_complete(struct dm_cache_migration *mg, bool success)
 static void invalidate_completed(struct work_struct *ws)
 {
 	struct dm_cache_migration *mg = ws_to_mg(ws);
+
 	invalidate_complete(mg, !mg->k.input);
 }
 
 static int invalidate_cblock(struct cache *cache, dm_cblock_t cblock)
 {
-	int r = policy_invalidate_mapping(cache->policy, cblock);
+	int r;
+
+	r = policy_invalidate_mapping(cache->policy, cblock);
 	if (!r) {
 		r = dm_cache_remove_mapping(cache->cmd, cblock);
 		if (r) {
@@ -1553,9 +1574,11 @@ static int invalidate_start(struct cache *cache, dm_cblock_t cblock,
 	return invalidate_lock(mg);
 }
 
-/*----------------------------------------------------------------
+/*
+ *--------------------------------------------------------------
  * bio processing
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------
+ */
 
 enum busy {
 	IDLE,
@@ -1763,9 +1786,11 @@ static bool process_discard_bio(struct cache *cache, struct bio *bio)
 {
 	dm_dblock_t b, e;
 
-	// FIXME: do we need to lock the region?  Or can we just assume the
-	// user wont be so foolish as to issue discard concurrently with
-	// other IO?
+	/*
+	 * FIXME: do we need to lock the region?  Or can we just assume the
+	 * user wont be so foolish as to issue discard concurrently with
+	 * other IO?
+	 */
 	calc_discard_block_range(cache, bio, &b, &e);
 	while (b != e) {
 		set_discard(cache, b);
@@ -1812,10 +1837,11 @@ static void process_deferred_bios(struct work_struct *ws)
 		schedule_commit(&cache->committer);
 }
 
-/*----------------------------------------------------------------
+/*
+ *--------------------------------------------------------------
  * Main worker loop
- *--------------------------------------------------------------*/
-
+ *--------------------------------------------------------------
+ */
 static void requeue_deferred_bios(struct cache *cache)
 {
 	struct bio *bio;
@@ -1874,9 +1900,11 @@ static void check_migrations(struct work_struct *ws)
 	}
 }
 
-/*----------------------------------------------------------------
+/*
+ *--------------------------------------------------------------
  * Target methods
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------
+ */
 
 /*
  * This function gets called on the error paths of the constructor, so we
@@ -2029,8 +2057,8 @@ static int parse_metadata_dev(struct cache_args *ca, struct dm_arg_set *as,
 	if (!at_least_one_arg(as, error))
 		return -EINVAL;
 
-	r = dm_get_device(ca->ti, dm_shift_arg(as), FMODE_READ | FMODE_WRITE,
-			  &ca->metadata_dev);
+	r = dm_get_device(ca->ti, dm_shift_arg(as),
+			  BLK_OPEN_READ | BLK_OPEN_WRITE, &ca->metadata_dev);
 	if (r) {
 		*error = "Error opening metadata device";
 		return r;
@@ -2052,8 +2080,8 @@ static int parse_cache_dev(struct cache_args *ca, struct dm_arg_set *as,
 	if (!at_least_one_arg(as, error))
 		return -EINVAL;
 
-	r = dm_get_device(ca->ti, dm_shift_arg(as), FMODE_READ | FMODE_WRITE,
-			  &ca->cache_dev);
+	r = dm_get_device(ca->ti, dm_shift_arg(as),
+			  BLK_OPEN_READ | BLK_OPEN_WRITE, &ca->cache_dev);
 	if (r) {
 		*error = "Error opening cache device";
 		return r;
@@ -2072,8 +2100,8 @@ static int parse_origin_dev(struct cache_args *ca, struct dm_arg_set *as,
 	if (!at_least_one_arg(as, error))
 		return -EINVAL;
 
-	r = dm_get_device(ca->ti, dm_shift_arg(as), FMODE_READ | FMODE_WRITE,
-			  &ca->origin_dev);
+	r = dm_get_device(ca->ti, dm_shift_arg(as),
+			  BLK_OPEN_READ | BLK_OPEN_WRITE, &ca->origin_dev);
 	if (r) {
 		*error = "Error opening origin device";
 		return r;
@@ -2240,7 +2268,7 @@ static int parse_cache_args(struct cache_args *ca, int argc, char **argv,
 
 /*----------------------------------------------------------------*/
 
-static struct kmem_cache *migration_cache;
+static struct kmem_cache *migration_cache = NULL;
 
 #define NOT_CORE_OPTION 1
 
@@ -3428,23 +3456,36 @@ static int __init dm_cache_init(void)
 	int r;
 
 	migration_cache = KMEM_CACHE(dm_cache_migration, 0);
-	if (!migration_cache)
-		return -ENOMEM;
+	if (!migration_cache) {
+		r = -ENOMEM;
+		goto err;
+	}
+
+	btracker_work_cache = kmem_cache_create("dm_cache_bt_work",
+		sizeof(struct bt_work), __alignof__(struct bt_work), 0, NULL);
+	if (!btracker_work_cache) {
+		r = -ENOMEM;
+		goto err;
+	}
 
 	r = dm_register_target(&cache_target);
 	if (r) {
-		DMERR("cache target registration failed: %d", r);
-		kmem_cache_destroy(migration_cache);
-		return r;
+		goto err;
 	}
 
 	return 0;
+
+err:
+	kmem_cache_destroy(migration_cache);
+	kmem_cache_destroy(btracker_work_cache);
+	return r;
 }
 
 static void __exit dm_cache_exit(void)
 {
 	dm_unregister_target(&cache_target);
 	kmem_cache_destroy(migration_cache);
+	kmem_cache_destroy(btracker_work_cache);
 }
 
 module_init(dm_cache_init);

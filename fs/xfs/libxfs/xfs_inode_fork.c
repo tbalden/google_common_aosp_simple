@@ -140,7 +140,8 @@ xfs_iformat_extents(
 				xfs_inode_verifier_error(ip, -EFSCORRUPTED,
 						"xfs_iformat_extents(2)",
 						dp, sizeof(*dp), fa);
-				return -EFSCORRUPTED;
+				return xfs_bmap_complain_bad_rec(ip, whichfork,
+						fa, &new);
 			}
 
 			xfs_iext_insert(ip, &icur, &new, state);
@@ -226,10 +227,15 @@ xfs_iformat_data_fork(
 
 	/*
 	 * Initialize the extent count early, as the per-format routines may
-	 * depend on it.
+	 * depend on it.  Use release semantics to set needextents /after/ we
+	 * set the format. This ensures that we can use acquire semantics on
+	 * needextents in xfs_need_iread_extents() and be guaranteed to see a
+	 * valid format value after that load.
 	 */
 	ip->i_df.if_format = dip->di_format;
 	ip->i_df.if_nextents = xfs_dfork_data_extents(dip);
+	smp_store_release(&ip->i_df.if_needextents,
+			   ip->i_df.if_format == XFS_DINODE_FMT_BTREE ? 1 : 0);
 
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFIFO:
@@ -282,8 +288,17 @@ xfs_ifork_init_attr(
 	enum xfs_dinode_fmt	format,
 	xfs_extnum_t		nextents)
 {
+	/*
+	 * Initialize the extent count early, as the per-format routines may
+	 * depend on it.  Use release semantics to set needextents /after/ we
+	 * set the format. This ensures that we can use acquire semantics on
+	 * needextents in xfs_need_iread_extents() and be guaranteed to see a
+	 * valid format value after that load.
+	 */
 	ip->i_af.if_format = format;
 	ip->i_af.if_nextents = nextents;
+	smp_store_release(&ip->i_af.if_needextents,
+			   ip->i_af.if_format == XFS_DINODE_FMT_BTREE ? 1 : 0);
 }
 
 void
@@ -434,15 +449,15 @@ xfs_iroot_realloc(
 	}
 
 	/*
-	 * Only copy the records and pointers if there are any.
+	 * Only copy the keys and pointers if there are any.
 	 */
 	if (new_max > 0) {
 		/*
-		 * First copy the records.
+		 * First copy the keys.
 		 */
-		op = (char *)XFS_BMBT_REC_ADDR(mp, ifp->if_broot, 1);
-		np = (char *)XFS_BMBT_REC_ADDR(mp, new_broot, 1);
-		memcpy(np, op, new_max * (uint)sizeof(xfs_bmbt_rec_t));
+		op = (char *)XFS_BMBT_KEY_ADDR(mp, ifp->if_broot, 1);
+		np = (char *)XFS_BMBT_KEY_ADDR(mp, new_broot, 1);
+		memcpy(np, op, new_max * (uint)sizeof(xfs_bmbt_key_t));
 
 		/*
 		 * Then copy the pointers.

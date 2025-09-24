@@ -89,9 +89,7 @@
 #include <linux/types.h>
 #include <linux/bitops.h>
 #include <linux/cred.h>
-#ifndef __GENKSYMS__
 #include <linux/errqueue.h>
-#endif
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -121,11 +119,14 @@ static int vsock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
 static void vsock_close(struct sock *sk, long timeout);
 
 /* Protocol family. */
-static struct proto vsock_proto = {
+struct proto vsock_proto = {
 	.name = "AF_VSOCK",
 	.owner = THIS_MODULE,
 	.obj_size = sizeof(struct vsock_sock),
 	.close = vsock_close,
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot = vsock_bpf_update_proto,
+#endif
 };
 
 /* The default peer timeout indicates how long we will wait for a peer response
@@ -644,8 +645,7 @@ static int __vsock_bind_connectible(struct vsock_sock *vsk,
 	struct sockaddr_vm new_addr;
 
 	if (!port)
-		port = LAST_RESERVED_PORT + 1 +
-			prandom_u32_max(U32_MAX - LAST_RESERVED_PORT);
+		port = get_random_u32_above(LAST_RESERVED_PORT);
 
 	vsock_addr_init(&new_addr, addr->svm_cid, addr->svm_port);
 
@@ -892,7 +892,7 @@ s64 vsock_stream_has_data(struct vsock_sock *vsk)
 }
 EXPORT_SYMBOL_GPL(vsock_stream_has_data);
 
-static s64 vsock_connectible_has_data(struct vsock_sock *vsk)
+s64 vsock_connectible_has_data(struct vsock_sock *vsk)
 {
 	struct sock *sk = sk_vsock(vsk);
 
@@ -904,6 +904,7 @@ static s64 vsock_connectible_has_data(struct vsock_sock *vsk)
 	else
 		return vsock_stream_has_data(vsk);
 }
+EXPORT_SYMBOL_GPL(vsock_connectible_has_data);
 
 s64 vsock_stream_has_space(struct vsock_sock *vsk)
 {
@@ -1090,6 +1091,9 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 		mask |= EPOLLRDHUP;
 	}
 
+	if (sk_is_readable(sk))
+		mask |= EPOLLIN | EPOLLRDNORM;
+
 	if (sock->type == SOCK_DGRAM) {
 		/* For datagram sockets we can read if there is something in
 		 * the queue and write as long as the socket isn't shutdown for
@@ -1175,6 +1179,16 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 	}
 
 	return mask;
+}
+
+static int vsock_read_skb(struct sock *sk, skb_read_actor_t read_actor)
+{
+	struct vsock_sock *vsk = vsock_sk(sk);
+
+	if (WARN_ON_ONCE(!vsk->transport))
+		return -ENODEV;
+
+	return vsk->transport->read_skb(vsk, read_actor);
 }
 
 static int vsock_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
@@ -1288,18 +1302,45 @@ static int vsock_dgram_connect(struct socket *sock,
 	memcpy(&vsk->remote_addr, remote_addr, sizeof(vsk->remote_addr));
 	sock->state = SS_CONNECTED;
 
+	/* sock map disallows redirection of non-TCP sockets with sk_state !=
+	 * TCP_ESTABLISHED (see sock_map_redirect_allowed()), so we set
+	 * TCP_ESTABLISHED here to allow redirection of connected vsock dgrams.
+	 *
+	 * This doesn't seem to be abnormal state for datagram sockets, as the
+	 * same approach can be see in other datagram socket types as well
+	 * (such as unix sockets).
+	 */
+	sk->sk_state = TCP_ESTABLISHED;
+
 out:
 	release_sock(sk);
 	return err;
 }
 
-static int vsock_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
-			       size_t len, int flags)
+int __vsock_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+			  size_t len, int flags)
 {
-	struct vsock_sock *vsk = vsock_sk(sock->sk);
+	struct sock *sk = sock->sk;
+	struct vsock_sock *vsk = vsock_sk(sk);
 
 	return vsk->transport->dgram_dequeue(vsk, msg, len, flags);
 }
+
+int vsock_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+			size_t len, int flags)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct sock *sk = sock->sk;
+	const struct proto *prot;
+
+	prot = READ_ONCE(sk->sk_prot);
+	if (prot != &vsock_proto)
+		return prot->recvmsg(sk, msg, len, flags, NULL);
+#endif
+
+	return __vsock_dgram_recvmsg(sock, msg, len, flags);
+}
+EXPORT_SYMBOL_GPL(vsock_dgram_recvmsg);
 
 static const struct proto_ops vsock_dgram_ops = {
 	.family = PF_VSOCK,
@@ -1317,7 +1358,7 @@ static const struct proto_ops vsock_dgram_ops = {
 	.sendmsg = vsock_dgram_sendmsg,
 	.recvmsg = vsock_dgram_recvmsg,
 	.mmap = sock_no_mmap,
-	.sendpage = sock_no_sendpage,
+	.read_skb = vsock_read_skb,
 };
 
 static int vsock_transport_cancel_pkt(struct vsock_sock *vsk)
@@ -1425,6 +1466,11 @@ static int vsock_connect(struct socket *sock, struct sockaddr *addr,
 		if (err < 0)
 			goto out;
 
+		/* sk_err might have been set as a result of an earlier
+		 * (failed) connect attempt.
+		 */
+		sk->sk_err = 0;
+
 		/* Mark sock as connecting and set the error code to in
 		 * progress in case this is a non-blocking connect.
 		 */
@@ -1439,11 +1485,7 @@ static int vsock_connect(struct socket *sock, struct sockaddr *addr,
 	timeout = vsk->connect_timeout;
 	prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
 
-	/* If the socket is already closing or it is in an error state, there
-	 * is no point in waiting.
-	 */
-	while (sk->sk_state != TCP_ESTABLISHED &&
-	       sk->sk_state != TCP_CLOSING && sk->sk_err == 0) {
+	while (sk->sk_state != TCP_ESTABLISHED && sk->sk_err == 0) {
 		if (flags & O_NONBLOCK) {
 			/* If we're not going to block, we schedule a timeout
 			 * function to generate a timeout on the connection
@@ -1911,8 +1953,9 @@ static int vsock_connectible_sendmsg(struct socket *sock, struct msghdr *msg,
 			written = transport->stream_enqueue(vsk,
 					msg, len - total_written);
 		}
+
 		if (written < 0) {
-			err = -ENOMEM;
+			err = written;
 			goto out_err;
 		}
 
@@ -2056,7 +2099,7 @@ static int __vsock_stream_recvmsg(struct sock *sk, struct msghdr *msg,
 
 		read = transport->stream_dequeue(vsk, msg, len - copied, flags);
 		if (read < 0) {
-			err = -ENOMEM;
+			err = read;
 			break;
 		}
 
@@ -2107,7 +2150,7 @@ static int __vsock_seqpacket_recvmsg(struct sock *sk, struct msghdr *msg,
 	msg_len = transport->seqpacket_dequeue(vsk, msg, flags);
 
 	if (msg_len < 0) {
-		err = -ENOMEM;
+		err = msg_len;
 		goto out;
 	}
 
@@ -2135,9 +2178,9 @@ out:
 	return err;
 }
 
-static int
-vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
-			  int flags)
+int
+__vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+			    int flags)
 {
 	struct sock *sk;
 	struct vsock_sock *vsk;
@@ -2202,6 +2245,23 @@ out:
 	return err;
 }
 
+int
+vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+			  int flags)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct sock *sk = sock->sk;
+	const struct proto *prot;
+
+	prot = READ_ONCE(sk->sk_prot);
+	if (prot != &vsock_proto)
+		return prot->recvmsg(sk, msg, len, flags, NULL);
+#endif
+
+	return __vsock_connectible_recvmsg(sock, msg, len, flags);
+}
+EXPORT_SYMBOL_GPL(vsock_connectible_recvmsg);
+
 static int vsock_set_rcvlowat(struct sock *sk, int val)
 {
 	const struct vsock_transport *transport;
@@ -2214,8 +2274,13 @@ static int vsock_set_rcvlowat(struct sock *sk, int val)
 
 	transport = vsk->transport;
 
-	if (transport && transport->set_rcvlowat)
-		return transport->set_rcvlowat(vsk, val);
+	if (transport && transport->notify_set_rcvlowat) {
+		int err;
+
+		err = transport->notify_set_rcvlowat(vsk, val);
+		if (err)
+			return err;
+	}
 
 	WRITE_ONCE(sk->sk_rcvlowat, val ? : 1);
 	return 0;
@@ -2239,8 +2304,8 @@ static const struct proto_ops vsock_stream_ops = {
 	.sendmsg = vsock_connectible_sendmsg,
 	.recvmsg = vsock_connectible_recvmsg,
 	.mmap = sock_no_mmap,
-	.sendpage = sock_no_sendpage,
 	.set_rcvlowat = vsock_set_rcvlowat,
+	.read_skb = vsock_read_skb,
 };
 
 static const struct proto_ops vsock_seqpacket_ops = {
@@ -2261,7 +2326,7 @@ static const struct proto_ops vsock_seqpacket_ops = {
 	.sendmsg = vsock_connectible_sendmsg,
 	.recvmsg = vsock_connectible_recvmsg,
 	.mmap = sock_no_mmap,
-	.sendpage = sock_no_sendpage,
+	.read_skb = vsock_read_skb,
 };
 
 static int vsock_create(struct net *net, struct socket *sock,
@@ -2400,6 +2465,8 @@ static int __init vsock_init(void)
 		       AF_VSOCK, err);
 		goto err_unregister_proto;
 	}
+
+	vsock_bpf_build_proto();
 
 	return 0;
 

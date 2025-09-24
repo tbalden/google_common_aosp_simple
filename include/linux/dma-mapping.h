@@ -63,23 +63,6 @@
 #define DMA_ATTR_PRIVILEGED		(1UL << 9)
 
 /*
- * DMA_ATTR_SYS_CACHE: used to indicate that the buffer should be mapped with
- * the correct memory attributes so that it can be cached in the system or last
- * level cache. This is useful for buffers that are being mapped for devices
- * that are non-coherent, but can use the system cache.
- */
-#define DMA_ATTR_SYS_CACHE		(1UL << 10)
-
-/*
- * DMA_ATTR_SYS_CACHE_NWA: used to indicate that the buffer should be mapped
- * with the correct memory attributes so that it can be cached in the system or
- * last level cache, with a no write allocate cache policy. This is useful for
- * buffers that are being mapped for devices that are non-coherent, but can use
- * the system cache.
- */
-#define DMA_ATTR_SYS_CACHE_NWA	(1UL << 11)
-
-/*
  * A dma_addr_t can hold any valid DMA or bus address for the platform.  It can
  * be given to a device to use as a DMA source or target.  It is specific to a
  * given device and there may be a translation between the CPU physical address
@@ -434,6 +417,8 @@ static inline void dma_sync_sgtable_for_device(struct device *dev,
 #define dma_unmap_page(d, a, s, r) dma_unmap_page_attrs(d, a, s, r, 0)
 #define dma_get_sgtable(d, t, v, h, s) dma_get_sgtable_attrs(d, t, v, h, s, 0)
 #define dma_mmap_coherent(d, v, c, h, s) dma_mmap_attrs(d, v, c, h, s, 0)
+
+bool dma_coherent_ok(struct device *dev, phys_addr_t phys, size_t size);
 
 static inline void *dma_alloc_coherent(struct device *dev, size_t size,
 		dma_addr_t *dma_handle, gfp_t gfp)

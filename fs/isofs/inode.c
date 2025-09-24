@@ -1436,13 +1436,8 @@ static int isofs_read_inode(struct inode *inode, int relocated)
 			inode->i_ino, de->flags[-high_sierra]);
 	}
 #endif
-
-	inode->i_mtime.tv_sec =
-	inode->i_atime.tv_sec =
-	inode->i_ctime.tv_sec = iso_date(de->date, high_sierra);
-	inode->i_mtime.tv_nsec =
-	inode->i_atime.tv_nsec =
-	inode->i_ctime.tv_nsec = 0;
+	inode->i_mtime = inode->i_atime =
+		inode_set_ctime(inode, iso_date(de->date, high_sierra), 0);
 
 	ei->i_first_extent = (isonum_733(de->extent) +
 			isonum_711(de->ext_attr_length));
@@ -1624,3 +1619,4 @@ static void __exit exit_iso9660_fs(void)
 module_init(init_iso9660_fs)
 module_exit(exit_iso9660_fs)
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);

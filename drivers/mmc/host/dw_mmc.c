@@ -1362,7 +1362,7 @@ static void __dw_mci_start_request(struct dw_mci *host,
 		 * is just about to roll over.
 		 *
 		 * We do this whole thing under spinlock and only if the
-		 * command hasn't already completed (indicating the the irq
+		 * command hasn't already completed (indicating the irq
 		 * already ran so we don't want the timeout).
 		 */
 		spin_lock_irqsave(&host->irq_lock, irqflags);
@@ -1857,7 +1857,7 @@ static void dw_mci_start_fault_timer(struct dw_mci *host)
 	 * Try to inject the error at random points during the data transfer.
 	 */
 	hrtimer_start(&host->fault_timer,
-		      ms_to_ktime(prandom_u32_max(25)),
+		      ms_to_ktime(get_random_u32_below(25)),
 		      HRTIMER_MODE_REL);
 }
 

@@ -1301,7 +1301,7 @@ static struct buffer_head *ext4_get_bitmap(struct super_block *sb, __u64 block)
 	if (unlikely(!bh))
 		return NULL;
 	if (!bh_uptodate_or_lock(bh)) {
-		if (ext4_read_bh(bh, 0, NULL) < 0) {
+		if (ext4_read_bh(bh, 0, NULL, false) < 0) {
 			brelse(bh);
 			return NULL;
 		}
@@ -1311,7 +1311,6 @@ static struct buffer_head *ext4_get_bitmap(struct super_block *sb, __u64 block)
 }
 
 static int ext4_set_bitmap_checksums(struct super_block *sb,
-				     ext4_group_t group,
 				     struct ext4_group_desc *gdp,
 				     struct ext4_new_group_data *group_data)
 {
@@ -1323,14 +1322,14 @@ static int ext4_set_bitmap_checksums(struct super_block *sb,
 	bh = ext4_get_bitmap(sb, group_data->inode_bitmap);
 	if (!bh)
 		return -EIO;
-	ext4_inode_bitmap_csum_set(sb, group, gdp, bh,
+	ext4_inode_bitmap_csum_set(sb, gdp, bh,
 				   EXT4_INODES_PER_GROUP(sb) / 8);
 	brelse(bh);
 
 	bh = ext4_get_bitmap(sb, group_data->block_bitmap);
 	if (!bh)
 		return -EIO;
-	ext4_block_bitmap_csum_set(sb, group, gdp, bh);
+	ext4_block_bitmap_csum_set(sb, gdp, bh);
 	brelse(bh);
 
 	return 0;
@@ -1368,7 +1367,7 @@ static int ext4_setup_new_descs(handle_t *handle, struct super_block *sb,
 		memset(gdp, 0, EXT4_DESC_SIZE(sb));
 		ext4_block_bitmap_set(sb, gdp, group_data->block_bitmap);
 		ext4_inode_bitmap_set(sb, gdp, group_data->inode_bitmap);
-		err = ext4_set_bitmap_checksums(sb, group, gdp, group_data);
+		err = ext4_set_bitmap_checksums(sb, gdp, group_data);
 		if (err) {
 			ext4_std_error(sb, err);
 			break;
@@ -1846,7 +1845,6 @@ int ext4_group_extend(struct super_block *sb, struct ext4_super_block *es,
 	ext4_grpblk_t last;
 	ext4_grpblk_t add;
 	struct buffer_head *bh;
-	int err;
 	ext4_group_t group;
 
 	o_blocks_count = ext4_blocks_count(es);
@@ -1901,8 +1899,7 @@ int ext4_group_extend(struct super_block *sb, struct ext4_super_block *es,
 	}
 	brelse(bh);
 
-	err = ext4_group_extend_no_check(sb, o_blocks_count, add);
-	return err;
+	return ext4_group_extend_no_check(sb, o_blocks_count, add);
 } /* ext4_group_extend */
 
 

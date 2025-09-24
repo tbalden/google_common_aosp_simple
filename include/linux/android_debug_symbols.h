@@ -8,16 +8,24 @@
 #define _ANDROID_DEBUG_SYMBOLS_H
 
 enum android_debug_symbol {
-	ADS_SDATA = 0,
-	ADS_BSS_END,
-	ADS_PER_CPU_START,
+	ADS_PER_CPU_START = 0,
 	ADS_PER_CPU_END,
 	ADS_TEXT,
 	ADS_SEND,
-	ADS_LINUX_BANNER,
-	ADS_TOTAL_CMA,
-	ADS_SLAB_CACHES,
-	ADS_SLAB_MUTEX,
+	ADS_MEM_BLOCK,
+	ADS_INIT_MM,
+	ADS_ITERATE_SUPERS,
+	ADS_DROP_SLAB,
+	ADS_FREE_PAGES,
+	ADS_COMPACT_PAGES,
+	ADS_SHOW_MEM, /* for debugging memory usage */
+	ADS_TOTAL_CMA, /* for debugging total cma pages */
+	ADS_SLAB_CACHES, /* for debugging slab */
+	ADS_SLAB_MUTEX, /* for debugging slab */
+#ifndef __GENKSYMS__
+	ADS_START_RO_AFTER_INIT,
+	ADS_END_RO_AFTER_INIT,
+#endif
 	ADS_END
 };
 

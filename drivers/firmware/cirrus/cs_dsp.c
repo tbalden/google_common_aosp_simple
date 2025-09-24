@@ -14,6 +14,7 @@
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
@@ -301,6 +302,7 @@ struct cs_dsp_ops {
 static const struct cs_dsp_ops cs_dsp_adsp1_ops;
 static const struct cs_dsp_ops cs_dsp_adsp2_ops[];
 static const struct cs_dsp_ops cs_dsp_halo_ops;
+static const struct cs_dsp_ops cs_dsp_halo_ao_ops;
 
 struct cs_dsp_buf {
 	struct list_head list;
@@ -369,7 +371,7 @@ const char *cs_dsp_mem_region_name(unsigned int type)
 		return NULL;
 	}
 }
-EXPORT_SYMBOL_GPL(cs_dsp_mem_region_name);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_mem_region_name, FW_CS_DSP);
 
 #ifdef CONFIG_DEBUG_FS
 static void cs_dsp_debugfs_save_wmfwname(struct cs_dsp *dsp, const char *s)
@@ -456,6 +458,33 @@ static const struct {
 	},
 };
 
+static int cs_dsp_coeff_base_reg(struct cs_dsp_coeff_ctl *ctl, unsigned int *reg,
+				 unsigned int off);
+
+static int cs_dsp_debugfs_read_controls_show(struct seq_file *s, void *ignored)
+{
+	struct cs_dsp *dsp = s->private;
+	struct cs_dsp_coeff_ctl *ctl;
+	unsigned int reg;
+
+	list_for_each_entry(ctl, &dsp->ctl_list, list) {
+		cs_dsp_coeff_base_reg(ctl, &reg, 0);
+		seq_printf(s, "%22.*s: %#8zx %s:%08x %#8x %s %#8x %#4x %c%c%c%c %s %s\n",
+			   ctl->subname_len, ctl->subname, ctl->len,
+			   cs_dsp_mem_region_name(ctl->alg_region.type),
+			   ctl->offset, reg, ctl->fw_name, ctl->alg_region.alg, ctl->type,
+			   ctl->flags & WMFW_CTL_FLAG_VOLATILE ? 'V' : '-',
+			   ctl->flags & WMFW_CTL_FLAG_SYS ? 'S' : '-',
+			   ctl->flags & WMFW_CTL_FLAG_READABLE ? 'R' : '-',
+			   ctl->flags & WMFW_CTL_FLAG_WRITEABLE ? 'W' : '-',
+			   ctl->enabled ? "enabled" : "disabled",
+			   ctl->set ? "dirty" : "clean");
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(cs_dsp_debugfs_read_controls);
+
 /**
  * cs_dsp_init_debugfs() - Create and populate DSP representation in debugfs
  * @dsp: pointer to DSP structure
@@ -478,9 +507,12 @@ void cs_dsp_init_debugfs(struct cs_dsp *dsp, struct dentry *debugfs_root)
 		debugfs_create_file(cs_dsp_debugfs_fops[i].name, 0444, root,
 				    dsp, &cs_dsp_debugfs_fops[i].fops);
 
+	debugfs_create_file("controls", 0444, root, dsp,
+			    &cs_dsp_debugfs_read_controls_fops);
+
 	dsp->debugfs_root = root;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_init_debugfs);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_init_debugfs, FW_CS_DSP);
 
 /**
  * cs_dsp_cleanup_debugfs() - Removes DSP representation from debugfs
@@ -492,17 +524,17 @@ void cs_dsp_cleanup_debugfs(struct cs_dsp *dsp)
 	debugfs_remove_recursive(dsp->debugfs_root);
 	dsp->debugfs_root = ERR_PTR(-ENODEV);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_cleanup_debugfs);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_cleanup_debugfs, FW_CS_DSP);
 #else
 void cs_dsp_init_debugfs(struct cs_dsp *dsp, struct dentry *debugfs_root)
 {
 }
-EXPORT_SYMBOL_GPL(cs_dsp_init_debugfs);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_init_debugfs, FW_CS_DSP);
 
 void cs_dsp_cleanup_debugfs(struct cs_dsp *dsp)
 {
 }
-EXPORT_SYMBOL_GPL(cs_dsp_cleanup_debugfs);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_cleanup_debugfs, FW_CS_DSP);
 
 static inline void cs_dsp_debugfs_save_wmfwname(struct cs_dsp *dsp,
 						const char *s)
@@ -710,7 +742,7 @@ int cs_dsp_coeff_write_acked_control(struct cs_dsp_coeff_ctl *ctl, unsigned int 
 
 	return -ETIMEDOUT;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_coeff_write_acked_control);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_coeff_write_acked_control, FW_CS_DSP);
 
 static int cs_dsp_coeff_write_ctrl_raw(struct cs_dsp_coeff_ctl *ctl,
 				       unsigned int off, const void *buf, size_t len)
@@ -752,7 +784,7 @@ static int cs_dsp_coeff_write_ctrl_raw(struct cs_dsp_coeff_ctl *ctl,
  *
  * Must be called with pwr_lock held.
  *
- * Return: Zero for success, a negative number on error.
+ * Return: < 0 on error, 1 when the control value changed and 0 when it has not.
  */
 int cs_dsp_coeff_write_ctrl(struct cs_dsp_coeff_ctl *ctl,
 			    unsigned int off, const void *buf, size_t len)
@@ -770,18 +802,25 @@ int cs_dsp_coeff_write_ctrl(struct cs_dsp_coeff_ctl *ctl,
 	if (len + off * sizeof(u32) > ctl->len)
 		return -EINVAL;
 
-	if (ctl->flags & WMFW_CTL_FLAG_VOLATILE)
+	if (ctl->flags & WMFW_CTL_FLAG_VOLATILE) {
 		ret = -EPERM;
-	else if (buf != ctl->cache)
-		memcpy(ctl->cache + off * sizeof(u32), buf, len);
+	} else if (buf != ctl->cache) {
+		if (memcmp(ctl->cache + off * sizeof(u32), buf, len))
+			memcpy(ctl->cache + off * sizeof(u32), buf, len);
+		else
+			return 0;
+	}
 
 	ctl->set = 1;
 	if (ctl->enabled && ctl->dsp->running)
 		ret = cs_dsp_coeff_write_ctrl_raw(ctl, off, buf, len);
 
-	return ret;
+	if (ret < 0)
+		return ret;
+
+	return 1;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_coeff_write_ctrl);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_coeff_write_ctrl, FW_CS_DSP);
 
 static int cs_dsp_coeff_read_ctrl_raw(struct cs_dsp_coeff_ctl *ctl,
 				      unsigned int off, void *buf, size_t len)
@@ -853,7 +892,7 @@ int cs_dsp_coeff_read_ctrl(struct cs_dsp_coeff_ctl *ctl,
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_coeff_read_ctrl);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_coeff_read_ctrl, FW_CS_DSP);
 
 static int cs_dsp_coeff_init_control_caches(struct cs_dsp *dsp)
 {
@@ -1386,6 +1425,9 @@ static int cs_dsp_load(struct cs_dsp *dsp, const struct firmware *firmware,
 	int regions = 0;
 	int ret, offset, type;
 
+	if (!firmware)
+		return 0;
+
 	ret = -EINVAL;
 
 	if (sizeof(*header) >= firmware->size) {
@@ -1520,8 +1562,8 @@ static int cs_dsp_load(struct cs_dsp *dsp, const struct firmware *firmware,
 				goto out_fw;
 			}
 
-			ret = regmap_raw_write_async(regmap, reg, buf->buf,
-						     le32_to_cpu(region->len));
+			ret = regmap_raw_write(regmap, reg, buf->buf,
+					       le32_to_cpu(region->len));
 			if (ret != 0) {
 				cs_dsp_err(dsp,
 					   "%s.%d: Failed to write %d bytes at %d in %s: %d\n",
@@ -1536,12 +1578,6 @@ static int cs_dsp_load(struct cs_dsp *dsp, const struct firmware *firmware,
 		regions++;
 	}
 
-	ret = regmap_async_complete(regmap);
-	if (ret != 0) {
-		cs_dsp_err(dsp, "Failed to complete async write: %d\n", ret);
-		goto out_fw;
-	}
-
 	if (pos > firmware->size)
 		cs_dsp_warn(dsp, "%s.%d: %zu bytes at end of file\n",
 			    file, regions, pos - firmware->size);
@@ -1549,7 +1585,6 @@ static int cs_dsp_load(struct cs_dsp *dsp, const struct firmware *firmware,
 	cs_dsp_debugfs_save_wmfwname(dsp, file);
 
 out_fw:
-	regmap_async_complete(regmap);
 	cs_dsp_buf_free(&buf_list);
 	kfree(text);
 
@@ -1591,7 +1626,7 @@ struct cs_dsp_coeff_ctl *cs_dsp_get_ctl(struct cs_dsp *dsp, const char *name, in
 
 	return rslt;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_get_ctl);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_get_ctl, FW_CS_DSP);
 
 static void cs_dsp_ctl_fixup_base(struct cs_dsp *dsp,
 				  const struct cs_dsp_alg_region *alg_region)
@@ -1681,7 +1716,7 @@ struct cs_dsp_alg_region *cs_dsp_find_alg_region(struct cs_dsp *dsp,
 
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_find_alg_region);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_find_alg_region, FW_CS_DSP);
 
 static struct cs_dsp_alg_region *cs_dsp_create_region(struct cs_dsp *dsp,
 						      int type, __be32 id,
@@ -2115,10 +2150,10 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
 		goto out_fw;
 	}
 
-	cs_dsp_dbg(dsp, "%s: v%d.%d.%d\n", file,
-		   (le32_to_cpu(hdr->ver) >> 16) & 0xff,
-		   (le32_to_cpu(hdr->ver) >>  8) & 0xff,
-		   le32_to_cpu(hdr->ver) & 0xff);
+	cs_dsp_info(dsp, "%s: v%d.%d.%d\n", file,
+		    (le32_to_cpu(hdr->ver) >> 16) & 0xff,
+		    (le32_to_cpu(hdr->ver) >>  8) & 0xff,
+		    le32_to_cpu(hdr->ver) & 0xff);
 
 	pos = le32_to_cpu(hdr->len);
 
@@ -2190,6 +2225,7 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
 				   file, blocks, le32_to_cpu(blk->len),
 				   type, le32_to_cpu(blk->id));
 
+			region_name = cs_dsp_mem_region_name(type);
 			mem = cs_dsp_find_region(dsp, type);
 			if (!mem) {
 				cs_dsp_err(dsp, "No base for region %x\n", type);
@@ -2213,8 +2249,8 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
 				reg = dsp->ops->region_to_reg(mem, reg);
 				reg += offset;
 			} else {
-				cs_dsp_err(dsp, "No %x for algorithm %x\n",
-					   type, le32_to_cpu(blk->id));
+				cs_dsp_err(dsp, "No %s for algorithm %x\n",
+					   region_name, le32_to_cpu(blk->id));
 			}
 			break;
 
@@ -2244,8 +2280,8 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
 			cs_dsp_dbg(dsp, "%s.%d: Writing %d bytes at %x\n",
 				   file, blocks, le32_to_cpu(blk->len),
 				   reg);
-			ret = regmap_raw_write_async(regmap, reg, buf->buf,
-						     le32_to_cpu(blk->len));
+			ret = regmap_raw_write(regmap, reg, buf->buf,
+					       le32_to_cpu(blk->len));
 			if (ret != 0) {
 				cs_dsp_err(dsp,
 					   "%s.%d: Failed to write to %x in %s: %d\n",
@@ -2257,10 +2293,6 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
 		blocks++;
 	}
 
-	ret = regmap_async_complete(regmap);
-	if (ret != 0)
-		cs_dsp_err(dsp, "Failed to complete async write: %d\n", ret);
-
 	if (pos > firmware->size)
 		cs_dsp_warn(dsp, "%s.%d: %zu bytes at end of file\n",
 			    file, blocks, pos - firmware->size);
@@ -2268,7 +2300,6 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
 	cs_dsp_debugfs_save_binname(dsp, file);
 
 out_fw:
-	regmap_async_complete(regmap);
 	cs_dsp_buf_free(&buf_list);
 	kfree(text);
 
@@ -2323,7 +2354,7 @@ int cs_dsp_adsp1_init(struct cs_dsp *dsp)
 
 	return cs_dsp_common_init(dsp);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_adsp1_init);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_adsp1_init, FW_CS_DSP);
 
 /**
  * cs_dsp_adsp1_power_up() - Load and start the named firmware
@@ -2415,7 +2446,7 @@ err_mutex:
 	mutex_unlock(&dsp->pwr_lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_adsp1_power_up);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_adsp1_power_up, FW_CS_DSP);
 
 /**
  * cs_dsp_adsp1_power_down() - Halts the DSP
@@ -2447,7 +2478,7 @@ void cs_dsp_adsp1_power_down(struct cs_dsp *dsp)
 
 	mutex_unlock(&dsp->pwr_lock);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_adsp1_power_down);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_adsp1_power_down, FW_CS_DSP);
 
 static int cs_dsp_adsp2v2_enable_core(struct cs_dsp *dsp)
 {
@@ -2480,8 +2511,8 @@ static int cs_dsp_adsp2_enable_core(struct cs_dsp *dsp)
 {
 	int ret;
 
-	ret = regmap_update_bits_async(dsp->regmap, dsp->base + ADSP2_CONTROL,
-				       ADSP2_SYS_ENA, ADSP2_SYS_ENA);
+	ret = regmap_update_bits(dsp->regmap, dsp->base + ADSP2_CONTROL,
+				 ADSP2_SYS_ENA, ADSP2_SYS_ENA);
 	if (ret != 0)
 		return ret;
 
@@ -2599,7 +2630,7 @@ int cs_dsp_set_dspclk(struct cs_dsp *dsp, unsigned int freq)
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_set_dspclk);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_set_dspclk, FW_CS_DSP);
 
 static void cs_dsp_stop_watchdog(struct cs_dsp *dsp)
 {
@@ -2689,7 +2720,7 @@ err_mutex:
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_power_up);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_power_up, FW_CS_DSP);
 
 /**
  * cs_dsp_power_down() - Powers-down the DSP
@@ -2723,7 +2754,7 @@ void cs_dsp_power_down(struct cs_dsp *dsp)
 
 	cs_dsp_dbg(dsp, "Shutdown complete\n");
 }
-EXPORT_SYMBOL_GPL(cs_dsp_power_down);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_power_down, FW_CS_DSP);
 
 static int cs_dsp_adsp2_start_core(struct cs_dsp *dsp)
 {
@@ -2809,7 +2840,7 @@ err:
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_run);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_run, FW_CS_DSP);
 
 /**
  * cs_dsp_stop() - Stops the firmware
@@ -2848,7 +2879,7 @@ void cs_dsp_stop(struct cs_dsp *dsp)
 
 	cs_dsp_dbg(dsp, "Execution stopped\n");
 }
-EXPORT_SYMBOL_GPL(cs_dsp_stop);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_stop, FW_CS_DSP);
 
 static int cs_dsp_halo_start_core(struct cs_dsp *dsp)
 {
@@ -2910,7 +2941,7 @@ int cs_dsp_adsp2_init(struct cs_dsp *dsp)
 
 	return cs_dsp_common_init(dsp);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_adsp2_init);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_adsp2_init, FW_CS_DSP);
 
 /**
  * cs_dsp_halo_init() - Initialise a cs_dsp structure representing a HALO Core DSP
@@ -2920,11 +2951,14 @@ EXPORT_SYMBOL_GPL(cs_dsp_adsp2_init);
  */
 int cs_dsp_halo_init(struct cs_dsp *dsp)
 {
-	dsp->ops = &cs_dsp_halo_ops;
+	if (dsp->no_core_startstop)
+		dsp->ops = &cs_dsp_halo_ao_ops;
+	else
+		dsp->ops = &cs_dsp_halo_ops;
 
 	return cs_dsp_common_init(dsp);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_halo_init);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_halo_init, FW_CS_DSP);
 
 /**
  * cs_dsp_remove() - Clean a cs_dsp before deletion
@@ -2944,7 +2978,7 @@ void cs_dsp_remove(struct cs_dsp *dsp)
 		cs_dsp_free_ctl_blk(ctl);
 	}
 }
-EXPORT_SYMBOL_GPL(cs_dsp_remove);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_remove, FW_CS_DSP);
 
 /**
  * cs_dsp_read_raw_data_block() - Reads a block of data from DSP memory
@@ -2981,7 +3015,7 @@ int cs_dsp_read_raw_data_block(struct cs_dsp *dsp, int mem_type, unsigned int me
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_read_raw_data_block);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_read_raw_data_block, FW_CS_DSP);
 
 /**
  * cs_dsp_read_data_word() - Reads a word from DSP memory
@@ -3005,7 +3039,7 @@ int cs_dsp_read_data_word(struct cs_dsp *dsp, int mem_type, unsigned int mem_add
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_read_data_word);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_read_data_word, FW_CS_DSP);
 
 /**
  * cs_dsp_write_data_word() - Writes a word to DSP memory
@@ -3031,7 +3065,7 @@ int cs_dsp_write_data_word(struct cs_dsp *dsp, int mem_type, unsigned int mem_ad
 
 	return regmap_raw_write(dsp->regmap, reg, &val, sizeof(val));
 }
-EXPORT_SYMBOL_GPL(cs_dsp_write_data_word);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_write_data_word, FW_CS_DSP);
 
 /**
  * cs_dsp_remove_padding() - Convert unpacked words to packed bytes
@@ -3055,7 +3089,7 @@ void cs_dsp_remove_padding(u32 *buf, int nwords)
 		*pack_out++ = (u8)(word >> 16);
 	}
 }
-EXPORT_SYMBOL_GPL(cs_dsp_remove_padding);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_remove_padding, FW_CS_DSP);
 
 /**
  * cs_dsp_adsp2_bus_error() - Handle a DSP bus error interrupt
@@ -3125,7 +3159,7 @@ void cs_dsp_adsp2_bus_error(struct cs_dsp *dsp)
 error:
 	mutex_unlock(&dsp->pwr_lock);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_adsp2_bus_error);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_adsp2_bus_error, FW_CS_DSP);
 
 /**
  * cs_dsp_halo_bus_error() - Handle a DSP bus error interrupt
@@ -3185,7 +3219,7 @@ void cs_dsp_halo_bus_error(struct cs_dsp *dsp)
 exit_unlock:
 	mutex_unlock(&dsp->pwr_lock);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_halo_bus_error);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_halo_bus_error, FW_CS_DSP);
 
 /**
  * cs_dsp_halo_wdt_expire() - Handle DSP watchdog expiry
@@ -3205,7 +3239,7 @@ void cs_dsp_halo_wdt_expire(struct cs_dsp *dsp)
 
 	mutex_unlock(&dsp->pwr_lock);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_halo_wdt_expire);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_halo_wdt_expire, FW_CS_DSP);
 
 static const struct cs_dsp_ops cs_dsp_adsp1_ops = {
 	.validate_version = cs_dsp_validate_version,
@@ -3286,6 +3320,14 @@ static const struct cs_dsp_ops cs_dsp_halo_ops = {
 	.stop_core = cs_dsp_halo_stop_core,
 };
 
+static const struct cs_dsp_ops cs_dsp_halo_ao_ops = {
+	.parse_sizes = cs_dsp_adsp2_parse_sizes,
+	.validate_version = cs_dsp_halo_validate_version,
+	.setup_algs = cs_dsp_halo_setup_algs,
+	.region_to_reg = cs_dsp_halo_region_to_reg,
+	.show_fw_status = cs_dsp_halo_show_fw_status,
+};
+
 /**
  * cs_dsp_chunk_write() - Format data to a DSP memory chunk
  * @ch: Pointer to the chunk structure
@@ -3327,7 +3369,7 @@ int cs_dsp_chunk_write(struct cs_dsp_chunk *ch, int nbits, u32 val)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_chunk_write);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_chunk_write, FW_CS_DSP);
 
 /**
  * cs_dsp_chunk_flush() - Pad remaining data with zero and commit to chunk
@@ -3346,7 +3388,7 @@ int cs_dsp_chunk_flush(struct cs_dsp_chunk *ch)
 
 	return cs_dsp_chunk_write(ch, CS_DSP_DATA_WORD_BITS - ch->cachebits, 0);
 }
-EXPORT_SYMBOL_GPL(cs_dsp_chunk_flush);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_chunk_flush, FW_CS_DSP);
 
 /**
  * cs_dsp_chunk_read() - Parse data from a DSP memory chunk
@@ -3388,7 +3430,7 @@ int cs_dsp_chunk_read(struct cs_dsp_chunk *ch, int nbits)
 
 	return result;
 }
-EXPORT_SYMBOL_GPL(cs_dsp_chunk_read);
+EXPORT_SYMBOL_NS_GPL(cs_dsp_chunk_read, FW_CS_DSP);
 
 MODULE_DESCRIPTION("Cirrus Logic DSP Support");
 MODULE_AUTHOR("Simon Trimmer <simont@opensource.cirrus.com>");

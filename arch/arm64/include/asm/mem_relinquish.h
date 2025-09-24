@@ -9,7 +9,6 @@
 
 struct page;
 
-bool kvm_has_memrelinquish_services(void);
 void page_relinquish(struct page *page);
 void post_page_relinquish_tlb_inv(void);
 

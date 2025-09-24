@@ -511,7 +511,7 @@ static void ib_device_release(struct device *device)
 	kfree_rcu(dev, rcu_head);
 }
 
-static int ib_device_uevent(struct device *device,
+static int ib_device_uevent(const struct device *device,
 			    struct kobj_uevent_env *env)
 {
 	if (add_uevent_var(env, "NAME=%s", dev_name(device)))
@@ -524,9 +524,9 @@ static int ib_device_uevent(struct device *device,
 	return 0;
 }
 
-static const void *net_namespace(struct device *d)
+static const void *net_namespace(const struct device *d)
 {
-	struct ib_core_device *coredev =
+	const struct ib_core_device *coredev =
 			container_of(d, struct ib_core_device, dev);
 
 	return read_pnet(&coredev->rdma_net);
@@ -543,8 +543,6 @@ static struct class ib_class = {
 static void rdma_init_coredev(struct ib_core_device *coredev,
 			      struct ib_device *dev, struct net *net)
 {
-	bool is_full_dev = &dev->coredev == coredev;
-
 	/* This BUILD_BUG_ON is intended to catch layout change
 	 * of union of ib_core_device and device.
 	 * dev must be the first element as ib_core and providers
@@ -556,13 +554,6 @@ static void rdma_init_coredev(struct ib_core_device *coredev,
 
 	coredev->dev.class = &ib_class;
 	coredev->dev.groups = dev->groups;
-
-	/*
-	 * Don't expose hw counters outside of the init namespace.
-	 */
-	if (!is_full_dev && dev->hw_stats_attr_index)
-		coredev->dev.groups[dev->hw_stats_attr_index] = NULL;
-
 	device_initialize(&coredev->dev);
 	coredev->owner = dev;
 	INIT_LIST_HEAD(&coredev->port_list);
@@ -2175,15 +2166,12 @@ int ib_device_set_netdev(struct ib_device *ib_dev, struct net_device *ndev,
 		return 0;
 	}
 
-	if (ndev)
-		dev_hold(ndev);
 	rcu_assign_pointer(pdata->netdev, ndev);
+	netdev_put(old_ndev, &pdata->netdev_tracker);
+	netdev_hold(ndev, &pdata->netdev_tracker, GFP_ATOMIC);
 	spin_unlock_irqrestore(&pdata->netdev_lock, flags);
 
 	add_ndev_hash(pdata);
-	if (old_ndev)
-		dev_put(old_ndev);
-
 	return 0;
 }
 EXPORT_SYMBOL(ib_device_set_netdev);
@@ -2215,7 +2203,7 @@ static void free_netdevs(struct ib_device *ib_dev)
 			 * comparisons after the put
 			 */
 			rcu_assign_pointer(pdata->netdev, NULL);
-			dev_put(ndev);
+			netdev_put(ndev, &pdata->netdev_tracker);
 		}
 		spin_unlock_irqrestore(&pdata->netdev_lock, flags);
 	}
@@ -2242,8 +2230,7 @@ struct net_device *ib_device_get_netdev(struct ib_device *ib_dev,
 		spin_lock(&pdata->netdev_lock);
 		res = rcu_dereference_protected(
 			pdata->netdev, lockdep_is_held(&pdata->netdev_lock));
-		if (res)
-			dev_hold(res);
+		dev_hold(res);
 		spin_unlock(&pdata->netdev_lock);
 	}
 
@@ -2318,9 +2305,7 @@ void ib_enum_roce_netdev(struct ib_device *ib_dev,
 
 			if (filter(ib_dev, port, idev, filter_cookie))
 				cb(ib_dev, port, idev, cookie);
-
-			if (idev)
-				dev_put(idev);
+			dev_put(idev);
 		}
 }
 

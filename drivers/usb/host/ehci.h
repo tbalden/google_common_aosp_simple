@@ -207,6 +207,7 @@ struct ehci_hcd {			/* one per controller */
 	unsigned		has_fsl_port_bug:1; /* FreeScale */
 	unsigned		has_fsl_hs_errata:1;	/* Freescale HS quirk */
 	unsigned		has_fsl_susp_errata:1;	/* NXP SUSP quirk */
+	unsigned		has_ci_pec_bug:1;	/* ChipIdea PEC bug */
 	unsigned		big_endian_mmio:1;
 	unsigned		big_endian_desc:1;
 	unsigned		big_endian_capbase:1;
@@ -471,7 +472,7 @@ struct ehci_iso_sched {
  * acts like a qh would, if EHCI had them for ISO.
  */
 struct ehci_iso_stream {
-	/* first field matches ehci_hq, but is NULL */
+	/* first field matches ehci_qh, but is NULL */
 	struct ehci_qh_hw	*hw;
 
 	u8			bEndpointAddress;
@@ -713,7 +714,7 @@ ehci_port_speed(struct ehci_hcd *ehci, unsigned int portsc)
  * when frame babble is detected.
  */
 #define ehci_has_ci_pec_bug(e, portsc) \
-	((e)->has_fsl_port_bug && ((e)->command & CMD_PSE) \
+	((e)->has_ci_pec_bug && ((e)->command & CMD_PSE) \
 	 && !(portsc & PORT_PEC) && !(portsc & PORT_PE))
 
 /*

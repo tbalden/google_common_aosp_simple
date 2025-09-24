@@ -333,19 +333,20 @@ static int mtk_cpufreq_hw_driver_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int mtk_cpufreq_hw_driver_remove(struct platform_device *pdev)
+static void mtk_cpufreq_hw_driver_remove(struct platform_device *pdev)
 {
-	return cpufreq_unregister_driver(&cpufreq_mtk_hw_driver);
+	cpufreq_unregister_driver(&cpufreq_mtk_hw_driver);
 }
 
 static const struct of_device_id mtk_cpufreq_hw_match[] = {
 	{ .compatible = "mediatek,cpufreq-hw", .data = &cpufreq_mtk_offsets },
 	{}
 };
+MODULE_DEVICE_TABLE(of, mtk_cpufreq_hw_match);
 
 static struct platform_driver mtk_cpufreq_hw_driver = {
 	.probe = mtk_cpufreq_hw_driver_probe,
-	.remove = mtk_cpufreq_hw_driver_remove,
+	.remove_new = mtk_cpufreq_hw_driver_remove,
 	.driver = {
 		.name = "mtk-cpufreq-hw",
 		.of_match_table = mtk_cpufreq_hw_match,

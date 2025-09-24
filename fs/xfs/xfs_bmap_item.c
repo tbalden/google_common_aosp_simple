@@ -24,6 +24,7 @@
 #include "xfs_error.h"
 #include "xfs_log_priv.h"
 #include "xfs_log_recover.h"
+#include "xfs_ag.h"
 
 struct kmem_cache	*xfs_bui_cache;
 struct kmem_cache	*xfs_bud_cache;
@@ -283,24 +284,24 @@ xfs_bmap_update_diff_items(
 /* Set the map extent flags for this mapping. */
 static void
 xfs_trans_set_bmap_flags(
-	struct xfs_map_extent		*bmap,
+	struct xfs_map_extent		*map,
 	enum xfs_bmap_intent_type	type,
 	int				whichfork,
 	xfs_exntst_t			state)
 {
-	bmap->me_flags = 0;
+	map->me_flags = 0;
 	switch (type) {
 	case XFS_BMAP_MAP:
 	case XFS_BMAP_UNMAP:
-		bmap->me_flags = type;
+		map->me_flags = type;
 		break;
 	default:
 		ASSERT(0);
 	}
 	if (state == XFS_EXT_UNWRITTEN)
-		bmap->me_flags |= XFS_BMAP_EXTENT_UNWRITTEN;
+		map->me_flags |= XFS_BMAP_EXTENT_UNWRITTEN;
 	if (whichfork == XFS_ATTR_FORK)
-		bmap->me_flags |= XFS_BMAP_EXTENT_ATTR_FORK;
+		map->me_flags |= XFS_BMAP_EXTENT_ATTR_FORK;
 }
 
 /* Log bmap updates in the intent item. */
@@ -308,7 +309,7 @@ STATIC void
 xfs_bmap_update_log_item(
 	struct xfs_trans		*tp,
 	struct xfs_bui_log_item		*buip,
-	struct xfs_bmap_intent		*bmap)
+	struct xfs_bmap_intent		*bi)
 {
 	uint				next_extent;
 	struct xfs_map_extent		*map;
@@ -324,12 +325,12 @@ xfs_bmap_update_log_item(
 	next_extent = atomic_inc_return(&buip->bui_next_extent) - 1;
 	ASSERT(next_extent < buip->bui_format.bui_nextents);
 	map = &buip->bui_format.bui_extents[next_extent];
-	map->me_owner = bmap->bi_owner->i_ino;
-	map->me_startblock = bmap->bi_bmap.br_startblock;
-	map->me_startoff = bmap->bi_bmap.br_startoff;
-	map->me_len = bmap->bi_bmap.br_blockcount;
-	xfs_trans_set_bmap_flags(map, bmap->bi_type, bmap->bi_whichfork,
-			bmap->bi_bmap.br_state);
+	map->me_owner = bi->bi_owner->i_ino;
+	map->me_startblock = bi->bi_bmap.br_startblock;
+	map->me_startoff = bi->bi_bmap.br_startoff;
+	map->me_len = bi->bi_bmap.br_blockcount;
+	xfs_trans_set_bmap_flags(map, bi->bi_type, bi->bi_whichfork,
+			bi->bi_bmap.br_state);
 }
 
 static struct xfs_log_item *
@@ -341,15 +342,15 @@ xfs_bmap_update_create_intent(
 {
 	struct xfs_mount		*mp = tp->t_mountp;
 	struct xfs_bui_log_item		*buip = xfs_bui_init(mp);
-	struct xfs_bmap_intent		*bmap;
+	struct xfs_bmap_intent		*bi;
 
 	ASSERT(count == XFS_BUI_MAX_FAST_EXTENTS);
 
 	xfs_trans_add_item(tp, &buip->bui_item);
 	if (sort)
 		list_sort(mp, items, xfs_bmap_update_diff_items);
-	list_for_each_entry(bmap, items, bi_list)
-		xfs_bmap_update_log_item(tp, buip, bmap);
+	list_for_each_entry(bi, items, bi_list)
+		xfs_bmap_update_log_item(tp, buip, bi);
 	return &buip->bui_item;
 }
 
@@ -361,6 +362,34 @@ xfs_bmap_update_create_done(
 	unsigned int			count)
 {
 	return &xfs_trans_get_bud(tp, BUI_ITEM(intent))->bud_item;
+}
+
+/* Take a passive ref to the AG containing the space we're mapping. */
+void
+xfs_bmap_update_get_group(
+	struct xfs_mount	*mp,
+	struct xfs_bmap_intent	*bi)
+{
+	xfs_agnumber_t		agno;
+
+	agno = XFS_FSB_TO_AGNO(mp, bi->bi_bmap.br_startblock);
+
+	/*
+	 * Bump the intent count on behalf of the deferred rmap and refcount
+	 * intent items that that we can queue when we finish this bmap work.
+	 * This new intent item will bump the intent count before the bmap
+	 * intent drops the intent count, ensuring that the intent count
+	 * remains nonzero across the transaction roll.
+	 */
+	bi->bi_pag = xfs_perag_intent_get(mp, agno);
+}
+
+/* Release a passive AG ref after finishing mapping work. */
+static inline void
+xfs_bmap_update_put_group(
+	struct xfs_bmap_intent	*bi)
+{
+	xfs_perag_intent_put(bi->bi_pag);
 }
 
 /* Process a deferred rmap update. */
@@ -381,6 +410,8 @@ xfs_bmap_update_finish_item(
 		ASSERT(bi->bi_type == XFS_BMAP_UNMAP);
 		return -EAGAIN;
 	}
+
+	xfs_bmap_update_put_group(bi);
 	kmem_cache_free(xfs_bmap_intent_cache, bi);
 	return error;
 }
@@ -393,15 +424,17 @@ xfs_bmap_update_abort_intent(
 	xfs_bui_release(BUI_ITEM(intent));
 }
 
-/* Cancel a deferred rmap update. */
+/* Cancel a deferred bmap update. */
 STATIC void
 xfs_bmap_update_cancel_item(
 	struct list_head		*item)
 {
-	struct xfs_bmap_intent		*bmap;
+	struct xfs_bmap_intent		*bi;
 
-	bmap = container_of(item, struct xfs_bmap_intent, bi_list);
-	kmem_cache_free(xfs_bmap_intent_cache, bmap);
+	bi = container_of(item, struct xfs_bmap_intent, bi_list);
+
+	xfs_bmap_update_put_group(bi);
+	kmem_cache_free(xfs_bmap_intent_cache, bi);
 }
 
 const struct xfs_defer_op_type xfs_bmap_update_defer_type = {
@@ -419,18 +452,18 @@ xfs_bui_validate(
 	struct xfs_mount		*mp,
 	struct xfs_bui_log_item		*buip)
 {
-	struct xfs_map_extent		*bmap;
+	struct xfs_map_extent		*map;
 
 	/* Only one mapping operation per BUI... */
 	if (buip->bui_format.bui_nextents != XFS_BUI_MAX_FAST_EXTENTS)
 		return false;
 
-	bmap = &buip->bui_format.bui_extents[0];
+	map = &buip->bui_format.bui_extents[0];
 
-	if (bmap->me_flags & ~XFS_BMAP_EXTENT_FLAGS)
+	if (map->me_flags & ~XFS_BMAP_EXTENT_FLAGS)
 		return false;
 
-	switch (bmap->me_flags & XFS_BMAP_EXTENT_TYPE_MASK) {
+	switch (map->me_flags & XFS_BMAP_EXTENT_TYPE_MASK) {
 	case XFS_BMAP_MAP:
 	case XFS_BMAP_UNMAP:
 		break;
@@ -438,13 +471,13 @@ xfs_bui_validate(
 		return false;
 	}
 
-	if (!xfs_verify_ino(mp, bmap->me_owner))
+	if (!xfs_verify_ino(mp, map->me_owner))
 		return false;
 
-	if (!xfs_verify_fileext(mp, bmap->me_startoff, bmap->me_len))
+	if (!xfs_verify_fileext(mp, map->me_startoff, map->me_len))
 		return false;
 
-	return xfs_verify_fsbext(mp, bmap->me_startblock, bmap->me_len);
+	return xfs_verify_fsbext(mp, map->me_startblock, map->me_len);
 }
 
 /*
@@ -453,11 +486,12 @@ xfs_bui_validate(
  */
 STATIC int
 xfs_bui_item_recover(
-	struct xfs_log_item		*lip,
+	struct xfs_defer_pending	*dfp,
 	struct list_head		*capture_list)
 {
 	struct xfs_bmap_intent		fake = { };
 	struct xfs_trans_res		resv;
+	struct xfs_log_item		*lip = dfp->dfp_intent;
 	struct xfs_bui_log_item		*buip = BUI_ITEM(lip);
 	struct xfs_trans		*tp;
 	struct xfs_inode		*ip = NULL;
@@ -490,6 +524,8 @@ xfs_bui_item_recover(
 		goto err_rele;
 
 	budp = xfs_trans_get_bud(tp, buip);
+	xlog_recover_transfer_intent(tp, dfp);
+
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
 	xfs_trans_ijoin(tp, ip, 0);
 
@@ -511,10 +547,12 @@ xfs_bui_item_recover(
 	fake.bi_bmap.br_state = (map->me_flags & XFS_BMAP_EXTENT_UNWRITTEN) ?
 			XFS_EXT_UNWRITTEN : XFS_EXT_NORM;
 
+	xfs_bmap_update_get_group(mp, &fake);
 	error = xfs_trans_log_finish_bmap_update(tp, budp, &fake);
 	if (error == -EFSCORRUPTED)
 		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp, map,
 				sizeof(*map));
+	xfs_bmap_update_put_group(&fake);
 	if (error)
 		goto err_cancel;
 
@@ -560,18 +598,18 @@ xfs_bui_item_relog(
 {
 	struct xfs_bud_log_item		*budp;
 	struct xfs_bui_log_item		*buip;
-	struct xfs_map_extent		*extp;
+	struct xfs_map_extent		*map;
 	unsigned int			count;
 
 	count = BUI_ITEM(intent)->bui_format.bui_nextents;
-	extp = BUI_ITEM(intent)->bui_format.bui_extents;
+	map = BUI_ITEM(intent)->bui_format.bui_extents;
 
 	tp->t_flags |= XFS_TRANS_DIRTY;
 	budp = xfs_trans_get_bud(tp, BUI_ITEM(intent));
 	set_bit(XFS_LI_DIRTY, &budp->bud_item.li_flags);
 
 	buip = xfs_bui_init(tp->t_mountp);
-	memcpy(buip->bui_format.bui_extents, extp, count * sizeof(*extp));
+	memcpy(buip->bui_format.bui_extents, map, count * sizeof(*map));
 	atomic_set(&buip->bui_next_extent, count);
 	xfs_trans_add_item(tp, &buip->bui_item);
 	set_bit(XFS_LI_DIRTY, &buip->bui_item.li_flags);
@@ -646,12 +684,9 @@ xlog_recover_bui_commit_pass2(
 	buip = xfs_bui_init(mp);
 	xfs_bui_copy_format(&buip->bui_format, bui_formatp);
 	atomic_set(&buip->bui_next_extent, bui_formatp->bui_nextents);
-	/*
-	 * Insert the intent into the AIL directly and drop one reference so
-	 * that finishing or canceling the work will drop the other.
-	 */
-	xfs_trans_ail_insert(log->l_ailp, &buip->bui_item, lsn);
-	xfs_bui_release(buip);
+
+	xlog_recover_intent_item(log, &buip->bui_item, lsn,
+			XFS_DEFER_OPS_TYPE_BMAP);
 	return 0;
 }
 

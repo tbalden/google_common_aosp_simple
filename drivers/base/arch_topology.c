@@ -227,8 +227,10 @@ static ssize_t cpu_capacity_show(struct device *dev,
 				 char *buf)
 {
 	struct cpu *cpu = container_of(dev, struct cpu, dev);
+	unsigned long capacity = topology_get_cpu_scale(cpu->dev.id);
 
-	return sysfs_emit(buf, "%lu\n", topology_get_cpu_scale(cpu->dev.id));
+	trace_android_rvh_cpu_capacity_show(&capacity, cpu->dev.id);
+	return sysfs_emit(buf, "%lu\n", capacity);
 }
 
 static void update_topology_flags_workfn(struct work_struct *work);
@@ -756,7 +758,7 @@ void update_siblings_masks(unsigned int cpuid)
 
 	ret = detect_cache_attributes(cpuid);
 	if (ret && ret != -ENOENT)
-		pr_info("Early cacheinfo failed, ret = %d\n", ret);
+		pr_info("Early cacheinfo allocation failed, ret = %d\n", ret);
 
 	/* update core and thread sibling masks */
 	for_each_online_cpu(cpu) {
@@ -845,7 +847,7 @@ __weak int __init parse_acpi_topology(void)
 #if defined(CONFIG_ARM64) || defined(CONFIG_RISCV)
 void __init init_cpu_topology(void)
 {
-	int ret;
+	int cpu, ret;
 
 	reset_cpu_topology();
 	ret = parse_acpi_topology();
@@ -855,9 +857,18 @@ void __init init_cpu_topology(void)
 	if (ret) {
 		/*
 		 * Discard anything that was parsed if we hit an error so we
-		 * don't use partial information.
+		 * don't use partial information. But do not return yet to give
+		 * arch-specific early cache level detection a chance to run.
 		 */
 		reset_cpu_topology();
+	}
+
+	for_each_possible_cpu(cpu) {
+		ret = fetch_cache_info(cpu);
+		if (!ret)
+			continue;
+		else if (ret != -ENOENT)
+			pr_err("Early cacheinfo failed, ret = %d\n", ret);
 		return;
 	}
 }

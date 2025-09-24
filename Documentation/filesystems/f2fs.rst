@@ -205,6 +205,7 @@ fault_type=%d		 Support configuring fault injection type, should be
 			 FAULT_LOCK_OP                    0x000020000
 			 FAULT_BLKADDR_VALIDITY           0x000040000
 			 FAULT_BLKADDR_CONSISTENCE        0x000080000
+			 FAULT_NO_SEGMENT                 0x000100000
 			 ===========================      ===========
 mode=%s			 Control block allocation mode which supports "adaptive"
 			 and "lfs". In "lfs" mode, there should be no random
@@ -227,8 +228,6 @@ mode=%s			 Control block allocation mode which supports "adaptive"
 			 option for more randomness.
 			 Please, use these options for your experiments and we strongly
 			 recommend to re-format the filesystem after using these options.
-io_bits=%u		 Set the bit size of write IO requests. It should be set
-			 with "mode=lfs".
 usrquota		 Enable plain user disk quota accounting.
 grpquota		 Enable plain group disk quota accounting.
 prjquota		 Enable plain project quota accounting.
@@ -350,6 +349,22 @@ age_extent_cache	 Enable an age extent cache based on rb-tree. It records
 			 data block update frequency of the extent per inode, in
 			 order to provide better temperature hints for data block
 			 allocation.
+errors=%s		 Specify f2fs behavior on critical errors. This supports modes:
+			 "panic", "continue" and "remount-ro", respectively, trigger
+			 panic immediately, continue without doing anything, and remount
+			 the partition in read-only mode. By default it uses "continue"
+			 mode.
+			 ====================== =============== =============== ========
+			 mode			continue	remount-ro	panic
+			 ====================== =============== =============== ========
+			 access ops		normal		normal		N/A
+			 syscall errors		-EIO		-EROFS		N/A
+			 mount option		rw		ro		N/A
+			 pending dir write	keep		keep		N/A
+			 pending non-dir write	drop		keep		N/A
+			 pending node write	drop		keep		N/A
+			 pending meta write	keep		keep		N/A
+			 ====================== =============== =============== ========
 ======================== ============================================================
 
 Debugfs Entries
@@ -463,7 +478,7 @@ Note: please refer to the manpage of dump.f2fs(8) to get full option list.
 
 sload.f2fs
 ----------
-The sload.f2fs gives a way to insert files and directories in the exisiting disk
+The sload.f2fs gives a way to insert files and directories in the existing disk
 image. This tool is useful when building f2fs images given compiled files.
 
 Note: please refer to the manpage of sload.f2fs(8) to get full option list.
@@ -759,6 +774,35 @@ In order to identify whether the data in the victim segment are valid or not,
 F2FS manages a bitmap. Each bit represents the validity of a block, and the
 bitmap is composed of a bit stream covering whole blocks in main area.
 
+Write-hint Policy
+-----------------
+
+F2FS sets the whint all the time with the below policy.
+
+===================== ======================== ===================
+User                  F2FS                     Block
+===================== ======================== ===================
+N/A                   META                     WRITE_LIFE_NONE|REQ_META
+N/A                   HOT_NODE                 WRITE_LIFE_NONE
+N/A                   WARM_NODE                WRITE_LIFE_MEDIUM
+N/A                   COLD_NODE                WRITE_LIFE_LONG
+ioctl(COLD)           COLD_DATA                WRITE_LIFE_EXTREME
+extension list        "                        "
+
+-- buffered io
+N/A                   COLD_DATA                WRITE_LIFE_EXTREME
+N/A                   HOT_DATA                 WRITE_LIFE_SHORT
+N/A                   WARM_DATA                WRITE_LIFE_NOT_SET
+
+-- direct io
+WRITE_LIFE_EXTREME    COLD_DATA                WRITE_LIFE_EXTREME
+WRITE_LIFE_SHORT      HOT_DATA                 WRITE_LIFE_SHORT
+WRITE_LIFE_NOT_SET    WARM_DATA                WRITE_LIFE_NOT_SET
+WRITE_LIFE_NONE       "                        WRITE_LIFE_NONE
+WRITE_LIFE_MEDIUM     "                        WRITE_LIFE_MEDIUM
+WRITE_LIFE_LONG       "                        WRITE_LIFE_LONG
+===================== ======================== ===================
+
 Fallocate(2) Policy
 -------------------
 
@@ -775,7 +819,7 @@ Allocating disk space
     as a method of optimally implementing that function.
 
 However, once F2FS receives ioctl(fd, F2FS_IOC_SET_PIN_FILE) in prior to
-fallocate(fd, DEFAULT_MODE), it allocates on-disk block addressess having
+fallocate(fd, DEFAULT_MODE), it allocates on-disk block addresses having
 zero or random data, which is useful to the below scenario where:
 
  1. create(fd)
@@ -899,3 +943,47 @@ NVMe Zoned Namespace devices
   can start before the zone-capacity and span across zone-capacity boundary.
   Such spanning segments are also considered as usable segments. All blocks
   past the zone-capacity are considered unusable in these segments.
+
+Device aliasing feature
+-----------------------
+
+f2fs can utilize a special file called a "device aliasing file." This file allows
+the entire storage device to be mapped with a single, large extent, not using
+the usual f2fs node structures. This mapped area is pinned and primarily intended
+for holding the space.
+
+Essentially, this mechanism allows a portion of the f2fs area to be temporarily
+reserved and used by another filesystem or for different purposes. Once that
+external usage is complete, the device aliasing file can be deleted, releasing
+the reserved space back to F2FS for its own use.
+
+<use-case>
+
+# ls /dev/vd*
+/dev/vdb (32GB) /dev/vdc (32GB)
+# mkfs.ext4 /dev/vdc
+# mkfs.f2fs -c /dev/vdc@vdc.file /dev/vdb
+# mount /dev/vdb /mnt/f2fs
+# ls -l /mnt/f2fs
+vdc.file
+# df -h
+/dev/vdb                            64G   33G   32G  52% /mnt/f2fs
+
+# mount -o loop /dev/vdc /mnt/ext4
+# df -h
+/dev/vdb                            64G   33G   32G  52% /mnt/f2fs
+/dev/loop7                          32G   24K   30G   1% /mnt/ext4
+# umount /mnt/ext4
+
+# f2fs_io getflags /mnt/f2fs/vdc.file
+get a flag on /mnt/f2fs/vdc.file ret=0, flags=nocow(pinned),immutable
+# f2fs_io setflags noimmutable /mnt/f2fs/vdc.file
+get a flag on noimmutable ret=0, flags=800010
+set a flag on /mnt/f2fs/vdc.file ret=0, flags=noimmutable
+# rm /mnt/f2fs/vdc.file
+# df -h
+/dev/vdb                            64G  753M   64G   2% /mnt/f2fs
+
+So, the key idea is, user can do any file operations on /dev/vdc, and
+reclaim the space after the use, while the space is counted as /data.
+That doesn't require modifying partition size and filesystem format.

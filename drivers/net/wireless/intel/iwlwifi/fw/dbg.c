@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2005-2014, 2018-2021 Intel Corporation
+ * Copyright (C) 2005-2014, 2018-2023 Intel Corporation
  * Copyright (C) 2013-2015 Intel Mobile Communications GmbH
  * Copyright (C) 2015-2017 Intel Deutschland GmbH
  */
@@ -559,71 +559,41 @@ static void iwl_dump_prph(struct iwl_fw_runtime *fwrt,
 }
 
 /*
- * alloc_sgtable - allocates (chained) scatterlist in the given size,
- *	fills it with pages and returns it
+ * alloc_sgtable - allocates scallerlist table in the given size,
+ * fills it with pages and returns it
  * @size: the size (in bytes) of the table
- */
-static struct scatterlist *alloc_sgtable(ssize_t size)
+*/
+static struct scatterlist *alloc_sgtable(int size)
 {
-	struct scatterlist *result = NULL, *prev;
-	int nents, i, n_prev;
+	int alloc_size, nents, i;
+	struct page *new_page;
+	struct scatterlist *iter;
+	struct scatterlist *table;
 
 	nents = DIV_ROUND_UP(size, PAGE_SIZE);
-
-#define N_ENTRIES_PER_PAGE (PAGE_SIZE / sizeof(*result))
-	/*
-	 * We need an additional entry for table chaining,
-	 * this ensures the loop can finish i.e. we can
-	 * fit at least two entries per page (obviously,
-	 * many more really fit.)
-	 */
-	BUILD_BUG_ON(N_ENTRIES_PER_PAGE < 2);
-
-	while (nents > 0) {
-		struct scatterlist *new, *iter;
-		int n_fill, n_alloc;
-
-		if (nents <= N_ENTRIES_PER_PAGE) {
-			/* last needed table */
-			n_fill = nents;
-			n_alloc = nents;
-			nents = 0;
-		} else {
-			/* fill a page with entries */
-			n_alloc = N_ENTRIES_PER_PAGE;
-			/* reserve one for chaining */
-			n_fill = n_alloc - 1;
-			nents -= n_fill;
-		}
-
-		new = kcalloc(n_alloc, sizeof(*new), GFP_KERNEL);
-		if (!new) {
-			if (result)
-				_devcd_free_sgtable(result);
+	table = kcalloc(nents, sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return NULL;
+	sg_init_table(table, nents);
+	iter = table;
+	for_each_sg(table, iter, sg_nents(table), i) {
+		new_page = alloc_page(GFP_KERNEL);
+		if (!new_page) {
+			/* release all previous allocated pages in the table */
+			iter = table;
+			for_each_sg(table, iter, sg_nents(table), i) {
+				new_page = sg_page(iter);
+				if (new_page)
+					__free_page(new_page);
+			}
+			kfree(table);
 			return NULL;
 		}
-		sg_init_table(new, n_alloc);
-
-		if (!result)
-			result = new;
-		else
-			sg_chain(prev, n_prev, new);
-		prev = new;
-		n_prev = n_alloc;
-
-		for_each_sg(new, iter, n_fill, i) {
-			struct page *new_page = alloc_page(GFP_KERNEL);
-
-			if (!new_page) {
-				_devcd_free_sgtable(result);
-				return NULL;
-			}
-
-			sg_set_page(iter, new_page, PAGE_SIZE, 0);
-		}
+		alloc_size = min_t(int, size, PAGE_SIZE);
+		size -= PAGE_SIZE;
+		sg_set_page(iter, new_page, alloc_size, 0);
 	}
-
-	return result;
+	return table;
 }
 
 static void iwl_fw_get_prph_len(struct iwl_fw_runtime *fwrt,
@@ -1068,7 +1038,7 @@ iwl_dump_ini_prph_mac_iter(struct iwl_fw_runtime *fwrt,
 	range->range_data_size = reg->dev_addr.size;
 	for (i = 0; i < le32_to_cpu(reg->dev_addr.size); i += 4) {
 		prph_val = iwl_read_prph(fwrt->trans, addr + i);
-		if ((prph_val & ~0xf) == 0xa5a5a5a0)
+		if (iwl_trans_is_hw_error_value(prph_val))
 			return -EBUSY;
 		*val++ = cpu_to_le32(prph_val);
 	}
@@ -1592,7 +1562,7 @@ iwl_dump_ini_dbgi_sram_iter(struct iwl_fw_runtime *fwrt,
 		prph_data = iwl_read_prph_no_grab(fwrt->trans, (i % 2) ?
 					  DBGI_SRAM_TARGET_ACCESS_RDATA_MSB :
 					  DBGI_SRAM_TARGET_ACCESS_RDATA_LSB);
-		if ((prph_data & ~0xf) == 0xa5a5a5a0) {
+		if (iwl_trans_is_hw_error_value(prph_data)) {
 			iwl_trans_release_nic_access(fwrt->trans);
 			return -EBUSY;
 		}
@@ -2064,7 +2034,6 @@ static u32
 iwl_dump_ini_imr_get_size(struct iwl_fw_runtime *fwrt,
 			  struct iwl_dump_ini_region_data *reg_data)
 {
-	u32 size = 0;
 	u32 ranges = 0;
 	u32 imr_enable = fwrt->trans->dbg.imr_data.imr_enable;
 	u32 imr_size = fwrt->trans->dbg.imr_data.imr_size;
@@ -2074,17 +2043,16 @@ iwl_dump_ini_imr_get_size(struct iwl_fw_runtime *fwrt,
 		IWL_DEBUG_INFO(fwrt,
 			       "WRT: Invalid imr data enable: %d, imr_size: %d, sram_size: %d\n",
 			       imr_enable, imr_size, sram_size);
-		return size;
-	}
-	size = imr_size;
-	ranges = iwl_dump_ini_imr_ranges(fwrt, reg_data);
-	if (!size && !ranges) {
-		IWL_ERR(fwrt, "WRT: imr_size :=%d, ranges :=%d\n", size, ranges);
 		return 0;
 	}
-	size += sizeof(struct iwl_fw_ini_error_dump) +
+	ranges = iwl_dump_ini_imr_ranges(fwrt, reg_data);
+	if (!ranges) {
+		IWL_ERR(fwrt, "WRT: ranges :=%d\n", ranges);
+		return 0;
+	}
+	imr_size += sizeof(struct iwl_fw_ini_error_dump) +
 		ranges * sizeof(struct iwl_fw_ini_error_dump_range);
-	return size;
+	return imr_size;
 }
 
 /**
@@ -2353,6 +2321,36 @@ static u32 iwl_dump_ini_info(struct iwl_fw_runtime *fwrt,
 	return entry->size;
 }
 
+static u32 iwl_dump_ini_file_name_info(struct iwl_fw_runtime *fwrt,
+				       struct list_head *list)
+{
+	struct iwl_fw_ini_dump_entry *entry;
+	struct iwl_dump_file_name_info *tlv;
+	u32 len = strnlen(fwrt->trans->dbg.dump_file_name_ext,
+			  IWL_FW_INI_MAX_NAME);
+
+	if (!fwrt->trans->dbg.dump_file_name_ext_valid)
+		return 0;
+
+	entry = vzalloc(sizeof(*entry) + sizeof(*tlv) + len);
+	if (!entry)
+		return 0;
+
+	entry->size = sizeof(*tlv) + len;
+
+	tlv = (void *)entry->data;
+	tlv->type = cpu_to_le32(IWL_INI_DUMP_NAME_TYPE);
+	tlv->len = cpu_to_le32(len);
+	memcpy(tlv->data, fwrt->trans->dbg.dump_file_name_ext, len);
+
+	/* add the dump file name extension tlv to the list */
+	list_add_tail(&entry->list, list);
+
+	fwrt->trans->dbg.dump_file_name_ext_valid = false;
+
+	return entry->size;
+}
+
 static const struct iwl_dump_ini_mem_ops iwl_dump_ini_region_ops[] = {
 	[IWL_FW_INI_REGION_INVALID] = {},
 	[IWL_FW_INI_REGION_INTERNAL_BUFFER] = {
@@ -2528,8 +2526,10 @@ static u32 iwl_dump_ini_trigger(struct iwl_fw_runtime *fwrt,
 		size += iwl_dump_ini_mem(fwrt, list, &reg_data,
 					 &iwl_dump_ini_region_ops[IWL_FW_INI_REGION_DRAM_IMR]);
 
-	if (size)
+	if (size) {
+		size += iwl_dump_ini_file_name_info(fwrt, list);
 		size += iwl_dump_ini_info(fwrt, trigger, list);
+	}
 
 	return size;
 }
@@ -3155,6 +3155,51 @@ static int iwl_fw_dbg_restart_recording(struct iwl_trans *trans,
 	return 0;
 }
 
+int iwl_fw_send_timestamp_marker_cmd(struct iwl_fw_runtime *fwrt)
+{
+	struct iwl_mvm_marker marker = {
+		.dw_len = sizeof(struct iwl_mvm_marker) / 4,
+		.marker_id = MARKER_ID_SYNC_CLOCK,
+	};
+	struct iwl_host_cmd hcmd = {
+		.flags = CMD_ASYNC,
+		.id = WIDE_ID(LONG_GROUP, MARKER_CMD),
+		.dataflags = {},
+	};
+	struct iwl_mvm_marker_rsp *resp;
+	int cmd_ver = iwl_fw_lookup_cmd_ver(fwrt->fw,
+					    WIDE_ID(LONG_GROUP, MARKER_CMD),
+					    IWL_FW_CMD_VER_UNKNOWN);
+	int ret;
+
+	if (cmd_ver == 1) {
+		/* the real timestamp is taken from the ftrace clock
+		 * this is for finding the match between fw and kernel logs
+		 */
+		marker.timestamp = cpu_to_le64(fwrt->timestamp.seq++);
+	} else if (cmd_ver == 2) {
+		marker.timestamp = cpu_to_le64(ktime_get_boottime_ns());
+	} else {
+		IWL_DEBUG_INFO(fwrt,
+			       "Invalid version of Marker CMD. Ver = %d\n",
+			       cmd_ver);
+		return -EINVAL;
+	}
+
+	hcmd.data[0] = &marker;
+	hcmd.len[0] = sizeof(marker);
+
+	ret = iwl_trans_send_cmd(fwrt->trans, &hcmd);
+
+	if (cmd_ver > 1 && hcmd.resp_pkt) {
+		resp = (void *)hcmd.resp_pkt->data;
+		IWL_DEBUG_INFO(fwrt, "FW GP2 time: %u\n",
+			       le32_to_cpu(resp->gp2));
+	}
+
+	return ret;
+}
+
 void iwl_fw_dbg_stop_restart_recording(struct iwl_fw_runtime *fwrt,
 				       struct iwl_fw_dbg_params *params,
 				       bool stop)
@@ -3165,12 +3210,15 @@ void iwl_fw_dbg_stop_restart_recording(struct iwl_fw_runtime *fwrt,
 		return;
 
 	if (fw_has_capa(&fwrt->fw->ucode_capa,
-			IWL_UCODE_TLV_CAPA_DBG_SUSPEND_RESUME_CMD_SUPP))
+			IWL_UCODE_TLV_CAPA_DBG_SUSPEND_RESUME_CMD_SUPP)) {
+		if (stop)
+			iwl_fw_send_timestamp_marker_cmd(fwrt);
 		ret = iwl_fw_dbg_suspend_resume_hcmd(fwrt->trans, stop);
-	else if (stop)
+	} else if (stop) {
 		iwl_fw_dbg_stop_recording(fwrt->trans, params);
-	else
+	} else {
 		ret = iwl_fw_dbg_restart_recording(fwrt->trans, params);
+	}
 #ifdef CONFIG_IWLWIFI_DEBUGFS
 	if (!ret) {
 		if (stop)

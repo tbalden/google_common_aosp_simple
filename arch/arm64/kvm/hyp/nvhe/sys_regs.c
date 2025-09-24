@@ -20,6 +20,7 @@
  */
 u64 id_aa64pfr0_el1_sys_val;
 u64 id_aa64pfr1_el1_sys_val;
+u64 id_aa64zfr0_el1_sys_val;
 u64 id_aa64isar0_el1_sys_val;
 u64 id_aa64isar1_el1_sys_val;
 u64 id_aa64isar2_el1_sys_val;
@@ -52,7 +53,6 @@ static void inject_undef64(struct kvm_vcpu *vcpu)
 /*
  * Returns the restricted features values of the feature register based on the
  * limitations in restrict_fields.
- * A feature id field value of 0b0000 does not impose any restrictions.
  * Note: Use only for unsigned feature field values.
  */
 static u64 get_restricted_features_unsigned(u64 sys_reg_val,
@@ -85,33 +85,33 @@ static u64 get_restricted_features_unsigned(u64 sys_reg_val,
 
 static u64 get_pvm_id_aa64pfr0(const struct kvm_vcpu *vcpu)
 {
-	u64 set_mask = 0;
-	u64 allow_mask = PVM_ID_AA64PFR0_ALLOW;
+	u64 value = get_restricted_features_unsigned(id_aa64pfr0_el1_sys_val,
+						     PVM_ID_AA64PFR0_ALLOW);
 
-	set_mask |= get_restricted_features_unsigned(id_aa64pfr0_el1_sys_val,
-		PVM_ID_AA64PFR0_RESTRICT_UNSIGNED);
+	if (!vcpu_has_sve(vcpu))
+		value &= ~ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_SVE);
 
-	return (id_aa64pfr0_el1_sys_val & allow_mask) | set_mask;
+	return value;
 }
 
 static u64 get_pvm_id_aa64pfr1(const struct kvm_vcpu *vcpu)
 {
 	const struct kvm *kvm = (const struct kvm *)kern_hyp_va(vcpu->kvm);
-	u64 allow_mask = PVM_ID_AA64PFR1_ALLOW;
+	u64 value = get_restricted_features_unsigned(id_aa64pfr1_el1_sys_val,
+						     PVM_ID_AA64PFR1_ALLOW);
 
 	if (!kvm_has_mte(kvm))
-		allow_mask &= ~ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_MTE);
+		value &= ~ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_MTE);
 
-	return id_aa64pfr1_el1_sys_val & allow_mask;
+	return value;
 }
 
 static u64 get_pvm_id_aa64zfr0(const struct kvm_vcpu *vcpu)
 {
-	/*
-	 * No support for Scalable Vectors, therefore, hyp has no sanitized
-	 * copy of the feature id register.
-	 */
-	BUILD_BUG_ON(PVM_ID_AA64ZFR0_ALLOW != 0ULL);
+	if (vcpu_has_sve(vcpu))
+		return get_restricted_features_unsigned(id_aa64zfr0_el1_sys_val,
+							PVM_ID_AA64ZFR0_ALLOW);
+
 	return 0;
 }
 
@@ -162,46 +162,46 @@ static u64 get_pvm_id_aa64isar0(const struct kvm_vcpu *vcpu)
 
 static u64 get_pvm_id_aa64isar1(const struct kvm_vcpu *vcpu)
 {
-	u64 allow_mask = PVM_ID_AA64ISAR1_ALLOW;
+	u64 value = get_restricted_features_unsigned(id_aa64isar1_el1_sys_val,
+						     PVM_ID_AA64ISAR1_ALLOW);
 
 	if (!vcpu_has_ptrauth(vcpu))
-		allow_mask &= ~(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_APA) |
-				ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_API) |
-				ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_GPA) |
-				ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_GPI));
+		value &= ~(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_APA) |
+			   ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_API) |
+			   ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_GPA) |
+			   ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_GPI));
 
-	return id_aa64isar1_el1_sys_val & allow_mask;
+	return value;
 }
 
 static u64 get_pvm_id_aa64isar2(const struct kvm_vcpu *vcpu)
 {
-	u64 allow_mask = PVM_ID_AA64ISAR2_ALLOW;
+	u64 value = get_restricted_features_unsigned(id_aa64isar2_el1_sys_val,
+						     PVM_ID_AA64ISAR2_ALLOW);
 
 	if (!vcpu_has_ptrauth(vcpu))
-		allow_mask &= ~(ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_APA3) |
-				ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_GPA3));
+		value &= ~(ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_APA3) |
+			   ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_GPA3));
 
-	return id_aa64isar2_el1_sys_val & allow_mask;
+	return id_aa64isar2_el1_sys_val & value;
 }
 
 static u64 get_pvm_id_aa64mmfr0(const struct kvm_vcpu *vcpu)
 {
-	u64 set_mask;
-
-	set_mask = get_restricted_features_unsigned(id_aa64mmfr0_el1_sys_val,
-		PVM_ID_AA64MMFR0_RESTRICT_UNSIGNED);
-
-	return (id_aa64mmfr0_el1_sys_val & PVM_ID_AA64MMFR0_ALLOW) | set_mask;
+	return get_restricted_features_unsigned(id_aa64mmfr0_el1_sys_val,
+						PVM_ID_AA64MMFR0_ALLOW);
 }
 
 static u64 get_pvm_id_aa64mmfr1(const struct kvm_vcpu *vcpu)
 {
-	return id_aa64mmfr1_el1_sys_val & PVM_ID_AA64MMFR1_ALLOW;
+	return get_restricted_features_unsigned(id_aa64mmfr1_el1_sys_val,
+						PVM_ID_AA64MMFR1_ALLOW);
 }
 
 static u64 get_pvm_id_aa64mmfr2(const struct kvm_vcpu *vcpu)
 {
-	return id_aa64mmfr2_el1_sys_val & PVM_ID_AA64MMFR2_ALLOW;
+	return get_restricted_features_unsigned(id_aa64mmfr2_el1_sys_val,
+						PVM_ID_AA64MMFR2_ALLOW);
 }
 
 /* Read a sanitized cpufeature ID register by its encoding */
@@ -276,7 +276,7 @@ static bool pvm_access_id_aarch32(struct kvm_vcpu *vcpu,
 	 * of AArch32 feature id registers.
 	 */
 	BUILD_BUG_ON(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_EL1),
-		     PVM_ID_AA64PFR0_RESTRICT_UNSIGNED) > ID_AA64PFR0_EL1_ELx_64BIT_ONLY);
+		     PVM_ID_AA64PFR0_ALLOW) > ID_AA64PFR0_EL1_ELx_64BIT_ONLY);
 
 	return pvm_access_raz_wi(vcpu, p, r);
 }
@@ -298,6 +298,19 @@ static bool pvm_access_id_aarch64(struct kvm_vcpu *vcpu,
 	}
 
 	p->regval = read_id_reg(vcpu, r);
+	return true;
+}
+
+static bool pvm_access_unallocated(struct kvm_vcpu *vcpu,
+				   struct sys_reg_params *p,
+				   const struct sys_reg_desc *r)
+{
+	if (p->is_write) {
+		inject_undef64(vcpu);
+		return false;
+	}
+
+	p->regval = 0;
 	return true;
 }
 
@@ -325,7 +338,16 @@ static bool pvm_gic_read_sre(struct kvm_vcpu *vcpu,
  */
 #define ID_UNALLOCATED(crm, op2) {			\
 	Op0(3), Op1(0), CRn(0), CRm(crm), Op2(op2),	\
-	.access = pvm_access_id_aarch64,		\
+	.access = pvm_access_unallocated,		\
+}
+
+/*
+ * sys_reg_desc initialiser for known ID registers that we hide from guests.
+ * For now, these are handled just like unallocated ID regs.
+ */
+#define ID_HIDDEN(REG) {			\
+	SYS_DESC(REG),				\
+	.access = pvm_access_unallocated,	\
 }
 
 /* Mark the specified system register as Read-As-Zero/Write-Ignored */
@@ -395,15 +417,15 @@ static const struct sys_reg_desc pvm_sys_reg_descs[] = {
 	ID_UNALLOCATED(4,2),
 	ID_UNALLOCATED(4,3),
 	AARCH64(SYS_ID_AA64ZFR0_EL1),
-	ID_UNALLOCATED(4,5),
+	ID_HIDDEN(SYS_ID_AA64SMFR0_EL1),
 	ID_UNALLOCATED(4,6),
 	ID_UNALLOCATED(4,7),
 	AARCH64(SYS_ID_AA64DFR0_EL1),
 	AARCH64(SYS_ID_AA64DFR1_EL1),
 	ID_UNALLOCATED(5,2),
 	ID_UNALLOCATED(5,3),
-	AARCH64(SYS_ID_AA64AFR0_EL1),
-	AARCH64(SYS_ID_AA64AFR1_EL1),
+	ID_HIDDEN(SYS_ID_AA64AFR0_EL1),
+	ID_HIDDEN(SYS_ID_AA64AFR1_EL1),
 	ID_UNALLOCATED(5,6),
 	ID_UNALLOCATED(5,7),
 	AARCH64(SYS_ID_AA64ISAR0_EL1),
@@ -422,8 +444,6 @@ static const struct sys_reg_desc pvm_sys_reg_descs[] = {
 	ID_UNALLOCATED(7,5),
 	ID_UNALLOCATED(7,6),
 	ID_UNALLOCATED(7,7),
-
-	/* Scalable Vector Registers are restricted. */
 
 	RAZ_WI(SYS_ERRIDR_EL1),
 	RAZ_WI(SYS_ERRSELR_EL1),

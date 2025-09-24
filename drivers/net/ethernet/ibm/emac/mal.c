@@ -22,7 +22,9 @@
 
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include <linux/of.h>
 #include <linux/of_irq.h>
+#include <linux/platform_device.h>
 
 #include "core.h"
 #include <asm/dcr-regs.h>
@@ -731,8 +733,6 @@ static int mal_remove(struct platform_device *ofdev)
 	free_irq(mal->rxeob_irq, mal);
 
 	mal_reset(mal);
-
-	dcr_unmap(mal->dcr_host, 0x100);
 
 	dma_free_coherent(&ofdev->dev,
 			  sizeof(struct mal_descriptor) *

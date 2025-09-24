@@ -23,6 +23,7 @@
 #include <linux/processor.h>
 #include <linux/sizes.h>
 #include <linux/compat.h>
+#include <linux/page_size_compat.h>
 
 #include <linux/uaccess.h>
 #include <trace/hooks/mm.h>
@@ -54,6 +55,7 @@ EXPORT_SYMBOL(kfree_const);
  *
  * Return: newly allocated copy of @s or %NULL in case of error
  */
+noinline
 char *kstrdup(const char *s, gfp_t gfp)
 {
 	size_t len;
@@ -125,7 +127,8 @@ EXPORT_SYMBOL(kstrndup);
  * @len: memory region length
  * @gfp: GFP mask to use
  *
- * Return: newly allocated copy of @src or %NULL in case of error
+ * Return: newly allocated copy of @src or %NULL in case of error,
+ * result is physically contiguous. Use kfree() to free.
  */
 void *kmemdup(const void *src, size_t len, gfp_t gfp)
 {
@@ -137,6 +140,27 @@ void *kmemdup(const void *src, size_t len, gfp_t gfp)
 	return p;
 }
 EXPORT_SYMBOL(kmemdup);
+
+/**
+ * kvmemdup - duplicate region of memory
+ *
+ * @src: memory region to duplicate
+ * @len: memory region length
+ * @gfp: GFP mask to use
+ *
+ * Return: newly allocated copy of @src or %NULL in case of error,
+ * result may be not physically contiguous. Use kvfree() to free.
+ */
+void *kvmemdup(const void *src, size_t len, gfp_t gfp)
+{
+	void *p;
+
+	p = kvmalloc(len, gfp);
+	if (p)
+		memcpy(p, src, len);
+	return p;
+}
+EXPORT_SYMBOL(kvmemdup);
 
 /**
  * kmemdup_nul - Create a NUL-terminated string from unterminated data
@@ -308,12 +332,12 @@ unsigned long randomize_stack_top(unsigned long stack_top)
 	if (current->flags & PF_RANDOMIZE) {
 		random_variable = get_random_long();
 		random_variable &= STACK_RND_MASK;
-		random_variable <<= PAGE_SHIFT;
+		random_variable <<= __PAGE_SHIFT;
 	}
 #ifdef CONFIG_STACK_GROWSUP
-	return PAGE_ALIGN(stack_top) + random_variable;
+	return __PAGE_ALIGN(stack_top) + random_variable;
 #else
-	return PAGE_ALIGN(stack_top) - random_variable;
+	return __PAGE_ALIGN(stack_top) - random_variable;
 #endif
 }
 
@@ -333,20 +357,20 @@ unsigned long randomize_stack_top(unsigned long stack_top)
  */
 unsigned long randomize_page(unsigned long start, unsigned long range)
 {
-	if (!PAGE_ALIGNED(start)) {
-		range -= PAGE_ALIGN(start) - start;
-		start = PAGE_ALIGN(start);
+	if (__offset_in_page(start)) {
+		range -= __PAGE_ALIGN(start) - start;
+		start = __PAGE_ALIGN(start);
 	}
 
 	if (start > ULONG_MAX - range)
 		range = ULONG_MAX - start;
 
-	range >>= PAGE_SHIFT;
+	range >>= __PAGE_SHIFT;
 
 	if (range == 0)
 		return start;
 
-	return start + (get_random_long() % range << PAGE_SHIFT);
+	return start + (get_random_long() % range << __PAGE_SHIFT);
 }
 
 #ifdef CONFIG_ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
@@ -378,7 +402,10 @@ static int mmap_is_legacy(struct rlimit *rlim_stack)
 	if (current->personality & ADDR_COMPAT_LAYOUT)
 		return 1;
 
-	if (rlim_stack->rlim_cur == RLIM_INFINITY)
+	/* On parisc the stack always grows up - so a unlimited stack should
+	 * not be an indicator to use the legacy memory layout. */
+	if (rlim_stack->rlim_cur == RLIM_INFINITY &&
+		!IS_ENABLED(CONFIG_STACK_GROWSUP))
 		return 1;
 
 	return sysctl_legacy_va_layout;
@@ -393,6 +420,15 @@ static int mmap_is_legacy(struct rlimit *rlim_stack)
 
 static unsigned long mmap_base(unsigned long rnd, struct rlimit *rlim_stack)
 {
+#ifdef CONFIG_STACK_GROWSUP
+	/*
+	 * For an upwards growing stack the calculation is much simpler.
+	 * Memory for the maximum stack size is reserved at the top of the
+	 * task. mmap_base starts directly below the stack and grows
+	 * downwards.
+	 */
+	return PAGE_ALIGN_DOWN(mmap_upper_limit(rlim_stack) - rnd);
+#else
 	unsigned long gap = rlim_stack->rlim_cur;
 	unsigned long pad = stack_guard_gap;
 
@@ -410,6 +446,7 @@ static unsigned long mmap_base(unsigned long rnd, struct rlimit *rlim_stack)
 		gap = MAX_GAP;
 
 	return PAGE_ALIGN(STACK_TOP - gap - rnd);
+#endif
 }
 
 void arch_pick_mmap_layout(struct mm_struct *mm, struct rlimit *rlim_stack)
@@ -522,7 +559,7 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 	if (!ret) {
 		if (mmap_write_lock_killable(mm))
 			return -EINTR;
-		ret = do_mmap(file, addr, len, prot, flag, pgoff, &populate,
+		ret = do_mmap(file, addr, len, prot, flag, 0, pgoff, &populate,
 			      &uf);
 		mmap_write_unlock(mm);
 		userfaultfd_unmap_complete(mm, &uf);
@@ -723,38 +760,6 @@ void *vcalloc(size_t n, size_t size)
 }
 EXPORT_SYMBOL(vcalloc);
 
-/* Neutral page->mapping pointer to address_space or anon_vma or other */
-void *page_rmapping(struct page *page)
-{
-	return folio_raw_mapping(page_folio(page));
-}
-
-/**
- * folio_mapped - Is this folio mapped into userspace?
- * @folio: The folio.
- *
- * Return: True if any page in this folio is referenced by user page tables.
- */
-bool folio_mapped(struct folio *folio)
-{
-	long i, nr;
-
-	if (!folio_test_large(folio))
-		return atomic_read(&folio->_mapcount) >= 0;
-	if (atomic_read(folio_mapcount_ptr(folio)) >= 0)
-		return true;
-	if (folio_test_hugetlb(folio))
-		return false;
-
-	nr = folio_nr_pages(folio);
-	for (i = 0; i < nr; i++) {
-		if (atomic_read(&folio_page(folio, i)->_mapcount) >= 0)
-			return true;
-	}
-	return false;
-}
-EXPORT_SYMBOL(folio_mapped);
-
 struct anon_vma *folio_anon_vma(struct folio *folio)
 {
 	unsigned long mapping = (unsigned long)folio->mapping;
@@ -785,7 +790,7 @@ struct address_space *folio_mapping(struct folio *folio)
 		return NULL;
 
 	if (unlikely(folio_test_swapcache(folio)))
-		return swap_address_space(folio_swap_entry(folio));
+		return swap_address_space(folio->swap);
 
 	mapping = folio->mapping;
 	if ((unsigned long)mapping & PAGE_MAPPING_FLAGS)
@@ -794,60 +799,6 @@ struct address_space *folio_mapping(struct folio *folio)
 	return mapping;
 }
 EXPORT_SYMBOL(folio_mapping);
-
-/* Slow path of page_mapcount() for compound pages */
-int __page_mapcount(struct page *page)
-{
-	int ret;
-
-	ret = atomic_read(&page->_mapcount) + 1;
-	/*
-	 * For file THP page->_mapcount contains total number of mapping
-	 * of the page: no need to look into compound_mapcount.
-	 */
-	if (!PageAnon(page) && !PageHuge(page))
-		return ret;
-	page = compound_head(page);
-	ret += atomic_read(compound_mapcount_ptr(page)) + 1;
-	if (PageDoubleMap(page))
-		ret--;
-	return ret;
-}
-EXPORT_SYMBOL_GPL(__page_mapcount);
-
-/**
- * folio_mapcount() - Calculate the number of mappings of this folio.
- * @folio: The folio.
- *
- * A large folio tracks both how many times the entire folio is mapped,
- * and how many times each individual page in the folio is mapped.
- * This function calculates the total number of times the folio is
- * mapped.
- *
- * Return: The number of times this folio is mapped.
- */
-int folio_mapcount(struct folio *folio)
-{
-	int i, compound, nr, ret;
-
-	if (likely(!folio_test_large(folio)))
-		return atomic_read(&folio->_mapcount) + 1;
-
-	compound = folio_entire_mapcount(folio);
-	if (folio_test_hugetlb(folio))
-		return compound;
-	ret = compound;
-	nr = folio_nr_pages(folio);
-	for (i = 0; i < nr; i++)
-		ret += atomic_read(&folio_page(folio, i)->_mapcount) + 1;
-	/* File pages has compound_mapcount included in _mapcount */
-	if (!folio_test_anon(folio))
-		return ret - compound * nr;
-	if (folio_test_double_map(folio))
-		ret -= nr;
-	return ret;
-}
-EXPORT_SYMBOL_GPL(folio_mapcount);
 
 /**
  * folio_copy - Copy the contents of one folio to another.
@@ -1037,7 +988,7 @@ int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin)
 	if (percpu_counter_read_positive(&vm_committed_as) < allowed)
 		return 0;
 error:
-	pr_warn_ratelimited("%s: pid: %d, comm: %s, no enough memory for the allocation\n",
+	pr_warn_ratelimited("%s: pid: %d, comm: %s, not enough memory for the allocation\n",
 			    __func__, current->pid, current->comm);
 	vm_unacct_memory(pages);
 
@@ -1114,39 +1065,6 @@ int __weak memcmp_pages(struct page *page1, struct page *page2)
 	kunmap_atomic(addr2);
 	kunmap_atomic(addr1);
 	return ret;
-}
-
-int mmap_file(struct file *file, struct vm_area_struct *vma)
-{
-	static const struct vm_operations_struct dummy_vm_ops = {};
-	int err = call_mmap(file, vma);
-
-	if (likely(!err))
-		return 0;
-
-	/*
-	 * OK, we tried to call the file hook for mmap(), but an error
-	 * arose. The mapping is in an inconsistent state and we most not invoke
-	 * any further hooks on it.
-	 */
-	vma->vm_ops = &dummy_vm_ops;
-
-	return err;
-}
-
-void vma_close(struct vm_area_struct *vma)
-{
-	static const struct vm_operations_struct dummy_vm_ops = {};
-
-	if (vma->vm_ops && vma->vm_ops->close) {
-		vma->vm_ops->close(vma);
-
-		/*
-		 * The mapping is in an inconsistent state, and no further hooks
-		 * may be invoked upon it.
-		 */
-		vma->vm_ops = &dummy_vm_ops;
-	}
 }
 
 #ifdef CONFIG_PRINTK
@@ -1227,7 +1145,7 @@ void page_offline_end(void)
 }
 EXPORT_SYMBOL(page_offline_end);
 
-#ifndef ARCH_IMPLEMENTS_FLUSH_DCACHE_FOLIO
+#ifndef flush_dcache_folio
 void flush_dcache_folio(struct folio *folio)
 {
 	long i, nr = folio_nr_pages(folio);

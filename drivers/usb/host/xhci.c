@@ -9,9 +9,7 @@
  */
 
 #include <linux/pci.h>
-#ifndef __GENKSYMS__	/* ANDROID: KABI CRC preservation hack */
 #include <linux/iommu.h>
-#endif
 #include <linux/iopoll.h>
 #include <linux/irq.h>
 #include <linux/log2.h>
@@ -20,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/dmi.h>
 #include <linux/dma-mapping.h>
+#include <trace/hooks/usb.h>
 
 #include "xhci.h"
 #include "xhci-trace.h"
@@ -198,6 +197,7 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
 	u32 command;
 	u32 state;
 	int ret;
+	bool full_reset = 0;
 
 	state = readl(&xhci->op_regs->status);
 
@@ -226,8 +226,11 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
 	if (xhci->quirks & XHCI_INTEL_HOST)
 		udelay(1000);
 
+	trace_android_vh_xhci_full_reset_on_remove(&full_reset);
+
 	ret = xhci_handshake_check_state(xhci, &xhci->op_regs->command,
-				CMD_RESET, 0, timeout_us, XHCI_STATE_REMOVING);
+				CMD_RESET, 0, timeout_us,
+				full_reset ? 0 : XHCI_STATE_REMOVING);
 	if (ret)
 		return ret;
 
@@ -322,191 +325,51 @@ static void xhci_zero_64b_regs(struct xhci_hcd *xhci)
 		xhci_info(xhci, "Fault detected\n");
 }
 
-#ifdef CONFIG_USB_PCI
-/*
- * Set up MSI
- */
-static int xhci_setup_msi(struct xhci_hcd *xhci)
+int xhci_enable_interrupter(struct xhci_interrupter *ir)
 {
-	int ret;
-	/*
-	 * TODO:Check with MSI Soc for sysdev
-	 */
-	struct pci_dev  *pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
+	u32 iman;
 
-	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
-	if (ret < 0) {
-		xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-				"failed to allocate MSI entry");
-		return ret;
-	}
-
-	ret = request_irq(pdev->irq, xhci_msi_irq,
-				0, "xhci_hcd", xhci_to_hcd(xhci));
-	if (ret) {
-		xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-				"disable MSI interrupt");
-		pci_free_irq_vectors(pdev);
-	}
-
-	return ret;
-}
-
-/*
- * Set up MSI-X
- */
-static int xhci_setup_msix(struct xhci_hcd *xhci)
-{
-	int i, ret;
-	struct usb_hcd *hcd = xhci_to_hcd(xhci);
-	struct pci_dev *pdev = to_pci_dev(hcd->self.controller);
-
-	/*
-	 * calculate number of msi-x vectors supported.
-	 * - HCS_MAX_INTRS: the max number of interrupts the host can handle,
-	 *   with max number of interrupters based on the xhci HCSPARAMS1.
-	 * - num_online_cpus: maximum msi-x vectors per CPUs core.
-	 *   Add additional 1 vector to ensure always available interrupt.
-	 */
-	xhci->msix_count = min(num_online_cpus() + 1,
-				HCS_MAX_INTRS(xhci->hcs_params1));
-
-	ret = pci_alloc_irq_vectors(pdev, xhci->msix_count, xhci->msix_count,
-			PCI_IRQ_MSIX);
-	if (ret < 0) {
-		xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-				"Failed to enable MSI-X");
-		return ret;
-	}
-
-	for (i = 0; i < xhci->msix_count; i++) {
-		ret = request_irq(pci_irq_vector(pdev, i), xhci_msi_irq, 0,
-				"xhci_hcd", xhci_to_hcd(xhci));
-		if (ret)
-			goto disable_msix;
-	}
-
-	hcd->msix_enabled = 1;
-	return ret;
-
-disable_msix:
-	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "disable MSI-X interrupt");
-	while (--i >= 0)
-		free_irq(pci_irq_vector(pdev, i), xhci_to_hcd(xhci));
-	pci_free_irq_vectors(pdev);
-	return ret;
-}
-
-/* Free any IRQs and disable MSI-X */
-static void xhci_cleanup_msix(struct xhci_hcd *xhci)
-{
-	struct usb_hcd *hcd = xhci_to_hcd(xhci);
-	struct pci_dev *pdev = to_pci_dev(hcd->self.controller);
-
-	if (xhci->quirks & XHCI_PLAT)
-		return;
-
-	/* return if using legacy interrupt */
-	if (hcd->irq > 0)
-		return;
-
-	if (hcd->msix_enabled) {
-		int i;
-
-		for (i = 0; i < xhci->msix_count; i++)
-			free_irq(pci_irq_vector(pdev, i), xhci_to_hcd(xhci));
-	} else {
-		free_irq(pci_irq_vector(pdev, 0), xhci_to_hcd(xhci));
-	}
-
-	pci_free_irq_vectors(pdev);
-	hcd->msix_enabled = 0;
-}
-
-static void __maybe_unused xhci_msix_sync_irqs(struct xhci_hcd *xhci)
-{
-	struct usb_hcd *hcd = xhci_to_hcd(xhci);
-
-	if (hcd->msix_enabled) {
-		struct pci_dev *pdev = to_pci_dev(hcd->self.controller);
-		int i;
-
-		for (i = 0; i < xhci->msix_count; i++)
-			synchronize_irq(pci_irq_vector(pdev, i));
-	}
-}
-
-static int xhci_try_enable_msi(struct usb_hcd *hcd)
-{
-	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
-	struct pci_dev  *pdev;
-	int ret;
-
-	/* The xhci platform device has set up IRQs through usb_add_hcd. */
-	if (xhci->quirks & XHCI_PLAT)
-		return 0;
-
-	pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
-	/*
-	 * Some Fresco Logic host controllers advertise MSI, but fail to
-	 * generate interrupts.  Don't even try to enable MSI.
-	 */
-	if (xhci->quirks & XHCI_BROKEN_MSI)
-		goto legacy_irq;
-
-	/* unregister the legacy interrupt */
-	if (hcd->irq)
-		free_irq(hcd->irq, hcd);
-	hcd->irq = 0;
-
-	ret = xhci_setup_msix(xhci);
-	if (ret)
-		/* fall back to msi*/
-		ret = xhci_setup_msi(xhci);
-
-	if (!ret) {
-		hcd->msi_enabled = 1;
-		return 0;
-	}
-
-	if (!pdev->irq) {
-		xhci_err(xhci, "No msi-x/msi found and no IRQ in BIOS\n");
+	if (!ir || !ir->ir_set)
 		return -EINVAL;
-	}
 
- legacy_irq:
-	if (!strlen(hcd->irq_descr))
-		snprintf(hcd->irq_descr, sizeof(hcd->irq_descr), "%s:usb%d",
-			 hcd->driver->description, hcd->self.busnum);
+	iman = readl(&ir->ir_set->irq_pending);
+	writel(ER_IRQ_ENABLE(iman), &ir->ir_set->irq_pending);
 
-	/* fall back to legacy interrupt*/
-	ret = request_irq(pdev->irq, &usb_hcd_irq, IRQF_SHARED,
-			hcd->irq_descr, hcd);
-	if (ret) {
-		xhci_err(xhci, "request interrupt %d failed\n",
-				pdev->irq);
-		return ret;
-	}
-	hcd->irq = pdev->irq;
 	return 0;
 }
+EXPORT_SYMBOL_GPL(xhci_enable_interrupter);
 
-#else
-
-static inline int xhci_try_enable_msi(struct usb_hcd *hcd)
+int xhci_disable_interrupter(struct xhci_interrupter *ir)
 {
+	u32 iman;
+
+	if (!ir || !ir->ir_set)
+		return -EINVAL;
+
+	iman = readl(&ir->ir_set->irq_pending);
+	writel(ER_IRQ_DISABLE(iman), &ir->ir_set->irq_pending);
+
 	return 0;
 }
+EXPORT_SYMBOL_GPL(xhci_disable_interrupter);
 
-static inline void xhci_cleanup_msix(struct xhci_hcd *xhci)
+/* interrupt moderation interval imod_interval in nanoseconds */
+int xhci_set_interrupter_moderation(struct xhci_interrupter *ir,
+					   u32 imod_interval)
 {
-}
+	u32 imod;
 
-static inline void xhci_msix_sync_irqs(struct xhci_hcd *xhci)
-{
-}
+	if (!ir || !ir->ir_set || imod_interval > U16_MAX * 250)
+		return -EINVAL;
 
-#endif
+	imod = readl(&ir->ir_set->irq_control);
+	imod &= ~ER_IRQ_INTERVAL_MASK;
+	imod |= (imod_interval / 250) & ER_IRQ_INTERVAL_MASK;
+	writel(imod, &ir->ir_set->irq_control);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(xhci_set_interrupter_moderation);
 
 static void compliance_mode_recovery(struct timer_list *t)
 {
@@ -640,9 +503,9 @@ static int xhci_init(struct usb_hcd *hcd)
 
 /*-------------------------------------------------------------------------*/
 
-
 static int xhci_run_finished(struct xhci_hcd *xhci)
 {
+	struct xhci_interrupter *ir = xhci->interrupters[0];
 	unsigned long	flags;
 	u32		temp;
 
@@ -658,8 +521,7 @@ static int xhci_run_finished(struct xhci_hcd *xhci)
 	writel(temp, &xhci->op_regs->command);
 
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "Enable primary interrupter");
-	temp = readl(&xhci->ir_set->irq_pending);
-	writel(ER_IRQ_ENABLE(temp), &xhci->ir_set->irq_pending);
+	xhci_enable_interrupter(ir);
 
 	if (xhci_start(xhci)) {
 		xhci_halt(xhci);
@@ -691,36 +553,29 @@ static int xhci_run_finished(struct xhci_hcd *xhci)
  */
 int xhci_run(struct usb_hcd *hcd)
 {
-	u32 temp;
 	u64 temp_64;
 	int ret;
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
-
+	struct xhci_interrupter *ir = xhci->interrupters[0];
 	/* Start the xHCI host controller running only after the USB 2.0 roothub
 	 * is setup.
 	 */
 
 	hcd->uses_new_polling = 1;
+	if (hcd->msi_enabled)
+		ir->ip_autoclear = true;
+
 	if (!usb_hcd_is_primary_hcd(hcd))
 		return xhci_run_finished(xhci);
 
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "xhci_run");
 
-	ret = xhci_try_enable_msi(hcd);
-	if (ret)
-		return ret;
-
-	temp_64 = xhci_read_64(xhci, &xhci->ir_set->erst_dequeue);
-	temp_64 &= ~ERST_PTR_MASK;
+	temp_64 = xhci_read_64(xhci, &ir->ir_set->erst_dequeue);
+	temp_64 &= ERST_PTR_MASK;
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
 			"ERST deq = 64'h%0lx", (long unsigned int) temp_64);
 
-	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-			"// Set the interrupt modulation register");
-	temp = readl(&xhci->ir_set->irq_control);
-	temp &= ~ER_IRQ_INTERVAL_MASK;
-	temp |= (xhci->imod_interval / 250) & ER_IRQ_INTERVAL_MASK;
-	writel(temp, &xhci->ir_set->irq_control);
+	xhci_set_interrupter_moderation(ir, xhci->imod_interval);
 
 	if (xhci->quirks & XHCI_NEC_HOST) {
 		struct xhci_command *command;
@@ -759,10 +614,11 @@ EXPORT_SYMBOL_GPL(xhci_run);
  * Disable device contexts, disable IRQs, and quiesce the HC.
  * Reset the HC, finish any completed transactions, and cleanup memory.
  */
-static void xhci_stop(struct usb_hcd *hcd)
+void xhci_stop(struct usb_hcd *hcd)
 {
 	u32 temp;
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+	struct xhci_interrupter *ir = xhci->interrupters[0];
 
 	mutex_lock(&xhci->mutex);
 
@@ -781,8 +637,6 @@ static void xhci_stop(struct usb_hcd *hcd)
 	xhci_reset(xhci, XHCI_RESET_SHORT_USEC);
 	spin_unlock_irq(&xhci->lock);
 
-	xhci_cleanup_msix(xhci);
-
 	/* Deleting Compliance Mode Recovery Timer */
 	if ((xhci->quirks & XHCI_COMP_MODE_QUIRK) &&
 			(!(xhci_all_ports_seen_u0(xhci)))) {
@@ -799,8 +653,7 @@ static void xhci_stop(struct usb_hcd *hcd)
 			"// Disabling event ring interrupts");
 	temp = readl(&xhci->op_regs->status);
 	writel((temp & ~0x1fff) | STS_EINT, &xhci->op_regs->status);
-	temp = readl(&xhci->ir_set->irq_pending);
-	writel(ER_IRQ_DISABLE(temp), &xhci->ir_set->irq_pending);
+	xhci_disable_interrupter(ir);
 
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "cleaning up memory");
 	xhci_mem_cleanup(xhci);
@@ -810,6 +663,7 @@ static void xhci_stop(struct usb_hcd *hcd)
 			readl(&xhci->op_regs->status));
 	mutex_unlock(&xhci->mutex);
 }
+EXPORT_SYMBOL_GPL(xhci_stop);
 
 /*
  * Shutdown HC (not bus-specific)
@@ -851,8 +705,6 @@ void xhci_shutdown(struct usb_hcd *hcd)
 
 	spin_unlock_irq(&xhci->lock);
 
-	xhci_cleanup_msix(xhci);
-
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
 			"xhci_shutdown completed - status = %x",
 			readl(&xhci->op_regs->status));
@@ -862,28 +714,51 @@ EXPORT_SYMBOL_GPL(xhci_shutdown);
 #ifdef CONFIG_PM
 static void xhci_save_registers(struct xhci_hcd *xhci)
 {
+	struct xhci_interrupter *ir;
+	unsigned int i;
+
 	xhci->s3.command = readl(&xhci->op_regs->command);
 	xhci->s3.dev_nt = readl(&xhci->op_regs->dev_notification);
 	xhci->s3.dcbaa_ptr = xhci_read_64(xhci, &xhci->op_regs->dcbaa_ptr);
 	xhci->s3.config_reg = readl(&xhci->op_regs->config_reg);
-	xhci->s3.erst_size = readl(&xhci->ir_set->erst_size);
-	xhci->s3.erst_base = xhci_read_64(xhci, &xhci->ir_set->erst_base);
-	xhci->s3.erst_dequeue = xhci_read_64(xhci, &xhci->ir_set->erst_dequeue);
-	xhci->s3.irq_pending = readl(&xhci->ir_set->irq_pending);
-	xhci->s3.irq_control = readl(&xhci->ir_set->irq_control);
+
+	/* save both primary and all secondary interrupters */
+	/* fixme, shold we lock  to prevent race with remove secondary interrupter? */
+	for (i = 0; i < xhci->max_interrupters; i++) {
+		ir = xhci->interrupters[i];
+		if (!ir)
+			continue;
+
+		ir->s3_erst_size = readl(&ir->ir_set->erst_size);
+		ir->s3_erst_base = xhci_read_64(xhci, &ir->ir_set->erst_base);
+		ir->s3_erst_dequeue = xhci_read_64(xhci, &ir->ir_set->erst_dequeue);
+		ir->s3_irq_pending = readl(&ir->ir_set->irq_pending);
+		ir->s3_irq_control = readl(&ir->ir_set->irq_control);
+	}
 }
 
 static void xhci_restore_registers(struct xhci_hcd *xhci)
 {
+	struct xhci_interrupter *ir;
+	unsigned int i;
+
 	writel(xhci->s3.command, &xhci->op_regs->command);
 	writel(xhci->s3.dev_nt, &xhci->op_regs->dev_notification);
 	xhci_write_64(xhci, xhci->s3.dcbaa_ptr, &xhci->op_regs->dcbaa_ptr);
 	writel(xhci->s3.config_reg, &xhci->op_regs->config_reg);
-	writel(xhci->s3.erst_size, &xhci->ir_set->erst_size);
-	xhci_write_64(xhci, xhci->s3.erst_base, &xhci->ir_set->erst_base);
-	xhci_write_64(xhci, xhci->s3.erst_dequeue, &xhci->ir_set->erst_dequeue);
-	writel(xhci->s3.irq_pending, &xhci->ir_set->irq_pending);
-	writel(xhci->s3.irq_control, &xhci->ir_set->irq_control);
+
+	/* FIXME should we lock to protect against freeing of interrupters */
+	for (i = 0; i < xhci->max_interrupters; i++) {
+		ir = xhci->interrupters[i];
+		if (!ir)
+			continue;
+
+		writel(ir->s3_erst_size, &ir->ir_set->erst_size);
+		xhci_write_64(xhci, ir->s3_erst_base, &ir->ir_set->erst_base);
+		xhci_write_64(xhci, ir->s3_erst_dequeue, &ir->ir_set->erst_dequeue);
+		writel(ir->s3_irq_pending, &ir->ir_set->irq_pending);
+		writel(ir->s3_irq_control, &ir->ir_set->irq_control);
+	}
 }
 
 static void xhci_set_cmd_ring_deq(struct xhci_hcd *xhci)
@@ -1019,7 +894,7 @@ static bool xhci_pending_portevent(struct xhci_hcd *xhci)
 	ports = xhci->usb3_rhub.ports;
 	while (port_index--) {
 		portsc = readl(ports[port_index]->addr);
-		if (portsc & PORT_CHANGE_MASK ||
+		if (portsc & (PORT_CHANGE_MASK | PORT_CAS) ||
 		    (portsc & PORT_PLS_MASK) == XDEV_RESUME)
 			return true;
 	}
@@ -1136,10 +1011,6 @@ int xhci_suspend(struct xhci_hcd *xhci, bool do_wakeup)
 				__func__);
 	}
 
-	/* step 5: remove core well power */
-	/* synchronize irq when using MSI-X */
-	xhci_msix_sync_irqs(xhci);
-
 	return rc;
 }
 EXPORT_SYMBOL_GPL(xhci_suspend);
@@ -1150,8 +1021,9 @@ EXPORT_SYMBOL_GPL(xhci_suspend);
  * This is called when the machine transition from S3/S4 mode.
  *
  */
-int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+int xhci_resume(struct xhci_hcd *xhci, pm_message_t msg)
 {
+	bool			hibernated = (msg.event == PM_EVENT_RESTORE);
 	u32			command, temp = 0;
 	struct usb_hcd		*hcd = xhci_to_hcd(xhci);
 	int			retval = 0;
@@ -1245,13 +1117,11 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
 		spin_unlock_irq(&xhci->lock);
 		if (retval)
 			return retval;
-		xhci_cleanup_msix(xhci);
 
 		xhci_dbg(xhci, "// Disabling event ring interrupts\n");
 		temp = readl(&xhci->op_regs->status);
 		writel((temp & ~0x1fff) | STS_EINT, &xhci->op_regs->status);
-		temp = readl(&xhci->ir_set->irq_pending);
-		writel(ER_IRQ_DISABLE(temp), &xhci->ir_set->irq_pending);
+		xhci_disable_interrupter(xhci->interrupters[0]);
 
 		xhci_dbg(xhci, "cleaning up memory\n");
 		xhci_mem_cleanup(xhci);
@@ -1325,7 +1195,8 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
 
 		pending_portevent = xhci_pending_portevent(xhci);
 
-		if (suspended_usb3_devs && !pending_portevent) {
+		if (suspended_usb3_devs && !pending_portevent &&
+		    msg.event == PM_EVENT_AUTO_RESUME) {
 			msleep(120);
 			pending_portevent = xhci_pending_portevent(xhci);
 		}
@@ -1717,11 +1588,6 @@ static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flag
 	if (xhci->devs[slot_id]->flags & VDEV_PORT_ERROR) {
 		xhci_dbg(xhci, "Can't queue urb, port error, link inactive\n");
 		return -ENODEV;
-	}
-
-	if (xhci_vendor_usb_offload_skip_urb(xhci, urb)) {
-		xhci_dbg(xhci, "skip urb for usb offload\n");
-		return -EOPNOTSUPP;
 	}
 
 	if (usb_endpoint_xfer_isoc(&urb->ep->desc))
@@ -2420,7 +2286,6 @@ static unsigned int xhci_get_block_size(struct usb_device *udev)
 	case USB_SPEED_SUPER_PLUS:
 		return SS_BLOCK;
 	case USB_SPEED_UNKNOWN:
-	case USB_SPEED_WIRELESS:
 	default:
 		/* Should never happen */
 		return 1;
@@ -2781,10 +2646,7 @@ static void xhci_drop_ep_from_interval_table(struct xhci_hcd *xhci,
 	case USB_SPEED_HIGH:
 		interval_bw->overhead[HS_OVERHEAD_TYPE] -= 1;
 		break;
-	case USB_SPEED_SUPER:
-	case USB_SPEED_SUPER_PLUS:
-	case USB_SPEED_UNKNOWN:
-	case USB_SPEED_WIRELESS:
+	default:
 		/* Should never happen because only LS/FS/HS endpoints will get
 		 * added to the endpoint list.
 		 */
@@ -2841,10 +2703,7 @@ static void xhci_add_ep_to_interval_table(struct xhci_hcd *xhci,
 	case USB_SPEED_HIGH:
 		interval_bw->overhead[HS_OVERHEAD_TYPE] += 1;
 		break;
-	case USB_SPEED_SUPER:
-	case USB_SPEED_SUPER_PLUS:
-	case USB_SPEED_UNKNOWN:
-	case USB_SPEED_WIRELESS:
+	default:
 		/* Should never happen because only LS/FS/HS endpoints will get
 		 * added to the endpoint list.
 		 */
@@ -2978,6 +2837,45 @@ static int xhci_reserve_bandwidth(struct xhci_hcd *xhci,
 	return -ENOMEM;
 }
 
+/*
+ * Synchronous XHCI stop endpoint helper.  Issues the stop endpoint command and
+ * waits for the command completion before returning.
+ */
+int xhci_stop_endpoint_sync(struct xhci_hcd *xhci, struct xhci_virt_ep *ep, int suspend,
+			    gfp_t gfp_flags)
+{
+	struct xhci_command *command;
+	unsigned long flags;
+	int ret;
+
+	command = xhci_alloc_command(xhci, true, gfp_flags);
+	if (!command)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&xhci->lock, flags);
+	ret = xhci_queue_stop_endpoint(xhci, command, ep->vdev->slot_id,
+				       ep->ep_index, suspend);
+	if (ret < 0) {
+		spin_unlock_irqrestore(&xhci->lock, flags);
+		goto out;
+	}
+
+	xhci_ring_cmd_db(xhci);
+	spin_unlock_irqrestore(&xhci->lock, flags);
+
+	wait_for_completion(command->completion);
+
+	if (command->status == COMP_COMMAND_ABORTED ||
+	    command->status == COMP_COMMAND_RING_STOPPED) {
+		xhci_warn(xhci, "Timeout while waiting for stop endpoint command\n");
+		ret = -ETIME;
+	}
+out:
+	xhci_free_command(xhci, command);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(xhci_stop_endpoint_sync);
 
 /* Issue a configure endpoint command or evaluate context command
  * and wait for it to finish.
@@ -3075,14 +2973,6 @@ static int xhci_configure_endpoint(struct xhci_hcd *xhci,
 			xhci_finish_resource_reservation(xhci, ctrl_ctx);
 		spin_unlock_irqrestore(&xhci->lock, flags);
 	}
-	if (ret)
-		goto failed;
-
-	ret = xhci_vendor_sync_dev_ctx(xhci, udev->slot_id);
-	if (ret)
-		xhci_warn(xhci, "sync device context failed, ret=%d", ret);
-
-failed:
 	return ret;
 }
 
@@ -3226,11 +3116,7 @@ void xhci_reset_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
 	for (i = 0; i < 31; i++) {
 		if (virt_dev->eps[i].new_ring) {
 			xhci_debugfs_remove_endpoint(xhci, virt_dev, i);
-			if (xhci_vendor_is_usb_offload_enabled(xhci, virt_dev, i))
-				xhci_vendor_free_transfer_ring(xhci, virt_dev, i);
-			else
-				xhci_ring_free(xhci, virt_dev->eps[i].new_ring);
-
+			xhci_ring_free(xhci, virt_dev->eps[i].new_ring);
 			virt_dev->eps[i].new_ring = NULL;
 		}
 	}
@@ -3391,13 +3277,6 @@ static void xhci_endpoint_reset(struct usb_hcd *hcd,
 
 	wait_for_completion(stop_cmd->completion);
 
-	err = xhci_vendor_sync_dev_ctx(xhci, udev->slot_id);
-	if (err) {
-		xhci_warn(xhci, "%s: Failed to sync device context failed, err=%d",
-			  __func__, err);
-		goto cleanup;
-	}
-
 	spin_lock_irqsave(&xhci->lock, flags);
 
 	/* config ep command clears toggle if add and drop ep flags are set */
@@ -3428,11 +3307,6 @@ static void xhci_endpoint_reset(struct usb_hcd *hcd,
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
 	wait_for_completion(cfg_cmd->completion);
-
-	err = xhci_vendor_sync_dev_ctx(xhci, udev->slot_id);
-	if (err)
-		xhci_warn(xhci, "%s: Failed to sync device context failed, err=%d",
-			  __func__, err);
 
 	xhci_free_command(xhci, cfg_cmd);
 cleanup:
@@ -3879,6 +3753,8 @@ void xhci_free_device_endpoint_resources(struct xhci_hcd *xhci,
 				xhci->num_active_eps);
 }
 
+static void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev);
+
 /*
  * This submits a Reset Device Command, which will set the device state to 0,
  * set the device address to 0, and disable all the endpoints except the default
@@ -3949,6 +3825,23 @@ static int xhci_discover_or_reset_device(struct usb_hcd *hcd,
 						SLOT_STATE_DISABLED)
 		return 0;
 
+	if (xhci->quirks & XHCI_ETRON_HOST) {
+		/*
+		 * Obtaining a new device slot to inform the xHCI host that
+		 * the USB device has been reset.
+		 */
+		ret = xhci_disable_slot(xhci, udev->slot_id);
+		xhci_free_virt_device(xhci, udev->slot_id);
+		if (!ret) {
+			ret = xhci_alloc_dev(hcd, udev);
+			if (ret == 1)
+				ret = 0;
+			else
+				ret = -EINVAL;
+		}
+		return ret;
+	}
+
 	trace_xhci_discover_or_reset_device(slot_ctx);
 
 	xhci_dbg(xhci, "Resetting device with slot ID %u\n", slot_id);
@@ -3978,13 +3871,6 @@ static int xhci_discover_or_reset_device(struct usb_hcd *hcd,
 
 	/* Wait for the Reset Device command to finish */
 	wait_for_completion(reset_device_cmd->completion);
-
-	ret = xhci_vendor_sync_dev_ctx(xhci, slot_id);
-	if (ret) {
-		xhci_warn(xhci, "%s: Failed to sync device context failed, err=%d",
-			  __func__, ret);
-		goto command_cleanup;
-	}
 
 	/* The Reset Device command can't fail, according to the 0.95/0.96 spec,
 	 * unless we tried to reset a slot ID that wasn't enabled,
@@ -4235,14 +4121,6 @@ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
 		xhci_warn(xhci, "Could not allocate xHCI USB device data structures\n");
 		goto disable_slot;
 	}
-
-	ret = xhci_vendor_sync_dev_ctx(xhci, slot_id);
-	if (ret) {
-		xhci_warn(xhci, "%s: Failed to sync device context failed, err=%d",
-			  __func__, ret);
-		goto disable_slot;
-	}
-
 	vdev = xhci->devs[slot_id];
 	slot_ctx = xhci_get_slot_ctx(xhci, vdev->out_ctx);
 	trace_xhci_alloc_dev(slot_ctx);
@@ -4269,12 +4147,18 @@ disable_slot:
 	return 0;
 }
 
-/*
- * Issue an Address Device command and optionally send a corresponding
- * SetAddress request to the device.
+/**
+ * xhci_setup_device - issues an Address Device command to assign a unique
+ *			USB bus address.
+ * @hcd: USB host controller data structure.
+ * @udev: USB dev structure representing the connected device.
+ * @setup: Enum specifying setup mode: address only or with context.
+ * @timeout_ms: Max wait time (ms) for the command operation to complete.
+ *
+ * Return: 0 if successful; otherwise, negative error code.
  */
 static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
-			     enum xhci_setup_dev setup)
+			     enum xhci_setup_dev setup, unsigned int timeout_ms)
 {
 	const char *act = setup == SETUP_CONTEXT_ONLY ? "context" : "address";
 	unsigned long flags;
@@ -4331,6 +4215,7 @@ static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
 	}
 
 	command->in_ctx = virt_dev->in_ctx;
+	command->timeout_ms = timeout_ms;
 
 	slot_ctx = xhci_get_slot_ctx(xhci, virt_dev->in_ctx);
 	ctrl_ctx = xhci_get_input_control_ctx(virt_dev->in_ctx);
@@ -4372,13 +4257,6 @@ static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
 
 	/* ctrl tx can take up to 5 sec; XXX: need more time for xHC? */
 	wait_for_completion(command->completion);
-
-	ret = xhci_vendor_sync_dev_ctx(xhci, udev->slot_id);
-	if (ret) {
-		xhci_warn(xhci, "%s: Failed to sync device context failed, err=%d",
-			  __func__, ret);
-		goto out;
-	}
 
 	/* FIXME: From section 4.3.4: "Software shall be responsible for timing
 	 * the SetAddress() "recovery interval" required by USB and aborting the
@@ -4466,15 +4344,16 @@ out:
 	return ret;
 }
 
-int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev)
+static int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev,
+			       unsigned int timeout_ms)
 {
-	return xhci_setup_device(hcd, udev, SETUP_CONTEXT_ADDRESS);
+	return xhci_setup_device(hcd, udev, SETUP_CONTEXT_ADDRESS, timeout_ms);
 }
-EXPORT_SYMBOL_GPL(xhci_address_device);
 
 static int xhci_enable_device(struct usb_hcd *hcd, struct usb_device *udev)
 {
-	return xhci_setup_device(hcd, udev, SETUP_CONTEXT_ONLY);
+	return xhci_setup_device(hcd, udev, SETUP_CONTEXT_ONLY,
+				 XHCI_CMD_DEFAULT_TIMEOUT);
 }
 
 /*
@@ -4535,14 +4414,6 @@ static int __maybe_unused xhci_change_max_exit_latency(struct xhci_hcd *xhci,
 		return -ENOMEM;
 	}
 
-	ret = xhci_vendor_sync_dev_ctx(xhci, udev->slot_id);
-	if (ret) {
-		spin_unlock_irqrestore(&xhci->lock, flags);
-		xhci_warn(xhci, "%s: Failed to sync device context failed, err=%d",
-			  __func__, ret);
-		return ret;
-	}
-
 	xhci_slot_copy(xhci, command->in_ctx, virt_dev->out_ctx);
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
@@ -4568,30 +4439,6 @@ static int __maybe_unused xhci_change_max_exit_latency(struct xhci_hcd *xhci,
 	xhci_free_command(xhci, command);
 
 	return ret;
-}
-
-struct xhci_vendor_ops *xhci_vendor_get_ops(struct xhci_hcd *xhci)
-{
-	return xhci->vendor_ops;
-}
-EXPORT_SYMBOL_GPL(xhci_vendor_get_ops);
-
-int xhci_vendor_sync_dev_ctx(struct xhci_hcd *xhci, unsigned int slot_id)
-{
-	struct xhci_vendor_ops *ops = xhci_vendor_get_ops(xhci);
-
-	if (ops && ops->sync_dev_ctx)
-		return ops->sync_dev_ctx(xhci, slot_id);
-	return 0;
-}
-
-bool xhci_vendor_usb_offload_skip_urb(struct xhci_hcd *xhci, struct urb *urb)
-{
-	struct xhci_vendor_ops *ops = xhci_vendor_get_ops(xhci);
-
-	if (ops && ops->usb_offload_skip_urb)
-		return ops->usb_offload_skip_urb(xhci, urb);
-	return false;
 }
 
 #ifdef CONFIG_PM
@@ -4913,7 +4760,7 @@ static u16 xhci_calculate_u1_timeout(struct xhci_hcd *xhci,
 		}
 	}
 
-	if (xhci->quirks & XHCI_INTEL_HOST)
+	if (xhci->quirks & (XHCI_INTEL_HOST | XHCI_ZHAOXIN_HOST))
 		timeout_ns = xhci_calculate_intel_u1_timeout(udev, desc);
 	else
 		timeout_ns = udev->u1_params.sel;
@@ -4977,7 +4824,7 @@ static u16 xhci_calculate_u2_timeout(struct xhci_hcd *xhci,
 		}
 	}
 
-	if (xhci->quirks & XHCI_INTEL_HOST)
+	if (xhci->quirks & (XHCI_INTEL_HOST | XHCI_ZHAOXIN_HOST))
 		timeout_ns = xhci_calculate_intel_u2_timeout(udev, desc);
 	else
 		timeout_ns = udev->u2_params.sel;
@@ -5049,35 +4896,28 @@ static int xhci_update_timeout_for_interface(struct xhci_hcd *xhci,
 	return 0;
 }
 
-static int xhci_check_intel_tier_policy(struct usb_device *udev,
-		enum usb3_link_state state)
-{
-	struct usb_device *parent;
-	unsigned int num_hubs;
-
-	/* Don't enable U1 if the device is on a 2nd tier hub or lower. */
-	for (parent = udev->parent, num_hubs = 0; parent->parent;
-			parent = parent->parent)
-		num_hubs++;
-
-	if (num_hubs < 2)
-		return 0;
-
-	dev_dbg(&udev->dev, "Disabling U1/U2 link state for device"
-			" below second-tier hub.\n");
-	dev_dbg(&udev->dev, "Plug device into first-tier hub "
-			"to decrease power consumption.\n");
-	return -E2BIG;
-}
-
 static int xhci_check_tier_policy(struct xhci_hcd *xhci,
 		struct usb_device *udev,
 		enum usb3_link_state state)
 {
-	if (xhci->quirks & XHCI_INTEL_HOST)
-		return xhci_check_intel_tier_policy(udev, state);
-	else
-		return 0;
+	struct usb_device *parent = udev->parent;
+	int tier = 1; /* roothub is tier1 */
+
+	while (parent) {
+		parent = parent->parent;
+		tier++;
+	}
+
+	if (xhci->quirks & XHCI_INTEL_HOST && tier > 3)
+		goto fail;
+	if (xhci->quirks & XHCI_ZHAOXIN_HOST && tier > 2)
+		goto fail;
+
+	return 0;
+fail:
+	dev_dbg(&udev->dev, "Tier policy prevents U1/U2 LPM states for devices at tier %d\n",
+			tier);
+	return -E2BIG;
 }
 
 /* Returns the U1 or U2 timeout that should be enabled.
@@ -5323,15 +5163,6 @@ int xhci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
 		return -ENOMEM;
 	}
 
-	ret = xhci_vendor_sync_dev_ctx(xhci, hdev->slot_id);
-	if (ret) {
-		xhci_warn(xhci, "%s: Failed to sync device context failed, err=%d",
-			  __func__, ret);
-		xhci_free_command(xhci, config_cmd);
-		spin_unlock_irqrestore(&xhci->lock, flags);
-		return ret;
-	}
-
 	xhci_slot_copy(xhci, config_cmd->in_ctx, vdev->out_ctx);
 	ctrl_ctx->add_flags |= cpu_to_le32(SLOT_FLAG);
 	slot_ctx = xhci_get_slot_ctx(xhci, config_cmd->in_ctx);
@@ -5491,9 +5322,15 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 	if (xhci->hci_version > 0x100)
 		xhci->hcc_params2 = readl(&xhci->cap_regs->hcc_params2);
 
+	/* xhci-plat or xhci-pci might have set max_interrupters already */
+	if ((!xhci->max_interrupters) ||
+	    xhci->max_interrupters > HCS_MAX_INTRS(xhci->hcs_params1))
+		xhci->max_interrupters = HCS_MAX_INTRS(xhci->hcs_params1);
+
 	xhci->quirks |= quirks;
 
-	get_quirks(dev, xhci);
+	if (get_quirks)
+		get_quirks(dev, xhci);
 
 	/* In xhci controllers which follow xhci 1.0 spec gives a spurious
 	 * success event after a short transfer. This quirk will ignore such
@@ -5675,12 +5512,8 @@ void xhci_init_driver(struct hc_driver *drv,
 			drv->reset_bandwidth = over->reset_bandwidth;
 		if (over->update_hub_device)
 			drv->update_hub_device = over->update_hub_device;
-		if (over->address_device)
-			drv->address_device = over->address_device;
-		if (over->bus_suspend)
-			drv->bus_suspend = over->bus_suspend;
-		if (over->bus_resume)
-			drv->bus_resume = over->bus_resume;
+		if (over->hub_control)
+			drv->hub_control = over->hub_control;
 	}
 }
 EXPORT_SYMBOL_GPL(xhci_init_driver);

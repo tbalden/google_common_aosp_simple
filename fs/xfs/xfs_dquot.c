@@ -333,7 +333,6 @@ xfs_dquot_disk_alloc(
 		goto err_cancel;
 
 	ASSERT(map.br_blockcount == XFS_DQUOT_CLUSTER_SIZE_FSB);
-	ASSERT(nmaps == 1);
 	ASSERT((map.br_startblock != DELAYSTARTBLOCK) &&
 	       (map.br_startblock != HOLESTARTBLOCK));
 
@@ -1387,7 +1386,7 @@ xfs_qm_dqiterate(
 			return error;
 
 		error = iter_fn(dq, type, priv);
-		id = dq->q_id;
+		id = dq->q_id + 1;
 		xfs_qm_dqput(dq);
 	} while (error == 0 && id != 0);
 

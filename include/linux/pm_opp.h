@@ -115,7 +115,7 @@ int dev_pm_opp_get_supplies(struct dev_pm_opp *opp, struct dev_pm_opp_supply *su
 
 unsigned long dev_pm_opp_get_power(struct dev_pm_opp *opp);
 
-unsigned long dev_pm_opp_get_freq(struct dev_pm_opp *opp);
+unsigned long dev_pm_opp_get_freq_indexed(struct dev_pm_opp *opp, u32 index);
 
 unsigned int dev_pm_opp_get_level(struct dev_pm_opp *opp);
 
@@ -133,16 +133,28 @@ unsigned long dev_pm_opp_get_suspend_opp_freq(struct device *dev);
 struct dev_pm_opp *dev_pm_opp_find_freq_exact(struct device *dev,
 					      unsigned long freq,
 					      bool available);
+
+struct dev_pm_opp *
+dev_pm_opp_find_freq_exact_indexed(struct device *dev, unsigned long freq,
+				   u32 index, bool available);
+
 struct dev_pm_opp *dev_pm_opp_find_freq_floor(struct device *dev,
 					      unsigned long *freq);
 
-struct dev_pm_opp *dev_pm_opp_find_level_exact(struct device *dev,
-					       unsigned int level);
-struct dev_pm_opp *dev_pm_opp_find_level_ceil(struct device *dev,
-					      unsigned int *level);
+struct dev_pm_opp *dev_pm_opp_find_freq_floor_indexed(struct device *dev,
+						      unsigned long *freq, u32 index);
 
 struct dev_pm_opp *dev_pm_opp_find_freq_ceil(struct device *dev,
 					     unsigned long *freq);
+
+struct dev_pm_opp *dev_pm_opp_find_freq_ceil_indexed(struct device *dev,
+						     unsigned long *freq, u32 index);
+
+struct dev_pm_opp *dev_pm_opp_find_level_exact(struct device *dev,
+					       unsigned int level);
+
+struct dev_pm_opp *dev_pm_opp_find_level_ceil(struct device *dev,
+					      unsigned int *level);
 
 struct dev_pm_opp *dev_pm_opp_find_bw_ceil(struct device *dev,
 					   unsigned int *bw, int index);
@@ -153,7 +165,6 @@ struct dev_pm_opp *dev_pm_opp_find_bw_floor(struct device *dev,
 void dev_pm_opp_put(struct dev_pm_opp *opp);
 
 int dev_pm_opp_add_dynamic(struct device *dev, struct dev_pm_opp_data *opp);
-int dev_pm_opp_add(struct device *dev, unsigned long freq, unsigned long u_volt);
 
 void dev_pm_opp_remove(struct device *dev, unsigned long freq);
 void dev_pm_opp_remove_all_dynamic(struct device *dev);
@@ -213,7 +224,7 @@ static inline unsigned long dev_pm_opp_get_power(struct dev_pm_opp *opp)
 	return 0;
 }
 
-static inline unsigned long dev_pm_opp_get_freq(struct dev_pm_opp *opp)
+static inline unsigned long dev_pm_opp_get_freq_indexed(struct dev_pm_opp *opp, u32 index)
 {
 	return 0;
 }
@@ -260,20 +271,15 @@ static inline unsigned long dev_pm_opp_get_suspend_opp_freq(struct device *dev)
 	return 0;
 }
 
-static inline struct dev_pm_opp *dev_pm_opp_find_level_exact(struct device *dev,
-					unsigned int level)
-{
-	return ERR_PTR(-EOPNOTSUPP);
-}
-
-static inline struct dev_pm_opp *dev_pm_opp_find_level_ceil(struct device *dev,
-					unsigned int *level)
-{
-	return ERR_PTR(-EOPNOTSUPP);
-}
-
 static inline struct dev_pm_opp *dev_pm_opp_find_freq_exact(struct device *dev,
 					unsigned long freq, bool available)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline struct dev_pm_opp *
+dev_pm_opp_find_freq_exact_indexed(struct device *dev, unsigned long freq,
+				   u32 index, bool available)
 {
 	return ERR_PTR(-EOPNOTSUPP);
 }
@@ -284,8 +290,32 @@ static inline struct dev_pm_opp *dev_pm_opp_find_freq_floor(struct device *dev,
 	return ERR_PTR(-EOPNOTSUPP);
 }
 
+static inline struct dev_pm_opp *
+dev_pm_opp_find_freq_floor_indexed(struct device *dev, unsigned long *freq, u32 index)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
 static inline struct dev_pm_opp *dev_pm_opp_find_freq_ceil(struct device *dev,
 					unsigned long *freq)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline struct dev_pm_opp *
+dev_pm_opp_find_freq_ceil_indexed(struct device *dev, unsigned long *freq, u32 index)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline struct dev_pm_opp *dev_pm_opp_find_level_exact(struct device *dev,
+					unsigned int level)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline struct dev_pm_opp *dev_pm_opp_find_level_ceil(struct device *dev,
+					unsigned int *level)
 {
 	return ERR_PTR(-EOPNOTSUPP);
 }
@@ -306,12 +336,6 @@ static inline void dev_pm_opp_put(struct dev_pm_opp *opp) {}
 
 static inline int
 dev_pm_opp_add_dynamic(struct device *dev, struct dev_pm_opp_data *opp)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int
-dev_pm_opp_add(struct device *dev, unsigned long freq, unsigned long u_volt)
 {
 	return -EOPNOTSUPP;
 }
@@ -431,6 +455,8 @@ struct device_node *dev_pm_opp_get_of_node(struct dev_pm_opp *opp);
 int of_get_required_opp_performance_state(struct device_node *np, int index);
 int dev_pm_opp_of_find_icc_paths(struct device *dev, struct opp_table *opp_table);
 int dev_pm_opp_of_register_em(struct device *dev, struct cpumask *cpus);
+int dev_pm_opp_calc_power(struct device *dev, unsigned long *uW,
+			  unsigned long *kHz);
 static inline void dev_pm_opp_of_unregister_em(struct device *dev)
 {
 	em_dev_unregister_perf_domain(dev);
@@ -494,6 +520,12 @@ static inline void dev_pm_opp_of_unregister_em(struct device *dev)
 {
 }
 
+static inline int dev_pm_opp_calc_power(struct device *dev, unsigned long *uW,
+					unsigned long *kHz)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline int of_get_required_opp_performance_state(struct device_node *np, int index)
 {
 	return -EOPNOTSUPP;
@@ -506,6 +538,17 @@ static inline int dev_pm_opp_of_find_icc_paths(struct device *dev, struct opp_ta
 #endif
 
 /* OPP Configuration helpers */
+
+static inline int dev_pm_opp_add(struct device *dev, unsigned long freq,
+				 unsigned long u_volt)
+{
+	struct dev_pm_opp_data data = {
+		.freq = freq,
+		.u_volt = u_volt,
+	};
+
+	return dev_pm_opp_add_dynamic(dev, &data);
+}
 
 /* Regulators helpers */
 static inline int dev_pm_opp_set_regulators(struct device *dev,
@@ -648,6 +691,11 @@ static inline int dev_pm_opp_set_prop_name(struct device *dev, const char *name)
 static inline void dev_pm_opp_put_prop_name(int token)
 {
 	dev_pm_opp_clear_config(token);
+}
+
+static inline unsigned long dev_pm_opp_get_freq(struct dev_pm_opp *opp)
+{
+	return dev_pm_opp_get_freq_indexed(opp, 0);
 }
 
 #endif		/* __LINUX_OPP_H__ */

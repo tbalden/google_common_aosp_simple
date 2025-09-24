@@ -75,10 +75,6 @@ efi_status_t efi_random_alloc(unsigned long size,
 	if (align < EFI_ALLOC_ALIGN)
 		align = EFI_ALLOC_ALIGN;
 
-	/* Avoid address 0x0, as it can be mistaken for NULL */
-	if (alloc_min == 0)
-		alloc_min = align;
-
 	size = round_up(size, EFI_ALLOC_ALIGN);
 
 	/* count the suitable slots in each memory map entry */
@@ -112,6 +108,7 @@ efi_status_t efi_random_alloc(unsigned long size,
 	 * to calculate the randomly chosen address, and allocate it directly
 	 * using EFI_ALLOCATE_ADDRESS.
 	 */
+	status = EFI_OUT_OF_RESOURCES;
 	for (map_offset = 0; map_offset < map->map_size; map_offset += map->desc_size) {
 		efi_memory_desc_t *md = (void *)map->map + map_offset;
 		efi_physical_addr_t target;

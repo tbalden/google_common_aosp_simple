@@ -76,6 +76,7 @@ struct svc_export {
 	struct nfsd4_deviceid_map *ex_devid_map;
 	struct cache_detail	*cd;
 	struct rcu_head		ex_rcu;
+	unsigned long		ex_xprtsec_modes;
 	struct export_stats	*ex_stats;
 };
 

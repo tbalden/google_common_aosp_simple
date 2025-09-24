@@ -559,16 +559,11 @@ static int ea_get(struct inode *inode, struct ea_buffer *ea_buf, int min_size)
 
       size_check:
 	if (EALIST_SIZE(ea_buf->xattr) != ea_size) {
-		if (unlikely(EALIST_SIZE(ea_buf->xattr) > INT_MAX)) {
-			printk(KERN_ERR "ea_get: extended attribute size too large: %u > INT_MAX\n",
-			       EALIST_SIZE(ea_buf->xattr));
-		} else {
-			int size = clamp_t(int, ea_size, 0, EALIST_SIZE(ea_buf->xattr));
+		int size = clamp_t(int, ea_size, 0, EALIST_SIZE(ea_buf->xattr));
 
-			printk(KERN_ERR "ea_get: invalid extended attribute\n");
-			print_hex_dump(KERN_ERR, "", DUMP_PREFIX_ADDRESS, 16, 1,
-				       ea_buf->xattr, size, 1);
-		}
+		printk(KERN_ERR "ea_get: invalid extended attribute\n");
+		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_ADDRESS, 16, 1,
+				     ea_buf->xattr, size, 1);
 		ea_release(inode, ea_buf);
 		rc = -EIO;
 		goto clean_up;
@@ -656,7 +651,7 @@ static int ea_put(tid_t tid, struct inode *inode, struct ea_buffer *ea_buf,
 	if (old_blocks)
 		dquot_free_block(inode, old_blocks);
 
-	inode->i_ctime = current_time(inode);
+	inode_set_ctime_current(inode);
 
 	return 0;
 }
@@ -956,7 +951,7 @@ static int jfs_xattr_get(const struct xattr_handler *handler,
 }
 
 static int jfs_xattr_set(const struct xattr_handler *handler,
-			 struct user_namespace *mnt_userns,
+			 struct mnt_idmap *idmap,
 			 struct dentry *unused, struct inode *inode,
 			 const char *name, const void *value,
 			 size_t size, int flags)
@@ -975,7 +970,7 @@ static int jfs_xattr_get_os2(const struct xattr_handler *handler,
 }
 
 static int jfs_xattr_set_os2(const struct xattr_handler *handler,
-			     struct user_namespace *mnt_userns,
+			     struct mnt_idmap *idmap,
 			     struct dentry *unused, struct inode *inode,
 			     const char *name, const void *value,
 			     size_t size, int flags)
@@ -1010,10 +1005,6 @@ static const struct xattr_handler jfs_trusted_xattr_handler = {
 };
 
 const struct xattr_handler *jfs_xattr_handlers[] = {
-#ifdef CONFIG_JFS_POSIX_ACL
-	&posix_acl_access_xattr_handler,
-	&posix_acl_default_xattr_handler,
-#endif
 	&jfs_os2_xattr_handler,
 	&jfs_user_xattr_handler,
 	&jfs_security_xattr_handler,

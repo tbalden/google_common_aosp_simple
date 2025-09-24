@@ -4,83 +4,29 @@
  */
 
 #include <linux/tracefs.h>
-#include <linux/trace_events.h>
+#include <linux/rcupdate.h>
 
 #include <asm/kvm_host.h>
-#include <asm/kvm_hypevents_defs.h>
 #include <asm/setup.h>
 
-#include "hyp_trace.h"
+static const char *hyp_printk_fmt_from_id(u8 fmt_id);
 
-#define HYP_EVENT_NAME_MAX 32
+#include <asm/kvm_define_hypevents.h>
 
-struct hyp_event {
-	struct trace_event_call *call;
-	char name[HYP_EVENT_NAME_MAX];
-	bool *enabled;
-};
+extern char __hyp_printk_fmts_start[];
+extern char __hyp_printk_fmts_end[];
 
-#define HYP_EVENT(__name, __proto, __struct, __assign, __printk)		\
-	HYP_EVENT_FORMAT(__name, __struct);					\
-	enum print_line_t hyp_event_trace_##__name(struct trace_iterator *iter,	\
-					  int flags, struct trace_event *event) \
-	{									\
-		struct ht_iterator *ht_iter = (struct ht_iterator *)iter;	\
-		struct trace_hyp_format_##__name __maybe_unused *__entry =	\
-			(struct trace_hyp_format_##__name *)ht_iter->ent;	\
-		trace_seq_puts(&ht_iter->seq, #__name);				\
-		trace_seq_putc(&ht_iter->seq, ' ');				\
-		trace_seq_printf(&ht_iter->seq, __printk);			\
-		trace_seq_putc(&ht_iter->seq, '\n');				\
-		return TRACE_TYPE_HANDLED;					\
-	}
-#include <asm/kvm_hypevents.h>
+#define nr_printk_fmts() ((__hyp_printk_fmts_end - __hyp_printk_fmts_start) / \
+				sizeof(struct hyp_printk_fmt))
 
-#undef he_field
-#define he_field(_type, _item)						\
-	{								\
-		.type = #_type, .name = #_item,				\
-		.size = sizeof(_type), .align = __alignof__(_type),	\
-		.is_signed = is_signed_type(_type),			\
-	},
-#undef HYP_EVENT
-#define HYP_EVENT(__name, __proto, __struct, __assign, __printk)		\
-	static struct trace_event_fields hyp_event_fields_##__name[] = {	\
-		__struct							\
-		{}								\
-	};									\
+static const char *hyp_printk_fmt_from_id(u8 fmt_id)
+{
+	if (fmt_id >= nr_printk_fmts())
+		return "Unknown Format";
 
-#undef __ARM64_KVM_HYPEVENTS_H_
-#include <asm/kvm_hypevents.h>
-
-#undef HYP_EVENT
-#undef HE_PRINTK
-#define __entry REC
-#define HE_PRINTK(fmt, args...) "\"" fmt "\", " __stringify(args)
-#define HYP_EVENT(__name, __proto, __struct, __assign, __printk)		\
-	static char hyp_event_print_fmt_##__name[] = __printk;			\
-	static struct trace_event_functions hyp_event_funcs_##__name = {	\
-		.trace = &hyp_event_trace_##__name,				\
-	};									\
-	static struct trace_event_class hyp_event_class_##__name = {		\
-		.system		= "nvhe-hypervisor",				\
-		.fields_array	= hyp_event_fields_##__name,			\
-		.fields		= LIST_HEAD_INIT(hyp_event_class_##__name.fields),\
-	};									\
-	static struct trace_event_call hyp_event_call_##__name = {		\
-		.class = &hyp_event_class_##__name,				\
-		.event.funcs = &hyp_event_funcs_##__name,			\
-		.print_fmt = hyp_event_print_fmt_##__name,			\
-	};									\
-	static bool hyp_event_enabled_##__name;					\
-	struct hyp_event __section("_hyp_events") hyp_event_##__name = {	\
-		.name = #__name,						\
-		.call = &hyp_event_call_##__name,				\
-		.enabled = &hyp_event_enabled_##__name,				\
-	}
-
-#undef __ARM64_KVM_HYPEVENTS_H_
-#include <asm/kvm_hypevents.h>
+	return (const char *)(__hyp_printk_fmts_start +
+			      (fmt_id * sizeof(struct hyp_printk_fmt)));
+}
 
 extern struct hyp_event __hyp_events_start[];
 extern struct hyp_event __hyp_events_end[];
@@ -93,8 +39,7 @@ static struct hyp_event *find_hyp_event(const char *name)
 {
 	struct hyp_event *event = __hyp_events_start;
 
-	for (; (unsigned long)event < (unsigned long)__hyp_events_end;
-		event++) {
+	for (; (unsigned long)event < (unsigned long)__hyp_events_end; event++) {
 		if (!strncmp(name, event->name, HYP_EVENT_NAME_MAX))
 			return event;
 	}
@@ -104,7 +49,7 @@ static struct hyp_event *find_hyp_event(const char *name)
 
 static int enable_hyp_event(struct hyp_event *event, bool enable)
 {
-	unsigned short id = event->call->event.type;
+	unsigned short id = event->id;
 	int ret;
 
 	if (enable == *event->enabled)
@@ -156,7 +101,6 @@ static int hyp_event_show(struct seq_file *m, void *v)
 {
 	struct hyp_event *evt = (struct hyp_event *)m->private;
 
-	/* lock ?? Ain't no time for that ! */
 	seq_printf(m, "%d\n", *evt->enabled);
 
 	return 0;
@@ -179,7 +123,7 @@ static int hyp_event_id_show(struct seq_file *m, void *v)
 {
 	struct hyp_event *evt = (struct hyp_event *)m->private;
 
-	seq_printf(m, "%d\n", evt->call->event.type);
+	seq_printf(m, "%d\n", evt->id);
 
 	return 0;
 }
@@ -203,11 +147,11 @@ static int hyp_event_format_show(struct seq_file *m, void *v)
 	unsigned int offset = sizeof(struct hyp_entry_hdr);
 
 	seq_printf(m, "name: %s\n", evt->name);
-	seq_printf(m, "ID: %d\n", evt->call->event.type);
+	seq_printf(m, "ID: %d\n", evt->id);
 	seq_puts(m, "format:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n");
 	seq_puts(m, "\n");
 
-	field = &evt->call->class->fields_array[0];
+	field = &evt->fields[0];
 	while (field->name) {
 		seq_printf(m, "\tfield:%s %s;\toffset:%u;\tsize:%u;\tsigned:%d;\n",
 			  field->type, field->name, offset, field->size,
@@ -216,10 +160,10 @@ static int hyp_event_format_show(struct seq_file *m, void *v)
 		field++;
 	}
 
-	if (field != &evt->call->class->fields_array[0])
+	if (field != &evt->fields[0])
 		seq_puts(m, "\n");
 
-	seq_printf(m, "print fmt: %s\n", evt->call->print_fmt);
+	seq_printf(m, "print fmt: %s\n", evt->print_fmt);
 
 	return 0;
 }
@@ -236,40 +180,28 @@ static const struct file_operations hyp_event_format_fops = {
 	.release = single_release,
 };
 
-static int hyp_header_page_show(struct seq_file *m, void *v)
+static ssize_t hyp_header_page_read(struct file *filp, char __user *ubuf,
+				   size_t cnt, loff_t *ppos)
 {
-	struct buffer_data_page bpage;
+	struct trace_seq *s;
+	ssize_t r;
 
-	seq_printf(m, "\tfield: u64 timestamp;\t"
-		   "offset:0;\tsize:%lu;\tsigned:%d;\n",
-		   sizeof(bpage.time_stamp),
-		   is_signed_type(u64));
+	s = kmalloc(sizeof(*s), GFP_KERNEL);
+	if (!s)
+		return -ENOMEM;
 
-	seq_printf(m, "\tfield: local_t commit;\t"
-		   "offset:%lu;\tsize:%lu;\tsigned:%d;\n",
-		   offsetof(typeof(bpage), commit),
-		   sizeof(bpage.commit),
-		   is_signed_type(long));
+	trace_seq_init(s);
+	ring_buffer_print_page_header(s);
+	r = simple_read_from_buffer(ubuf, cnt, ppos, s->buffer,
+				    trace_seq_used(s));
+	kfree(s);
 
-	seq_printf(m, "\tfield: char data;\t"
-		   "offset:%lu;\tsize:%lu;\tsigned:%d;\n",
-		   offsetof(typeof(bpage), data),
-		   BUF_EXT_PAGE_SIZE,
-		   is_signed_type(char));
-
-	return 0;
-}
-
-static int hyp_header_page_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, hyp_header_page_show, NULL);
+	return r;
 }
 
 static const struct file_operations hyp_header_page_fops = {
-	.open = hyp_header_page_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
+	.read = hyp_header_page_read,
+	.llseek = default_llseek,
 };
 
 static char early_events[COMMAND_LINE_SIZE];
@@ -282,7 +214,7 @@ static __init int setup_hyp_event_early(char *str)
 }
 __setup("hyp_event=", setup_hyp_event_early);
 
-bool kvm_hyp_events_enable_early(void)
+bool hyp_trace_init_event_early(void)
 {
 	char *token, *buf = early_events;
 	bool enabled = false;
@@ -317,10 +249,98 @@ bool kvm_hyp_events_enable_early(void)
 	return enabled;
 }
 
-void kvm_hyp_init_events_tracefs(struct dentry *parent)
+static struct dentry *event_tracefs;
+static unsigned int last_event_id;
+
+struct hyp_event_table {
+	struct hyp_event	*start;
+	unsigned long		nr_events;
+};
+static struct hyp_event_mod_tables {
+	struct hyp_event_table *tables;
+	unsigned long		nr_tables;
+} mod_event_tables;
+
+#define nr_events(__start, __stop) \
+	(((unsigned long)__stop - (unsigned long)__start) / sizeof(*__start))
+
+struct hyp_event *hyp_trace_find_event(int id)
 {
-	struct hyp_event *event = __hyp_events_start;
-	struct dentry *d, *event_dir;
+	struct hyp_event *event = __hyp_events_start + id;
+
+	if ((unsigned long)event >= (unsigned long)__hyp_events_end) {
+		struct hyp_event_table *table;
+
+		event = NULL;
+		id -= nr_events(__hyp_events_start, __hyp_events_end);
+
+		rcu_read_lock();
+		table = rcu_dereference(mod_event_tables.tables);
+
+		for (int i = 0; i < mod_event_tables.nr_tables; i++) {
+			if (table->nr_events <= id) {
+				id -= table->nr_events;
+				table++;
+				continue;
+			}
+
+			event = table->start + id;
+			break;
+		}
+		rcu_read_unlock();
+	}
+
+	return event;
+}
+
+static void hyp_event_table_init_tracefs(struct hyp_event *event, int nr_events)
+{
+	struct dentry *event_dir;
+	int i;
+
+	if (!event_tracefs)
+		return;
+
+	for (i = 0; i < nr_events; event++, i++) {
+		event_dir = tracefs_create_dir(event->name, event_tracefs);
+		if (!event_dir) {
+			pr_err("Failed to create events/hyp/%s\n", event->name);
+			continue;
+		}
+
+		tracefs_create_file("enable", 0700, event_dir, (void *)event,
+				    &hyp_event_fops);
+		tracefs_create_file("id", 0400, event_dir, (void *)event,
+				    &hyp_event_id_fops);
+		tracefs_create_file("format", 0400, event_dir, (void *)event,
+				    &hyp_event_format_fops);
+	}
+}
+
+/*
+ * Register hyp events and write their id into the hyp section _hyp_event_ids.
+ */
+static int hyp_event_table_init(struct hyp_event *event,
+				struct hyp_event_id *event_id, int nr_events)
+{
+	while (nr_events--) {
+		/*
+		 * Both the host and the hypervisor rely on the same hyp event
+		 * declarations from kvm_hypevents.h. We have then a 1:1
+		 * mapping.
+		 */
+		event->id = event_id->id = last_event_id++;
+
+		event++;
+		event_id++;
+	}
+
+	return 0;
+}
+
+void hyp_trace_init_event_tracefs(struct dentry *parent)
+{
+	int nr_events = nr_events(__hyp_events_start, __hyp_events_end);
 
 	parent = tracefs_create_dir("events", parent);
 	if (!parent) {
@@ -328,71 +348,61 @@ void kvm_hyp_init_events_tracefs(struct dentry *parent)
 		return;
 	}
 
-	d = tracefs_create_file("header_page", 0400, parent, NULL,
-				&hyp_header_page_fops);
-	if (!d)
-		pr_err("Failed to create events/header_page\n");
+	tracefs_create_file("header_page", 0400, parent, NULL,
+			    &hyp_header_page_fops);
 
-	parent = tracefs_create_dir("hyp", parent);
-	if (!parent) {
+	event_tracefs = tracefs_create_dir("hyp", parent);
+	if (!event_tracefs) {
 		pr_err("Failed to create tracefs folder for hyp events\n");
 		return;
 	}
 
-	for (; (unsigned long)event < (unsigned long)__hyp_events_end; event++) {
-		event_dir = tracefs_create_dir(event->name, parent);
-		if (!event_dir) {
-			pr_err("Failed to create events/hyp/%s\n", event->name);
-			continue;
-		}
-		d = tracefs_create_file("enable", 0700, event_dir, (void *)event,
-				&hyp_event_fops);
-		if (!d)
-			pr_err("Failed to create events/hyp/%s/enable\n", event->name);
-
-		d = tracefs_create_file("id", 0400, event_dir, (void *)event,
-				&hyp_event_id_fops);
-		if (!d)
-			pr_err("Failed to create events/hyp/%s/id\n", event->name);
-
-		d = tracefs_create_file("format", 0400, event_dir, (void *)event,
-					&hyp_event_format_fops);
-		if (!d)
-			pr_err("Failed to create events/hyp/%s/format\n",
-			       event->name);
-
-	}
+	hyp_event_table_init_tracefs(__hyp_events_start, nr_events);
 }
 
-/*
- * Register hyp events and write their id into the hyp section _hyp_event_ids.
- */
-int kvm_hyp_init_events(void)
+int hyp_trace_init_events(void)
 {
-	struct hyp_event *event = __hyp_events_start;
-	struct hyp_event_id *hyp_event_id = __hyp_event_ids_start;
-	int ret, err = -ENODEV;
+	int nr_events = nr_events(__hyp_events_start, __hyp_events_end);
+	int nr_event_ids = nr_events(__hyp_event_ids_start, __hyp_event_ids_end);
 
-	/* TODO: BUILD_BUG nr events host side / hyp side */
+	/* __hyp_printk event only supports U8_MAX different formats */
+	WARN_ON(nr_printk_fmts() > U8_MAX);
 
-	for (; (unsigned long)event < (unsigned long)__hyp_events_end;
-		event++, hyp_event_id++) {
-		event->call->name = event->name;
-		ret = register_trace_event(&event->call->event);
-		if (!ret) {
-			pr_warn("Couldn't register trace event for %s\n", event->name);
-			continue;
-		}
+	if (WARN_ON(nr_events != nr_event_ids))
+		return -EINVAL;
 
-		/*
-		 * Both the host and the hypervisor relies on the same hyp event
-		 * declarations from kvm_hypevents.h. We have then a 1:1
-		 * mapping.
-		 */
-		hyp_event_id->id = ret;
+	return hyp_event_table_init(__hyp_events_start, __hyp_event_ids_start,
+				    nr_events);
+}
 
-		err = 0;
+int hyp_trace_init_mod_events(struct hyp_event *event,
+			      struct hyp_event_id *event_id, int nr_events)
+{
+	struct hyp_event_table *tables;
+	int ret, i;
+
+	ret = hyp_event_table_init(event, event_id, nr_events);
+	if (ret)
+		return ret;
+
+	tables = kmalloc_array(mod_event_tables.nr_tables + 1,
+			       sizeof(*tables), GFP_KERNEL);
+	if (!tables)
+		return -ENOMEM;
+
+	for (i = 0; i < mod_event_tables.nr_tables; i++) {
+		tables[i].start = mod_event_tables.tables[i].start;
+		tables[i].nr_events = mod_event_tables.tables[i].nr_events;
 	}
+	tables[i].start = event;
+	tables[i].nr_events = nr_events;
 
-	return err;
+	tables = rcu_replace_pointer(mod_event_tables.tables, tables, true);
+	synchronize_rcu();
+	mod_event_tables.nr_tables++;
+	kfree(tables);
+
+	hyp_event_table_init_tracefs(event, nr_events);
+
+	return 0;
 }

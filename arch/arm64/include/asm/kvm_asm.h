@@ -22,12 +22,14 @@
 #define ARM_EXCEPTION_IL	  3
 /* The hyp-stub will return this for any kvm_call_hyp() call */
 #define ARM_EXCEPTION_HYP_GONE	  HVC_STUB_ERR
+#define ARM_EXCEPTION_HYP_REQ	  5
 
 #define kvm_arm_exception_type					\
 	{ARM_EXCEPTION_IRQ,		"IRQ"		},	\
 	{ARM_EXCEPTION_EL1_SERROR, 	"SERROR"	},	\
 	{ARM_EXCEPTION_TRAP, 		"TRAP"		},	\
-	{ARM_EXCEPTION_HYP_GONE,	"HYP_GONE"	}
+	{ARM_EXCEPTION_HYP_GONE,	"HYP_GONE"	},	\
+	{ARM_EXCEPTION_HYP_REQ,		"HYP_REQ"	}
 
 /*
  * Size of the HYP vectors preamble. kvm_patch_vector_branch() generates code
@@ -61,19 +63,28 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___vgic_v3_get_gic_config,
 	__KVM_HOST_SMCCC_FUNC___kvm_flush_vm_context,
 	__KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid_ipa,
+	__KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid_ipa_nsh,
 	__KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid,
+	__KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid_range,
 	__KVM_HOST_SMCCC_FUNC___kvm_flush_cpu_context,
 	__KVM_HOST_SMCCC_FUNC___pkvm_alloc_module_va,
 	__KVM_HOST_SMCCC_FUNC___pkvm_map_module_page,
 	__KVM_HOST_SMCCC_FUNC___pkvm_unmap_module_page,
 	__KVM_HOST_SMCCC_FUNC___pkvm_init_module,
 	__KVM_HOST_SMCCC_FUNC___pkvm_register_hcall,
+	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_init,
 	__KVM_HOST_SMCCC_FUNC___pkvm_prot_finalize,
 
 	/* Hypercalls available after pKVM finalisation */
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_share_hyp,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_unshare_hyp,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_map_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_unmap_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_relax_perms,
+	__KVM_HOST_SMCCC_FUNC___pkvm_wrprotect,
+	__KVM_HOST_SMCCC_FUNC___pkvm_dirty_log,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_split_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_tlb_flush_vmid,
 	__KVM_HOST_SMCCC_FUNC___kvm_adjust_pc,
 	__KVM_HOST_SMCCC_FUNC___kvm_vcpu_run,
 	__KVM_HOST_SMCCC_FUNC___kvm_timer_set_cntvoff,
@@ -87,19 +98,23 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_load,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_put,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_sync_state,
-	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_driver_init,
-	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_register,
-	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_pm_notify,
-	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_finalize,
 	__KVM_HOST_SMCCC_FUNC___pkvm_load_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_teardown_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_enable_tracing,
-	__KVM_HOST_SMCCC_FUNC___pkvm_rb_swap_reader_page,
-	__KVM_HOST_SMCCC_FUNC___pkvm_rb_update_footers,
+	__KVM_HOST_SMCCC_FUNC___pkvm_swap_reader_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_enable_event,
-#ifdef CONFIG_ANDROID_ARM64_WORKAROUND_DMA_BEYOND_POC
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_set_stage2_memattr,
-#endif
+	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_alloc_mgt_refill,
+	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_alloc_mgt_reclaimable,
+	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_alloc_mgt_reclaim,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_alloc_domain,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_free_domain,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_attach_dev,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_detach_dev,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_map_pages,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_unmap_pages,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_iova_to_phys,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_hvc_pd,
+	__KVM_HOST_SMCCC_FUNC___pkvm_stage2_snapshot,
 
 	/*
 	 * Start of the dynamically registered hypercalls. Start a bit
@@ -268,6 +283,11 @@ extern void __kvm_flush_vm_context(void);
 extern void __kvm_flush_cpu_context(struct kvm_s2_mmu *mmu);
 extern void __kvm_tlb_flush_vmid_ipa(struct kvm_s2_mmu *mmu, phys_addr_t ipa,
 				     int level);
+extern void __kvm_tlb_flush_vmid_ipa_nsh(struct kvm_s2_mmu *mmu,
+					 phys_addr_t ipa,
+					 int level);
+extern void __kvm_tlb_flush_vmid_range(struct kvm_s2_mmu *mmu,
+					phys_addr_t start, unsigned long pages);
 extern void __kvm_tlb_flush_vmid(struct kvm_s2_mmu *mmu);
 
 extern void __kvm_timer_set_cntvoff(u64 cntvoff);
@@ -308,6 +328,24 @@ extern u64 __kvm_get_mdcr_el2(void);
 	__kvm_at_err;							\
 } )
 
+void __noreturn hyp_panic(void);
+asmlinkage void kvm_unexpected_el2_exception(void);
+asmlinkage void __noreturn hyp_panic(void);
+asmlinkage void __noreturn hyp_panic_bad_stack(void);
+asmlinkage void kvm_unexpected_el2_exception(void);
+struct kvm_cpu_context;
+void handle_trap(struct kvm_cpu_context *host_ctxt);
+asmlinkage void __noreturn __kvm_host_psci_cpu_entry(bool is_cpu_on);
+void __noreturn __pkvm_init_finalise(void);
+void kvm_nvhe_prepare_backtrace(unsigned long fp, unsigned long pc);
+void kvm_patch_vector_branch(struct alt_instr *alt,
+	__le32 *origptr, __le32 *updptr, int nr_inst);
+void kvm_get_kimage_voffset(struct alt_instr *alt,
+	__le32 *origptr, __le32 *updptr, int nr_inst);
+void kvm_compute_final_ctr_el0(struct alt_instr *alt,
+	__le32 *origptr, __le32 *updptr, int nr_inst);
+void __noreturn __cold nvhe_hyp_panic_handler(u64 esr, u64 spsr, u64 elr_virt,
+	u64 elr_phys, u64 par, uintptr_t vcpu, u64 far, u64 hpfar);
 
 #else /* __ASSEMBLY__ */
 

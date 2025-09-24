@@ -14,6 +14,7 @@
 #include <linux/memcontrol.h>
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
+#include <linux/page_size_compat.h>
 #include <linux/kernel-page-flags.h>
 #include <linux/uaccess.h>
 #include "internal.h"
@@ -67,7 +68,7 @@ static ssize_t kpagecount_read(struct file *file, char __user *buf,
 		 */
 		ppage = pfn_to_online_page(pfn);
 
-		if (!ppage || PageSlab(ppage) || page_has_type(ppage))
+		if (!ppage)
 			pcount = 0;
 		else
 			pcount = page_mapcount(ppage);
@@ -124,11 +125,8 @@ u64 stable_page_flags(struct page *page)
 
 	/*
 	 * pseudo flags for the well known (anonymous) memory mapped pages
-	 *
-	 * Note that page->_mapcount is overloaded in SLOB/SLUB/SLQB, so the
-	 * simple test in page_mapped() is not enough.
 	 */
-	if (!PageSlab(page) && page_mapped(page))
+	if (page_mapped(page))
 		u |= 1 << KPF_MMAP;
 	if (PageAnon(page))
 		u |= 1 << KPF_ANON;
@@ -165,9 +163,8 @@ u64 stable_page_flags(struct page *page)
 
 
 	/*
-	 * Caveats on high order pages: page->_refcount will only be set
-	 * -1 on the head page; SLUB/SLQB do the same for PG_slab;
-	 * SLOB won't set PG_slab at all on compound pages.
+	 * Caveats on high order pages: PG_buddy and PG_slab will only be set
+	 * on the head page.
 	 */
 	if (PageBuddy(page))
 		u |= 1 << KPF_BUDDY;
@@ -185,7 +182,7 @@ u64 stable_page_flags(struct page *page)
 	u |= kpf_copy_bit(k, KPF_LOCKED,	PG_locked);
 
 	u |= kpf_copy_bit(k, KPF_SLAB,		PG_slab);
-	if (PageTail(page) && PageSlab(compound_head(page)))
+	if (PageTail(page) && PageSlab(page))
 		u |= 1 << KPF_SLAB;
 
 	u |= kpf_copy_bit(k, KPF_ERROR,		PG_error);
@@ -219,8 +216,9 @@ u64 stable_page_flags(struct page *page)
 	u |= kpf_copy_bit(k, KPF_PRIVATE_2,	PG_private_2);
 	u |= kpf_copy_bit(k, KPF_OWNER_PRIVATE,	PG_owner_priv_1);
 	u |= kpf_copy_bit(k, KPF_ARCH,		PG_arch_1);
-#ifdef CONFIG_64BIT
+#ifdef CONFIG_ARCH_USES_PG_ARCH_X
 	u |= kpf_copy_bit(k, KPF_ARCH_2,	PG_arch_2);
+	u |= kpf_copy_bit(k, KPF_ARCH_3,	PG_arch_3);
 #endif
 
 	return u;
@@ -332,6 +330,9 @@ static const struct proc_ops kpagecgroup_proc_ops = {
 
 static int __init proc_page_init(void)
 {
+	if (__PAGE_SIZE != PAGE_SIZE)
+		return 0;
+
 	proc_create("kpagecount", S_IRUSR, NULL, &kpagecount_proc_ops);
 	proc_create("kpageflags", S_IRUSR, NULL, &kpageflags_proc_ops);
 #ifdef CONFIG_MEMCG

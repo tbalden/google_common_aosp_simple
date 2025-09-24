@@ -166,7 +166,7 @@ static void handle_se_timeout(struct spi_master *spi,
 		 * doesn`t support CMD Cancel sequnece
 		 */
 		spin_unlock_irq(&mas->lock);
-		goto reset_if_dma;
+		goto unmap_if_dma;
 	}
 
 	reinit_completion(&mas->cancel_done);
@@ -175,7 +175,7 @@ static void handle_se_timeout(struct spi_master *spi,
 
 	time_left = wait_for_completion_timeout(&mas->cancel_done, HZ);
 	if (time_left)
-		goto reset_if_dma;
+		goto unmap_if_dma;
 
 	spin_lock_irq(&mas->lock);
 	reinit_completion(&mas->abort_done);
@@ -193,7 +193,7 @@ static void handle_se_timeout(struct spi_master *spi,
 		mas->abort_failed = true;
 	}
 
-reset_if_dma:
+unmap_if_dma:
 	if (mas->cur_xfer_mode == GENI_SE_DMA) {
 		if (xfer) {
 			if (xfer->tx_buf) {
@@ -413,9 +413,9 @@ static int setup_fifo_params(struct spi_device *spi_slv,
 			cpha = CPHA;
 
 		if (spi_slv->mode & SPI_CS_HIGH)
-			demux_output_inv = BIT(spi_slv->chip_select);
+			demux_output_inv = BIT(spi_get_chipselect(spi_slv, 0));
 
-		demux_sel = spi_slv->chip_select;
+		demux_sel = spi_get_chipselect(spi_slv, 0);
 		mas->cur_bits_per_word = spi_slv->bits_per_word;
 
 		spi_setup_word_len(mas, spi_slv->mode, spi_slv->bits_per_word);
@@ -491,7 +491,7 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
 	peripheral.loopback_en = !!(spi_slv->mode & SPI_LOOP);
 	peripheral.clock_pol_high = !!(spi_slv->mode & SPI_CPOL);
 	peripheral.data_pol_high = !!(spi_slv->mode & SPI_CPHA);
-	peripheral.cs = spi_slv->chip_select;
+	peripheral.cs = spi_get_chipselect(spi_slv, 0);
 	peripheral.pack_en = true;
 	peripheral.word_len = xfer->bits_per_word - MIN_WORD_LEN;
 
@@ -1108,6 +1108,11 @@ static int spi_geni_probe(struct platform_device *pdev)
 	init_completion(&mas->tx_reset_done);
 	init_completion(&mas->rx_reset_done);
 	spin_lock_init(&mas->lock);
+
+	ret = geni_icc_get(&mas->se, NULL);
+	if (ret)
+		return ret;
+
 	pm_runtime_use_autosuspend(&pdev->dev);
 	pm_runtime_set_autosuspend_delay(&pdev->dev, 250);
 	ret = devm_pm_runtime_enable(dev);
@@ -1117,9 +1122,6 @@ static int spi_geni_probe(struct platform_device *pdev)
 	if (device_property_read_bool(&pdev->dev, "spi-slave"))
 		spi->slave = true;
 
-	ret = geni_icc_get(&mas->se, NULL);
-	if (ret)
-		return ret;
 	/* Set the bus quota to a reasonable value for register access */
 	mas->se.icc_paths[GENI_TO_CORE].avg_bw = Bps_to_icc(CORE_2X_50_MHZ);
 	mas->se.icc_paths[CPU_TO_GENI].avg_bw = GENI_DEFAULT_BW;

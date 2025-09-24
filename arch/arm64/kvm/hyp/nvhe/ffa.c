@@ -67,6 +67,9 @@ struct kvm_ffa_buffers {
  */
 static struct kvm_ffa_buffers hyp_buffers;
 static struct kvm_ffa_buffers host_buffers;
+static u32 hyp_ffa_version;
+static bool has_version_negotiated;
+static hyp_spinlock_t version_lock;
 
 static void ffa_to_smccc_error(struct arm_smccc_res *res, u64 ffa_errno)
 {
@@ -108,7 +111,7 @@ static bool is_ffa_call(u64 func_id)
 	       ARM_SMCCC_FUNC_NUM(func_id) <= FFA_MAX_FUNC_NUM;
 }
 
-static int spmd_map_ffa_buffers(u64 ffa_page_count)
+static int ffa_map_hyp_buffers(u64 ffa_page_count)
 {
 	struct arm_smccc_res res;
 
@@ -122,7 +125,7 @@ static int spmd_map_ffa_buffers(u64 ffa_page_count)
 	return res.a0 == FFA_SUCCESS ? FFA_RET_SUCCESS : res.a2;
 }
 
-static int spmd_unmap_ffa_buffers(void)
+static int ffa_unmap_hyp_buffers(void)
 {
 	struct arm_smccc_res res;
 
@@ -134,7 +137,7 @@ static int spmd_unmap_ffa_buffers(void)
 	return res.a0 == FFA_SUCCESS ? FFA_RET_SUCCESS : res.a2;
 }
 
-static void spmd_mem_frag_tx(struct arm_smccc_res *res, u32 handle_lo,
+static void ffa_mem_frag_tx(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 fraglen, u32 endpoint_id)
 {
 	arm_smccc_1_1_smc(FFA_MEM_FRAG_TX,
@@ -143,7 +146,7 @@ static void spmd_mem_frag_tx(struct arm_smccc_res *res, u32 handle_lo,
 			  res);
 }
 
-static void spmd_mem_frag_rx(struct arm_smccc_res *res, u32 handle_lo,
+static void ffa_mem_frag_rx(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 fragoff)
 {
 	arm_smccc_1_1_smc(FFA_MEM_FRAG_RX,
@@ -152,7 +155,7 @@ static void spmd_mem_frag_rx(struct arm_smccc_res *res, u32 handle_lo,
 			  res);
 }
 
-static void spmd_mem_xfer(struct arm_smccc_res *res, u64 func_id, u32 len,
+static void ffa_mem_xfer(struct arm_smccc_res *res, u64 func_id, u32 len,
 			  u32 fraglen)
 {
 	arm_smccc_1_1_smc(func_id, len, fraglen,
@@ -160,7 +163,7 @@ static void spmd_mem_xfer(struct arm_smccc_res *res, u64 func_id, u32 len,
 			  res);
 }
 
-static void spmd_mem_reclaim(struct arm_smccc_res *res, u32 handle_lo,
+static void ffa_mem_reclaim(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 flags)
 {
 	arm_smccc_1_1_smc(FFA_MEM_RECLAIM,
@@ -169,10 +172,18 @@ static void spmd_mem_reclaim(struct arm_smccc_res *res, u32 handle_lo,
 			  res);
 }
 
-static void spmd_retrieve_req(struct arm_smccc_res *res, u32 len)
+static void ffa_retrieve_req(struct arm_smccc_res *res, u32 len)
 {
 	arm_smccc_1_1_smc(FFA_FN64_MEM_RETRIEVE_REQ,
 			  len, len,
+			  0, 0, 0, 0, 0,
+			  res);
+}
+
+static void ffa_rx_release(struct arm_smccc_res *res)
+{
+	arm_smccc_1_1_smc(FFA_RX_RELEASE,
+			  0, 0,
 			  0, 0, 0, 0, 0,
 			  res);
 }
@@ -202,7 +213,11 @@ static void do_ffa_rxtx_map(struct arm_smccc_res *res,
 		goto out_unlock;
 	}
 
-	ret = spmd_map_ffa_buffers(npages);
+	/*
+	 * Map our hypervisor buffers into the SPMD before mapping and
+	 * pinning the host buffers in our own address space.
+	 */
+	ret = ffa_map_hyp_buffers(npages);
 	if (ret)
 		goto out_unlock;
 
@@ -248,7 +263,7 @@ err_unshare_rx:
 err_unshare_tx:
 	__pkvm_host_unshare_hyp(hyp_phys_to_pfn(tx));
 err_unmap:
-	spmd_unmap_ffa_buffers();
+	ffa_unmap_hyp_buffers();
 	goto out_unlock;
 }
 
@@ -277,7 +292,7 @@ static void do_ffa_rxtx_unmap(struct arm_smccc_res *res,
 	WARN_ON(__pkvm_host_unshare_hyp(hyp_virt_to_pfn(host_buffers.rx)));
 	host_buffers.rx = NULL;
 
-	spmd_unmap_ffa_buffers();
+	ffa_unmap_hyp_buffers();
 
 out_unlock:
 	hyp_spin_unlock(&host_buffers.lock);
@@ -385,12 +400,12 @@ static void do_ffa_mem_frag_tx(struct arm_smccc_res *res,
 		 * to restore the global state back to what it was prior to
 		 * transmission of the first fragment.
 		 */
-		spmd_mem_reclaim(res, handle_lo, handle_hi, 0);
+		ffa_mem_reclaim(res, handle_lo, handle_hi, 0);
 		WARN_ON(res->a0 != FFA_SUCCESS);
 		goto out_unlock;
 	}
 
-	spmd_mem_frag_tx(res, handle_lo, handle_hi, fraglen, endpoint_id);
+	ffa_mem_frag_tx(res, handle_lo, handle_hi, fraglen, endpoint_id);
 	if (res->a0 != FFA_SUCCESS && res->a0 != FFA_MEM_FRAG_RX)
 		WARN_ON(ffa_host_unshare_ranges(buf, nr_ranges));
 
@@ -419,6 +434,7 @@ static void __do_ffa_mem_xfer(const u64 func_id,
 	DECLARE_REG(u32, fraglen, ctxt, 2);
 	DECLARE_REG(u64, addr_mbz, ctxt, 3);
 	DECLARE_REG(u32, npages_mbz, ctxt, 4);
+	struct ffa_mem_region_attributes *ep_mem_access;
 	struct ffa_composite_mem_region *reg;
 	struct ffa_mem_region *buf;
 	u32 offset, nr_ranges;
@@ -450,7 +466,9 @@ static void __do_ffa_mem_xfer(const u64 func_id,
 	buf = hyp_buffers.tx;
 	memcpy(buf, host_buffers.tx, fraglen);
 
-	offset = buf->ep_mem_access[0].composite_off;
+	ep_mem_access = (void *)buf +
+			ffa_mem_desc_offset(buf, 0, hyp_ffa_version);
+	offset = ep_mem_access->composite_off;
 	if (!offset || buf->ep_count != 1 || buf->sender_id != HOST_FFA_ID) {
 		ret = FFA_RET_INVALID_PARAMETERS;
 		goto out_unlock;
@@ -473,7 +491,7 @@ static void __do_ffa_mem_xfer(const u64 func_id,
 	if (ret)
 		goto out_unlock;
 
-	spmd_mem_xfer(res, func_id, len, fraglen);
+	ffa_mem_xfer(res, func_id, len, fraglen);
 	if (fraglen != len) {
 		if (res->a0 != FFA_MEM_FRAG_RX)
 			goto err_unshare;
@@ -509,6 +527,7 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 	DECLARE_REG(u32, handle_lo, ctxt, 1);
 	DECLARE_REG(u32, handle_hi, ctxt, 2);
 	DECLARE_REG(u32, flags, ctxt, 3);
+	struct ffa_mem_region_attributes *ep_mem_access;
 	struct ffa_composite_mem_region *reg;
 	u32 offset, len, fraglen, fragoff;
 	struct ffa_mem_region *buf;
@@ -525,7 +544,7 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 		.handle		= handle,
 	};
 
-	spmd_retrieve_req(res, sizeof(*buf));
+	ffa_retrieve_req(res, sizeof(*buf));
 	buf = hyp_buffers.rx;
 	if (res->a0 != FFA_MEM_RETRIEVE_RESP)
 		goto out_unlock;
@@ -533,7 +552,9 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 	len = res->a1;
 	fraglen = res->a2;
 
-	offset = buf->ep_mem_access[0].composite_off;
+	ep_mem_access = (void *)buf +
+			ffa_mem_desc_offset(buf, 0, hyp_ffa_version);
+	offset = ep_mem_access->composite_off;
 	/*
 	 * We can trust the SPMD to get this right, but let's at least
 	 * check that we end up with something that doesn't look _completely_
@@ -542,19 +563,22 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 	if (WARN_ON(offset > len ||
 		    fraglen > KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE)) {
 		ret = FFA_RET_ABORTED;
+		ffa_rx_release(res);
 		goto out_unlock;
 	}
 
 	if (len > ffa_desc_buf.len) {
 		ret = FFA_RET_NO_MEMORY;
+		ffa_rx_release(res);
 		goto out_unlock;
 	}
 
 	buf = ffa_desc_buf.buf;
 	memcpy(buf, hyp_buffers.rx, fraglen);
+	ffa_rx_release(res);
 
 	for (fragoff = fraglen; fragoff < len; fragoff += fraglen) {
-		spmd_mem_frag_rx(res, handle_lo, handle_hi, fragoff);
+		ffa_mem_frag_rx(res, handle_lo, handle_hi, fragoff);
 		if (res->a0 != FFA_MEM_FRAG_TX) {
 			ret = FFA_RET_INVALID_PARAMETERS;
 			goto out_unlock;
@@ -562,9 +586,10 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 
 		fraglen = res->a3;
 		memcpy((void *)buf + fragoff, hyp_buffers.rx, fraglen);
+		ffa_rx_release(res);
 	}
 
-	spmd_mem_reclaim(res, handle_lo, handle_hi, flags);
+	ffa_mem_reclaim(res, handle_lo, handle_hi, flags);
 	if (res->a0 != FFA_SUCCESS)
 		goto out_unlock;
 
@@ -579,7 +604,11 @@ out_unlock:
 		ffa_to_smccc_res(res, ret);
 }
 
-static bool ffa_call_unsupported(u64 func_id)
+/*
+ * Is a given FFA function supported, either by forwarding on directly
+ * or by handling at EL2?
+ */
+static bool ffa_call_supported(u64 func_id)
 {
 	switch (func_id) {
 	/* Unsupported memory management calls */
@@ -595,15 +624,14 @@ static bool ffa_call_unsupported(u64 func_id)
 	case FFA_MSG_POLL:
 	case FFA_MSG_WAIT:
 	/* 32-bit variants of 64-bit calls */
-	case FFA_MSG_SEND_DIRECT_REQ:
 	case FFA_MSG_SEND_DIRECT_RESP:
 	case FFA_RXTX_MAP:
 	case FFA_MEM_DONATE:
 	case FFA_MEM_RETRIEVE_REQ:
-		return true;
+		return false;
 	}
 
-	return false;
+	return true;
 }
 
 static bool do_ffa_features(struct arm_smccc_res *res,
@@ -613,7 +641,7 @@ static bool do_ffa_features(struct arm_smccc_res *res,
 	u64 prop = 0;
 	int ret = 0;
 
-	if (ffa_call_unsupported(id)) {
+	if (!ffa_call_supported(id)) {
 		ret = FFA_RET_NOT_SUPPORTED;
 		goto out_handled;
 	}
@@ -635,66 +663,10 @@ out_handled:
 	return true;
 }
 
-bool kvm_host_ffa_handler(struct kvm_cpu_context *host_ctxt)
+static int hyp_ffa_post_init(void)
 {
-	DECLARE_REG(u64, func_id, host_ctxt, 0);
-	struct arm_smccc_res res;
-
-	if (!is_ffa_call(func_id))
-		return false;
-
-	switch (func_id) {
-	case FFA_FEATURES:
-		if (!do_ffa_features(&res, host_ctxt))
-			return false;
-		goto out_handled;
-	/* Memory management */
-	case FFA_FN64_RXTX_MAP:
-		do_ffa_rxtx_map(&res, host_ctxt);
-		goto out_handled;
-	case FFA_RXTX_UNMAP:
-		do_ffa_rxtx_unmap(&res, host_ctxt);
-		goto out_handled;
-	case FFA_MEM_SHARE:
-	case FFA_FN64_MEM_SHARE:
-		do_ffa_mem_xfer(FFA_FN64_MEM_SHARE, &res, host_ctxt);
-		goto out_handled;
-	case FFA_MEM_RECLAIM:
-		do_ffa_mem_reclaim(&res, host_ctxt);
-		goto out_handled;
-	case FFA_MEM_LEND:
-	case FFA_FN64_MEM_LEND:
-		do_ffa_mem_xfer(FFA_FN64_MEM_LEND, &res, host_ctxt);
-		goto out_handled;
-	case FFA_MEM_FRAG_TX:
-		do_ffa_mem_frag_tx(&res, host_ctxt);
-		goto out_handled;
-	}
-
-	if (!ffa_call_unsupported(func_id))
-		return false; /* Pass through */
-
-	ffa_to_smccc_error(&res, FFA_RET_NOT_SUPPORTED);
-out_handled:
-	ffa_set_retval(host_ctxt, &res);
-	return true;
-}
-
-int hyp_ffa_init(void *pages)
-{
-	struct arm_smccc_res res;
 	size_t min_rxtx_sz;
-	void *tx, *rx;
-
-	if (kvm_host_psci_config.smccc_version < ARM_SMCCC_VERSION_1_1)
-		return 0;
-
-	arm_smccc_1_1_smc(FFA_VERSION, FFA_VERSION_1_0, 0, 0, 0, 0, 0, 0, &res);
-	if (res.a0 == FFA_RET_NOT_SUPPORTED)
-		return 0;
-
-	if (res.a0 != FFA_VERSION_1_0)
-		return -EOPNOTSUPP;
+	struct arm_smccc_res res;
 
 	arm_smccc_1_1_smc(FFA_ID_GET, 0, 0, 0, 0, 0, 0, 0, &res);
 	if (res.a0 != FFA_SUCCESS)
@@ -725,6 +697,212 @@ int hyp_ffa_init(void *pages)
 	if (min_rxtx_sz > PAGE_SIZE)
 		return -EOPNOTSUPP;
 
+	return 0;
+}
+
+static void do_ffa_version(struct arm_smccc_res *res,
+			   struct kvm_cpu_context *ctxt)
+{
+	DECLARE_REG(u32, ffa_req_version, ctxt, 1);
+
+	if (FFA_MAJOR_VERSION(ffa_req_version) != 1) {
+		res->a0 = FFA_RET_NOT_SUPPORTED;
+		return;
+	}
+
+	hyp_spin_lock(&version_lock);
+	if (has_version_negotiated) {
+		res->a0 = hyp_ffa_version;
+		goto unlock;
+	}
+
+	/*
+	 * If the client driver tries to downgrade the version, we need to ask
+	 * first if TEE supports it.
+	 */
+	if (FFA_MINOR_VERSION(ffa_req_version) < FFA_MINOR_VERSION(hyp_ffa_version)) {
+		arm_smccc_1_1_smc(FFA_VERSION, ffa_req_version, 0,
+				  0, 0, 0, 0, 0,
+				  res);
+		if (res->a0 == FFA_RET_NOT_SUPPORTED)
+			goto unlock;
+
+		hyp_ffa_version = ffa_req_version;
+	}
+
+	if (hyp_ffa_post_init())
+		res->a0 = FFA_RET_NOT_SUPPORTED;
+	else {
+		has_version_negotiated = true;
+		res->a0 = hyp_ffa_version;
+	}
+unlock:
+	hyp_spin_unlock(&version_lock);
+}
+
+static void do_ffa_part_get(struct arm_smccc_res *res,
+			    struct kvm_cpu_context *ctxt)
+{
+	DECLARE_REG(u32, uuid0, ctxt, 1);
+	DECLARE_REG(u32, uuid1, ctxt, 2);
+	DECLARE_REG(u32, uuid2, ctxt, 3);
+	DECLARE_REG(u32, uuid3, ctxt, 4);
+	DECLARE_REG(u32, flags, ctxt, 5);
+	u32 count, partition_sz, copy_sz;
+
+	hyp_spin_lock(&host_buffers.lock);
+	if (!host_buffers.rx) {
+		ffa_to_smccc_res(res, FFA_RET_BUSY);
+		goto out_unlock;
+	}
+
+	arm_smccc_1_1_smc(FFA_PARTITION_INFO_GET, uuid0, uuid1,
+			  uuid2, uuid3, flags, 0, 0,
+			  res);
+
+	if (res->a0 != FFA_SUCCESS)
+		goto out_unlock;
+
+	count = res->a2;
+	if (!count)
+		goto out_unlock;
+
+	if (hyp_ffa_version > FFA_VERSION_1_0) {
+		/* Get the number of partitions deployed in the system */
+		if (flags & 0x1)
+			goto out_unlock;
+
+		partition_sz  = res->a3;
+	} else {
+		/* FFA_VERSION_1_0 lacks the size in the response */
+		partition_sz = FFA_1_0_PARTITON_INFO_SZ;
+	}
+
+	copy_sz = partition_sz * count;
+	if (copy_sz > KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE) {
+		ffa_to_smccc_res(res, FFA_RET_ABORTED);
+		goto out_unlock;
+	}
+
+	memcpy(host_buffers.rx, hyp_buffers.rx, copy_sz);
+out_unlock:
+	hyp_spin_unlock(&host_buffers.lock);
+}
+
+bool kvm_host_ffa_handler(struct kvm_cpu_context *ctxt, u32 func_id)
+{
+	DECLARE_REG(u64, arg1, ctxt, 1);
+	DECLARE_REG(u64, arg2, ctxt, 2);
+	DECLARE_REG(u64, arg3, ctxt, 3);
+	DECLARE_REG(u64, arg4, ctxt, 4);
+	struct arm_smccc_res res;
+	bool handled = true;
+	int err = 0;
+
+	/*
+	 * There's no way we can tell what a non-standard SMC call might
+	 * be up to. Ideally, we would terminate these here and return
+	 * an error to the host, but sadly devices make use of custom
+	 * firmware calls for things like power management, debugging,
+	 * RNG access and crash reporting.
+	 *
+	 * Given that the architecture requires us to trust EL3 anyway,
+	 * we forward unrecognised calls on under the assumption that
+	 * the firmware doesn't expose a mechanism to access arbitrary
+	 * non-secure memory. Short of a per-device table of SMCs, this
+	 * is the best we can do.
+	 */
+	if (!is_ffa_call(func_id))
+		return false;
+
+	if (!has_version_negotiated && func_id != FFA_VERSION) {
+		ffa_to_smccc_error(&res, FFA_RET_INVALID_PARAMETERS);
+		goto unhandled;
+	}
+
+	switch (func_id) {
+	case FFA_FEATURES:
+		if (!do_ffa_features(&res, ctxt)) {
+			handled = false;
+			goto unhandled;
+		}
+		break;
+	/* Memory management */
+	case FFA_FN64_RXTX_MAP:
+		do_ffa_rxtx_map(&res, ctxt);
+		break;
+	case FFA_RXTX_UNMAP:
+		do_ffa_rxtx_unmap(&res, ctxt);
+		break;
+	case FFA_MEM_SHARE:
+	case FFA_FN64_MEM_SHARE:
+		do_ffa_mem_xfer(FFA_FN64_MEM_SHARE, &res, ctxt);
+		break;
+	case FFA_MEM_RECLAIM:
+		do_ffa_mem_reclaim(&res, ctxt);
+		break;
+	case FFA_MEM_LEND:
+	case FFA_FN64_MEM_LEND:
+		do_ffa_mem_xfer(FFA_FN64_MEM_LEND, &res, ctxt);
+		break;
+	case FFA_MEM_FRAG_TX:
+		do_ffa_mem_frag_tx(&res, ctxt);
+		break;
+	case FFA_VERSION:
+		do_ffa_version(&res, ctxt);
+		break;
+	case FFA_PARTITION_INFO_GET:
+		do_ffa_part_get(&res, ctxt);
+		break;
+	default:
+		if (ffa_call_supported(func_id)) {
+			handled = false;
+			goto unhandled;
+		}
+
+		ffa_to_smccc_error(&res, FFA_RET_NOT_SUPPORTED);
+	}
+
+	ffa_set_retval(ctxt, &res);
+	err = res.a0 == FFA_SUCCESS ? 0 : res.a2;
+unhandled:
+	trace_host_ffa_call(func_id, arg1, arg2, arg3, arg4, handled, err);
+	return handled;
+}
+
+int hyp_ffa_init(void *pages)
+{
+	struct arm_smccc_res res;
+	void *tx, *rx;
+
+	if (kvm_host_psci_config.smccc_version < ARM_SMCCC_VERSION_1_1)
+		return 0;
+
+	arm_smccc_1_1_smc(FFA_VERSION, FFA_VERSION_1_1, 0, 0, 0, 0, 0, 0, &res);
+	if (res.a0 == FFA_RET_NOT_SUPPORTED)
+		return 0;
+
+	/*
+	 * Firmware returns the maximum supported version of the FF-A
+	 * implementation. Check that the returned version is
+	 * backwards-compatible with the hyp according to the rules in DEN0077A
+	 * v1.1 REL0 13.2.1.
+	 *
+	 * Of course, things are never simple when dealing with firmware. v1.1
+	 * broke ABI with v1.0 on several structures, which is itself
+	 * incompatible with the aforementioned versioning scheme. The
+	 * expectation is that v1.x implementations that do not support the v1.0
+	 * ABI return NOT_SUPPORTED rather than a version number, according to
+	 * DEN0077A v1.1 REL0 18.6.4.
+	 */
+	if (FFA_MAJOR_VERSION(res.a0) != 1)
+		return -EOPNOTSUPP;
+
+	if (FFA_MINOR_VERSION(res.a0) < FFA_MINOR_VERSION(FFA_VERSION_1_1))
+		hyp_ffa_version = res.a0;
+	else
+		hyp_ffa_version = FFA_VERSION_1_1;
+
 	tx = pages;
 	pages += KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE;
 	rx = pages;
@@ -746,5 +924,6 @@ int hyp_ffa_init(void *pages)
 		.lock	= __HYP_SPIN_LOCK_UNLOCKED,
 	};
 
+	version_lock = __HYP_SPIN_LOCK_UNLOCKED;
 	return 0;
 }

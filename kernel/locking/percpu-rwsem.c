@@ -19,26 +19,12 @@
  * will result to build-err. So we create
  * func:_trace_android_vh_record_pcpu_rwsem_starttime for percpu-rwsem.h to call.
  */
-void _trace_android_vh_record_pcpu_rwsem_starttime(struct task_struct *tsk,
+void _trace_android_vh_record_pcpu_rwsem_starttime(struct percpu_rw_semaphore *sem,
 		unsigned long settime)
 {
-	trace_android_vh_record_pcpu_rwsem_starttime(tsk, settime);
+	trace_android_vh_record_pcpu_rwsem_starttime(sem, settime);
 }
 EXPORT_SYMBOL_GPL(_trace_android_vh_record_pcpu_rwsem_starttime);
-
-/*
- * trace_android_vh_record_pcpu_rwsem_time_early is called in
- * include/linux/percpu-rwsem.h by including include/hooks/dtask.h, which
- * will result to build-err. So we create
- * func: _trace_android_vh_record_pcpu_rwsem_time_early for percpu-rwsem.h to call.
-*/
-
-void _trace_android_vh_record_pcpu_rwsem_time_early(
-		unsigned long settime, struct percpu_rw_semaphore *sem)
-{
-	trace_android_vh_record_pcpu_rwsem_time_early(settime, sem);
-}
-EXPORT_SYMBOL_GPL(_trace_android_vh_record_pcpu_rwsem_time_early);
 
 int __percpu_init_rwsem(struct percpu_rw_semaphore *sem,
 			const char *name, struct lock_class_key *key)
@@ -265,8 +251,6 @@ void __sched percpu_down_write(struct percpu_rw_semaphore *sem)
 	rwsem_acquire(&sem->dep_map, 0, 0, _RET_IP_);
 	trace_contention_begin(sem, LCB_F_PERCPU | LCB_F_WRITE);
 
-	trace_android_vh_record_pcpu_rwsem_time_early(jiffies, sem);
-
 	/* Notify readers to take the slow path. */
 	rcu_sync_enter(&sem->rss);
 
@@ -290,7 +274,7 @@ void __sched percpu_down_write(struct percpu_rw_semaphore *sem)
 	if (!complete)
 		rcuwait_wait_event(&sem->writer, readers_active_check(sem), TASK_UNINTERRUPTIBLE);
 	trace_contention_end(sem, 0);
-	trace_android_vh_record_pcpu_rwsem_starttime(current, jiffies);
+	trace_android_vh_record_pcpu_rwsem_starttime(sem, jiffies);
 }
 EXPORT_SYMBOL_GPL(percpu_down_write);
 
@@ -323,7 +307,6 @@ void percpu_up_write(struct percpu_rw_semaphore *sem)
 	 * exclusive write lock because its counting.
 	 */
 	rcu_sync_exit(&sem->rss);
-	trace_android_vh_record_pcpu_rwsem_time_early(0, sem);
-	trace_android_vh_record_pcpu_rwsem_starttime(current, 0);
+	trace_android_vh_record_pcpu_rwsem_starttime(sem, 0);
 }
 EXPORT_SYMBOL_GPL(percpu_up_write);

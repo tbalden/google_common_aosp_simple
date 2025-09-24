@@ -791,6 +791,10 @@ static int dmz_fixup_devices(struct dm_target *ti)
 				return -EINVAL;
 			}
 			zone_nr_sectors = bdev_zone_sectors(bdev);
+			if (!is_power_of_2(zone_nr_sectors)) {
+				ti->error = "Zone size is not a power-of-2 number of sectors";
+				return -EINVAL;
+			}
 			zoned_dev->zone_nr_sectors = zone_nr_sectors;
 			zoned_dev->nr_zones = bdev_nr_zones(bdev);
 		}
@@ -800,6 +804,10 @@ static int dmz_fixup_devices(struct dm_target *ti)
 
 		if (zoned_dev->flags & DMZ_BDEV_REGULAR) {
 			ti->error = "Disk is not a zoned device";
+			return -EINVAL;
+		}
+		if (!is_power_of_2(zoned_dev->zone_nr_sectors)) {
+			ti->error = "Zone size is not a power-of-2 number of sectors";
 			return -EINVAL;
 		}
 		zoned_dev->zone_nr_sectors = bdev_zone_sectors(bdev);
@@ -1118,7 +1126,6 @@ static void dmz_status(struct dm_target *ti, status_type_t type,
 		*result = '\0';
 		break;
 	}
-	return;
 }
 
 static int dmz_message(struct dm_target *ti, unsigned int argc, char **argv,
@@ -1138,7 +1145,7 @@ static int dmz_message(struct dm_target *ti, unsigned int argc, char **argv,
 	return r;
 }
 
-static struct target_type dmz_type = {
+static struct target_type zoned_target = {
 	.name		 = "zoned",
 	.version	 = {2, 0, 0},
 	.features	 = DM_TARGET_SINGLETON | DM_TARGET_MIXED_ZONED_MODEL,
@@ -1154,19 +1161,7 @@ static struct target_type dmz_type = {
 	.status		 = dmz_status,
 	.message	 = dmz_message,
 };
-
-static int __init dmz_init(void)
-{
-	return dm_register_target(&dmz_type);
-}
-
-static void __exit dmz_exit(void)
-{
-	dm_unregister_target(&dmz_type);
-}
-
-module_init(dmz_init);
-module_exit(dmz_exit);
+module_dm(zoned);
 
 MODULE_DESCRIPTION(DM_NAME " target for zoned block devices");
 MODULE_AUTHOR("Damien Le Moal <damien.lemoal@wdc.com>");

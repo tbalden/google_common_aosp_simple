@@ -20,7 +20,6 @@
 #include <sound/initval.h>
 #include <sound/soc-dpcm.h>
 #include <sound/soc-link.h>
-#include <linux/pm_runtime.h>
 
 static int snd_soc_compr_components_open(struct snd_compr_stream *cstream)
 {
@@ -134,8 +133,6 @@ err_no_lock:
 static int soc_compr_open_fe(struct snd_compr_stream *cstream)
 {
 	struct snd_soc_pcm_runtime *fe = cstream->private_data;
-	struct snd_pcm_substream *fe_substream =
-		 fe->pcm->streams[cstream->direction].substream;
 	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(fe, 0);
 	struct snd_soc_dpcm *dpcm;
 	struct snd_soc_dapm_widget_list *list;
@@ -143,7 +140,6 @@ static int soc_compr_open_fe(struct snd_compr_stream *cstream)
 	int ret;
 
 	snd_soc_card_mutex_lock(fe->card);
-	fe->dpcm[stream].runtime = fe_substream->runtime;
 
 	ret = dpcm_path_get(fe, stream, &list);
 	if (ret < 0)
@@ -153,7 +149,6 @@ static int soc_compr_open_fe(struct snd_compr_stream *cstream)
 
 	/* calculate valid and active FE <-> BE dpcms */
 	dpcm_process_paths(fe, stream, &list, 1);
-	fe->dpcm[stream].runtime = fe_substream->runtime;
 
 	fe->dpcm[stream].runtime_update = SND_SOC_DPCM_UPDATE_FE;
 
@@ -164,7 +159,6 @@ static int soc_compr_open_fe(struct snd_compr_stream *cstream)
 			dpcm->state = SND_SOC_DPCM_LINK_STATE_FREE;
 
 		dpcm_be_disconnect(fe, stream);
-		fe->dpcm[stream].runtime = NULL;
 		goto out;
 	}
 
@@ -236,8 +230,6 @@ static int soc_compr_free_fe(struct snd_compr_stream *cstream)
 	dpcm_be_disconnect(fe, stream);
 
 	snd_soc_dpcm_mutex_unlock(fe);
-
-	fe->dpcm[stream].runtime = NULL;
 
 	snd_soc_link_compr_shutdown(cstream, 0);
 
@@ -393,11 +385,15 @@ static int soc_compr_set_params_fe(struct snd_compr_stream *cstream,
 
 	fe->dpcm[stream].runtime_update = SND_SOC_DPCM_UPDATE_FE;
 
+	snd_soc_dpcm_mutex_lock(fe);
 	ret = dpcm_be_dai_hw_params(fe, stream);
+	snd_soc_dpcm_mutex_unlock(fe);
 	if (ret < 0)
 		goto out;
 
+	snd_soc_dpcm_mutex_lock(fe);
 	ret = dpcm_be_dai_prepare(fe, stream);
+	snd_soc_dpcm_mutex_unlock(fe);
 	if (ret < 0)
 		goto out;
 

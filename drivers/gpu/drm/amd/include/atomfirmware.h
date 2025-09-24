@@ -182,6 +182,7 @@ enum atom_dgpu_vram_type {
   ATOM_DGPU_VRAM_TYPE_HBM2  = 0x60,
   ATOM_DGPU_VRAM_TYPE_HBM2E = 0x61,
   ATOM_DGPU_VRAM_TYPE_GDDR6 = 0x70,
+  ATOM_DGPU_VRAM_TYPE_HBM3 = 0x80,
 };
 
 enum atom_dp_vs_preemph_def{
@@ -3159,6 +3160,24 @@ enum atom_umc_config1_def {
 	UMC_CONFIG1__ENABLE_ECC_CAPABLE = 0x00010000,
 };
 
+struct atom_umc_info_v4_0 {
+	struct atom_common_table_header table_header;
+	uint32_t ucode_reserved[5];
+	uint8_t umcip_min_ver;
+	uint8_t umcip_max_ver;
+	uint8_t vram_type;
+	uint8_t umc_config;
+	uint32_t mem_refclk_10khz;
+	uint32_t clk_reserved[4];
+	uint32_t golden_reserved;
+	uint32_t umc_config1;
+	uint32_t reserved[2];
+	uint8_t channel_num;
+	uint8_t channel_width;
+	uint8_t channel_reserve[2];
+	uint8_t umc_info_reserved[16];
+};
+
 /* 
   ***************************************************************************
     Data Table vram_info  structure
@@ -3532,7 +3551,7 @@ struct atom_gpio_voltage_object_v4
    uint8_t  phase_delay_us;                      // phase delay in unit of micro second
    uint8_t  reserved;   
    uint32_t gpio_mask_val;                         // GPIO Mask value
-   struct atom_voltage_gpio_map_lut voltage_gpio_lut[1];
+   struct atom_voltage_gpio_map_lut voltage_gpio_lut[] __counted_by(gpio_entry_num);
 };
 
 struct  atom_svid2_voltage_object_v4

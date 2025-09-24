@@ -13,7 +13,7 @@
 #include <net/rpl.h>
 
 struct rpl_iptunnel_encap {
-	struct ipv6_rpl_sr_hdr srh[0];
+	DECLARE_FLEX_ARRAY(struct ipv6_rpl_sr_hdr, srh);
 };
 
 struct rpl_lwt {
@@ -280,8 +280,6 @@ static int rpl_input(struct sk_buff *skb)
 	if (unlikely(err))
 		goto drop;
 
-	skb_dst_drop(skb);
-
 	if (!dst) {
 		ip6_route_input(skb);
 		dst = skb_dst(skb);
@@ -298,6 +296,7 @@ static int rpl_input(struct sk_buff *skb)
 		if (unlikely(err))
 			goto drop;
 	} else {
+		skb_dst_drop(skb);
 		skb_dst_set(skb, dst);
 	}
 

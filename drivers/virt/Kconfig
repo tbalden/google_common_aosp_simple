@@ -52,8 +52,10 @@ source "drivers/virt/coco/efi_secret/Kconfig"
 
 source "drivers/virt/coco/sev-guest/Kconfig"
 
-source "drivers/virt/gunyah/Kconfig"
+source "drivers/virt/coco/tdx-guest/Kconfig"
 
 source "drivers/virt/geniezone/Kconfig"
+
+source "drivers/virt/gunyah/Kconfig"
 
 endif

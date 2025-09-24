@@ -52,16 +52,6 @@
 
 struct tls_rec;
 
-struct tls_cipher_size_desc {
-	unsigned int iv;
-	unsigned int key;
-	unsigned int salt;
-	unsigned int tag;
-	unsigned int rec_seq;
-};
-
-extern const struct tls_cipher_size_desc tls_cipher_size_desc[];
-
 /* Maximum data size carried in a TLS record */
 #define TLS_MAX_PAYLOAD_SIZE		((size_t)1 << 14)
 
@@ -69,8 +59,6 @@ extern const struct tls_cipher_size_desc tls_cipher_size_desc[];
 #define TLS_NONCE_OFFSET		TLS_HEADER_SIZE
 
 #define TLS_CRYPTO_INFO_READY(info)	((info)->cipher_type)
-
-#define TLS_RECORD_TYPE_DATA		0x17
 
 #define TLS_AAD_SPACE_SIZE		13
 
@@ -125,7 +113,8 @@ struct tls_strparser {
 	u32 stopped : 1;
 	u32 copy_mode : 1;
 	u32 mixed_decrypted : 1;
-	u32 msg_ready : 1;
+
+	bool msg_ready;
 
 	struct strp_msg stm;
 
@@ -257,7 +246,7 @@ struct tls_context {
 	struct scatterlist *partially_sent_record;
 	u16 partially_sent_offset;
 
-	bool in_tcp_sendpages;
+	bool splicing_pages;
 	bool pending_open_record_frags;
 
 	struct mutex tx_lock; /* protects partially_sent_* fields and
@@ -374,10 +363,12 @@ struct sk_buff *
 tls_validate_xmit_skb_sw(struct sock *sk, struct net_device *dev,
 			 struct sk_buff *skb);
 
-static inline bool tls_is_sk_tx_device_offloaded(struct sock *sk)
+static inline bool tls_is_skb_tx_device_offloaded(const struct sk_buff *skb)
 {
-#ifdef CONFIG_SOCK_VALIDATE_XMIT
-	return sk_fullsock(sk) &&
+#ifdef CONFIG_TLS_DEVICE
+	struct sock *sk = skb->sk;
+
+	return sk && sk_fullsock(sk) &&
 	       (smp_load_acquire(&sk->sk_validate_xmit_skb) ==
 	       &tls_validate_xmit_skb);
 #else
@@ -415,8 +406,12 @@ tls_offload_ctx_tx(const struct tls_context *tls_ctx)
 
 static inline bool tls_sw_has_ctx_tx(const struct sock *sk)
 {
-	struct tls_context *ctx = tls_get_ctx(sk);
+	struct tls_context *ctx;
 
+	if (!sk_is_inet(sk) || !inet_test_bit(IS_ICSK, sk))
+		return false;
+
+	ctx = tls_get_ctx(sk);
 	if (!ctx)
 		return false;
 	return !!tls_sw_ctx_tx(ctx);
@@ -424,8 +419,12 @@ static inline bool tls_sw_has_ctx_tx(const struct sock *sk)
 
 static inline bool tls_sw_has_ctx_rx(const struct sock *sk)
 {
-	struct tls_context *ctx = tls_get_ctx(sk);
+	struct tls_context *ctx;
 
+	if (!sk_is_inet(sk) || !inet_test_bit(IS_ICSK, sk))
+		return false;
+
+	ctx = tls_get_ctx(sk);
 	if (!ctx)
 		return false;
 	return !!tls_sw_ctx_rx(ctx);

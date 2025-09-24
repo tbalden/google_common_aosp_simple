@@ -20,7 +20,6 @@
   crypto_alg_list
   crypto_alg_sem
   crypto_alloc_aead
-  crypto_alloc_base
   crypto_alloc_rng
   crypto_alloc_shash
   crypto_alloc_skcipher
@@ -28,6 +27,8 @@
   crypto_check_attr_type
   crypto_cipher_encrypt_one
   crypto_cipher_setkey
+  crypto_clone_cipher
+  crypto_clone_shash
   crypto_destroy_tfm
   crypto_drop_spawn
   crypto_get_default_null_skcipher
@@ -55,7 +56,6 @@
   crypto_remove_spawns
   crypto_req_done
   crypto_rng_reset
-  crypto_shash_alg_has_setkey
   crypto_shash_digest
   crypto_shash_final
   crypto_shash_finup
@@ -67,7 +67,7 @@
   crypto_skcipher_setkey
   crypto_spawn_tfm
   crypto_spawn_tfm2
-  crypto_unregister_aead
+  crypto_unregister_aeads
   crypto_unregister_alg
   crypto_unregister_rng
   crypto_unregister_rngs
@@ -76,6 +76,7 @@
   crypto_unregister_skciphers
   crypto_unregister_template
   crypto_unregister_templates
+  down_read
   down_write
   fortify_panic
   fpsimd_context_busy
@@ -93,15 +94,14 @@
   kmalloc_trace
   kmemdup
   ktime_get
-  __list_add_valid
-  __list_del_entry_valid
+  __list_add_valid_or_report
+  __list_del_entry_valid_or_report
   memcpy
   memset
   __mutex_init
   mutex_lock
   mutex_unlock
   panic
-  preempt_schedule
   preempt_schedule_notrace
   _printk
   ___ratelimit
@@ -115,6 +115,7 @@
   sg_init_table
   sg_next
   shash_free_singlespawn_instance
+  shash_no_setkey
   shash_register_instance
   skcipher_alloc_instance_simple
   skcipher_register_instance
@@ -125,7 +126,6 @@
   snprintf
   __stack_chk_fail
   strcmp
-  strlcat
   strlen
   strncmp
   strnlen
@@ -139,6 +139,7 @@
   __tracepoint_android_vh_aes_expandkey
   __tracepoint_android_vh_sha256
   tracepoint_probe_register
+  up_read
   up_write
   wait_for_completion
   xa_load

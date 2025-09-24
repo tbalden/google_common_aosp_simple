@@ -38,6 +38,7 @@
 #include "xfs_reflink.h"
 #include "xfs_ioctl.h"
 #include "xfs_xattr.h"
+#include "xfs_file.h"
 
 #include <linux/mount.h>
 #include <linux/namei.h>
@@ -665,7 +666,7 @@ xfs_ioc_fsbulkstat(
 	struct xfs_fsop_bulkreq	bulkreq;
 	struct xfs_ibulk	breq = {
 		.mp		= mp,
-		.mnt_userns	= file_mnt_user_ns(file),
+		.idmap		= file_mnt_idmap(file),
 		.ocount		= 0,
 	};
 	xfs_ino_t		lastino;
@@ -844,7 +845,7 @@ xfs_ioc_bulkstat(
 	struct xfs_bulk_ireq		hdr;
 	struct xfs_ibulk		breq = {
 		.mp			= mp,
-		.mnt_userns		= file_mnt_user_ns(file),
+		.idmap			= file_mnt_idmap(file),
 	};
 	int				error;
 
@@ -1125,7 +1126,18 @@ xfs_ioctl_setattr_xflags(
 
 	if (rtflag != XFS_IS_REALTIME_INODE(ip)) {
 		/* Can't change realtime flag if any extents are allocated. */
-		if (ip->i_df.if_nextents || ip->i_delayed_blks)
+		if (xfs_inode_has_filedata(ip))
+			return -EINVAL;
+
+		/*
+		 * If S_DAX is enabled on this file, we can only switch the
+		 * device if both support fsdax.  We can't update S_DAX because
+		 * there might be other threads walking down the access paths.
+		 */
+		if (IS_DAX(VFS_I(ip)) &&
+		    (mp->m_ddev_targp->bt_daxdev == NULL ||
+		     (mp->m_rtdev_targp &&
+		      mp->m_rtdev_targp->bt_daxdev == NULL)))
 			return -EINVAL;
 	}
 
@@ -1139,10 +1151,6 @@ xfs_ioctl_setattr_xflags(
 		if (xfs_is_reflink_inode(ip))
 			ip->i_diflags2 &= ~XFS_DIFLAG2_REFLINK;
 	}
-
-	/* Don't allow us to set DAX mode for a reflinked file for now. */
-	if ((fa->fsx_xflags & FS_XFLAG_DAX) && xfs_is_reflink_inode(ip))
-		return -EINVAL;
 
 	/* diflags2 only valid for v3 inodes. */
 	i_flags2 = xfs_flags2diflags2(ip, fa->fsx_xflags);
@@ -1239,7 +1247,7 @@ xfs_ioctl_setattr_check_extsize(
 	if (!fa->fsx_valid)
 		return 0;
 
-	if (S_ISREG(VFS_I(ip)->i_mode) && ip->i_df.if_nextents &&
+	if (S_ISREG(VFS_I(ip)->i_mode) && xfs_inode_has_filedata(ip) &&
 	    XFS_FSB_TO_B(mp, ip->i_extsize) != fa->fsx_extsize)
 		return -EINVAL;
 
@@ -1311,7 +1319,7 @@ xfs_ioctl_setattr_check_projid(
 
 int
 xfs_fileattr_set(
-	struct user_namespace	*mnt_userns,
+	struct mnt_idmap	*idmap,
 	struct dentry		*dentry,
 	struct fileattr		*fa)
 {
@@ -1385,7 +1393,7 @@ xfs_fileattr_set(
 	 */
 
 	if ((VFS_I(ip)->i_mode & (S_ISUID|S_ISGID)) &&
-	    !capable_wrt_inode_uidgid(mnt_userns, VFS_I(ip), CAP_FSETID))
+	    !capable_wrt_inode_uidgid(idmap, VFS_I(ip), CAP_FSETID))
 		VFS_I(ip)->i_mode &= ~(S_ISUID|S_ISGID);
 
 	/* Change the ownerships and register project quota modifications */

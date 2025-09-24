@@ -5,6 +5,10 @@
 #include <linux/cpufreq_times.h>
 #include <trace/hooks/sched.h>
 
+#ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ #include <asm/cputime.h>
+#endif
+
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 
 /*
@@ -502,13 +506,12 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	u64 cputime, steal;
 	int ticks = 1;
 
-	trace_android_vh_account_process_tick_gran(user_tick, &ticks);
+	trace_android_vh_account_process_tick_gran(p, this_rq(), user_tick, &ticks);
 	if (!ticks)
 		return;
 
 	if (vtime_accounting_enabled_this_cpu())
 		return;
-	trace_android_vh_account_task_time(p, this_rq(), user_tick, ticks);
 
 	if (sched_clock_irqtime) {
 		irqtime_account_process_tick(p, user_tick, ticks);

@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/timer.h>
 #include <linux/string.h>
+#include <linux/leds.h>
 
 #include "hid-ids.h"
 
@@ -57,7 +58,13 @@ static unsigned int swap_opt_cmd;
 module_param(swap_opt_cmd, uint, 0644);
 MODULE_PARM_DESC(swap_opt_cmd, "Swap the Option (\"Alt\") and Command (\"Flag\") keys. "
 		"(For people who want to keep Windows PC keyboard muscle memory. "
-		"[0] = as-is, Mac layout. 1 = swapped, Windows layout.)");
+		"[0] = as-is, Mac layout. 1 = swapped, Windows layout., 2 = swapped, Swap only left side)");
+
+static unsigned int swap_ctrl_cmd;
+module_param(swap_ctrl_cmd, uint, 0644);
+MODULE_PARM_DESC(swap_ctrl_cmd, "Swap the Control (\"Ctrl\") and Command (\"Flag\") keys. "
+		"(For people who are used to Mac shortcuts involving Command instead of Control. "
+		"[0] = No change. 1 = Swapped.)");
 
 static unsigned int swap_fn_leftctrl;
 module_param(swap_fn_leftctrl, uint, 0644);
@@ -308,7 +315,21 @@ static const struct apple_key_translation swapped_option_cmd_keys[] = {
 	{ KEY_LEFTALT,	KEY_LEFTMETA },
 	{ KEY_LEFTMETA,	KEY_LEFTALT },
 	{ KEY_RIGHTALT,	KEY_RIGHTMETA },
-	{ KEY_RIGHTMETA,KEY_RIGHTALT },
+	{ KEY_RIGHTMETA, KEY_RIGHTALT },
+	{ }
+};
+
+static const struct apple_key_translation swapped_option_cmd_left_keys[] = {
+	{ KEY_LEFTALT,	KEY_LEFTMETA },
+	{ KEY_LEFTMETA,	KEY_LEFTALT },
+	{ }
+};
+
+static const struct apple_key_translation swapped_ctrl_cmd_keys[] = {
+	{ KEY_LEFTCTRL,	KEY_LEFTMETA },
+	{ KEY_LEFTMETA,	KEY_LEFTCTRL },
+	{ KEY_RIGHTCTRL, KEY_RIGHTMETA },
+	{ KEY_RIGHTMETA, KEY_RIGHTCTRL },
 	{ }
 };
 
@@ -322,7 +343,10 @@ static const struct apple_non_apple_keyboard non_apple_keyboards[] = {
 	{ "SONiX USB DEVICE" },
 	{ "Keychron" },
 	{ "AONE" },
-	{ "GANSS" }
+	{ "GANSS" },
+	{ "Hailuck" },
+	{ "Jamesdonkey" },
+	{ "A3R" },
 };
 
 static bool apple_is_non_apple_keyboard(struct hid_device *hdev)
@@ -337,12 +361,6 @@ static bool apple_is_non_apple_keyboard(struct hid_device *hdev)
 	}
 
 	return false;
-}
-
-static bool apple_is_omoton_kb066(struct hid_device *hdev)
-{
-	return hdev->product == USB_DEVICE_ID_APPLE_ALU_WIRELESS_ANSI &&
-		strcmp(hdev->name, "Bluetooth Keyboard") == 0;
 }
 
 static inline void apple_setup_key_translation(struct input_dev *input,
@@ -407,7 +425,17 @@ static int hidinput_apple_event(struct hid_device *hid, struct input_dev *input,
 	}
 
 	if (swap_opt_cmd) {
-		trans = apple_find_translation(swapped_option_cmd_keys, code);
+		if (swap_opt_cmd == 2)
+			trans = apple_find_translation(swapped_option_cmd_left_keys, code);
+		else
+			trans = apple_find_translation(swapped_option_cmd_keys, code);
+
+		if (trans)
+			code = trans->to;
+	}
+
+	if (swap_ctrl_cmd) {
+		trans = apple_find_translation(swapped_ctrl_cmd_keys, code);
 
 		if (trans)
 			code = trans->to;
@@ -431,7 +459,6 @@ static int hidinput_apple_event(struct hid_device *hid, struct input_dev *input,
 			 hid->product == USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2015)
 			table = magic_keyboard_2015_fn_keys;
 		else if (hid->product == USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021 ||
-			 hid->product == USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2024 ||
 			 hid->product == USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2021 ||
 			 hid->product == USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2021)
 			table = apple2021_fn_keys;
@@ -682,7 +709,7 @@ static int apple_input_configured(struct hid_device *hdev,
 {
 	struct apple_sc *asc = hid_get_drvdata(hdev);
 
-	if (((asc->quirks & APPLE_HAS_FN) && !asc->fn_found) || apple_is_omoton_kb066(hdev)) {
+	if ((asc->quirks & APPLE_HAS_FN) && !asc->fn_found) {
 		hid_info(hdev, "Fn key not found (Apple Wireless Keyboard clone?), disabling Fn key handling\n");
 		asc->quirks &= ~APPLE_HAS_FN;
 	}
@@ -1036,10 +1063,6 @@ static const struct hid_device_id apple_devices[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021),
 		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK | APPLE_RDESC_BATTERY },
 	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021),
-		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK },
-	{ HID_USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2024),
-		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK | APPLE_RDESC_BATTERY },
-	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2024),
 		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2021),
 		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK | APPLE_RDESC_BATTERY },

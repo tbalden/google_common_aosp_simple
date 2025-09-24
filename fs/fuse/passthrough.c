@@ -5,6 +5,7 @@
 #include <linux/file.h>
 #include <linux/fuse.h>
 #include <linux/idr.h>
+#include <linux/splice.h>
 #include <linux/uio.h>
 
 #define PASSTHROUGH_IOCB_MASK                                                  \
@@ -19,17 +20,21 @@ static void fuse_file_accessed(struct file *dst_file, struct file *src_file)
 {
 	struct inode *dst_inode;
 	struct inode *src_inode;
+	struct timespec64 dst_ts;
+	struct timespec64 src_ts;
 
 	if (dst_file->f_flags & O_NOATIME)
 		return;
 
 	dst_inode = file_inode(dst_file);
 	src_inode = file_inode(src_file);
+	dst_ts = inode_get_ctime(dst_inode);
+	src_ts = inode_get_ctime(src_inode);
 
 	if ((!timespec64_equal(&dst_inode->i_mtime, &src_inode->i_mtime) ||
-	     !timespec64_equal(&dst_inode->i_ctime, &src_inode->i_ctime))) {
+	     !timespec64_equal(&dst_ts, &src_ts))) {
 		dst_inode->i_mtime = src_inode->i_mtime;
-		dst_inode->i_ctime = src_inode->i_ctime;
+		inode_set_ctime_to_ts(dst_inode, inode_get_ctime(src_inode));
 	}
 
 	touch_atime(&dst_file->f_path);
@@ -42,7 +47,7 @@ void fuse_copyattr(struct file *dst_file, struct file *src_file)
 
 	dst->i_atime = src->i_atime;
 	dst->i_mtime = src->i_mtime;
-	dst->i_ctime = src->i_ctime;
+	inode_set_ctime_to_ts(dst, inode_get_ctime(src));
 	i_size_write(dst, i_size_read(src));
 }
 
@@ -107,7 +112,6 @@ ssize_t fuse_passthrough_read_iter(struct kiocb *iocb_fuse,
 	}
 out:
 	revert_creds(old_cred);
-
 	fuse_file_accessed(fuse_filp, passthrough_filp);
 
 	return ret;
@@ -166,6 +170,52 @@ out:
 	return ret;
 }
 
+ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
+				     struct pipe_inode_info *pipe,
+				     size_t len, unsigned int flags)
+{
+	const struct cred *old_cred;
+	struct fuse_file *ff = in->private_data;
+	struct file *backing_file = ff->passthrough.filp;
+	ssize_t ret;
+
+	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
+		 backing_file, ppos ? *ppos : 0, len, flags);
+
+	old_cred = override_creds(ff->passthrough.cred);
+	fuse_file_accessed(in, backing_file);
+	ret = vfs_splice_read(backing_file, ppos, pipe, len, flags);
+	revert_creds(old_cred);
+
+	return ret;
+}
+
+ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
+		struct file *out, loff_t *ppos, size_t len, unsigned int flags)
+{
+	const struct cred *old_cred;
+	struct fuse_file *ff = out->private_data;
+	struct file *backing_file = ff->passthrough.filp;
+	struct inode *inode = file_inode(out);
+	ssize_t ret;
+
+	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
+		 backing_file, ppos ? *ppos : 0, len, flags);
+
+	inode_lock(inode);
+	old_cred = override_creds(ff->passthrough.cred);
+	file_start_write(backing_file);
+	ret = iter_file_splice_write(pipe, backing_file, ppos, len, flags);
+	file_end_write(backing_file);
+	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
+	revert_creds(old_cred);
+	if (ret > 0)
+		fuse_copyattr(out, backing_file);
+	inode_unlock(inode);
+
+	return ret;
+}
+
 ssize_t fuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	int ret;
@@ -214,8 +264,7 @@ int fuse_passthrough_open(struct fuse_dev *fud, u32 lower_fd)
 	}
 
 	if (!passthrough_filp->f_op->read_iter ||
-	    !((passthrough_filp->f_path.mnt->mnt_flags | MNT_READONLY) ||
-	       passthrough_filp->f_op->write_iter)) {
+	    !passthrough_filp->f_op->write_iter) {
 		pr_err("FUSE: passthrough file misses file operations.\n");
 		res = -EBADF;
 		goto err_free_file;

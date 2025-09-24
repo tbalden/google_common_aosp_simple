@@ -80,8 +80,8 @@ struct unix_sock {
 	struct path		path;
 	struct mutex		iolock, bindlock;
 	struct sock		*peer;
-	struct sock		*listener;
 	struct unix_vertex	*vertex;
+	struct sock		*listener;
 	spinlock_t		lock;
 	struct socket_wq	peer_wq;
 	wait_queue_entry_t	peer_wake;
@@ -91,10 +91,8 @@ struct unix_sock {
 #endif
 };
 
-static inline struct unix_sock *unix_sk(const struct sock *sk)
-{
-	return (struct unix_sock *)sk;
-}
+#define unix_sk(ptr) container_of_const(ptr, struct unix_sock, sk)
+#define unix_peer(sk) (unix_sk(sk)->peer)
 
 #define unix_state_lock(s)	spin_lock(&unix_sk(s)->lock)
 #define unix_state_unlock(s)	spin_unlock(&unix_sk(s)->lock)
