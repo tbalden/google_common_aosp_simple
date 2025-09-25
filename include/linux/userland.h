@@ -4,8 +4,7 @@
  * 2020 Pal Zoltan Illes @tbalden at github
  */
 
-extern struct selinux_state *get_extern_state(void);
-extern struct selinux_state *extern_state;
+extern bool is_selinux_initialized(void);
 extern bool is_decrypted;
 extern bool is_before_decryption;
 
