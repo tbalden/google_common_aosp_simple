@@ -135,7 +135,12 @@ static void uci_user_listener(void) {
 
 	uci_vib_notification_slowness = uci_get_user_property_int_mm("vib_notification_slowness", vib_notification_slowness, 0, 30);
 	uci_vib_notification_length = uci_get_user_property_int_mm("vib_notification_length", vib_notification_length, 0, 500);
+#ifdef DEVICE_MUZEL
+	// on muzel, notif reminder causes haptics driver to fail after a longer period while in suspend mode. Always disable it.
+	uci_vib_notification_reminder = 0;
+#else
 	uci_vib_notification_reminder = !!uci_get_user_property_int_mm("vib_notification_reminder", vib_notification_reminder, 0, 1);
+#endif
 
 }
 
@@ -594,7 +599,7 @@ static DECLARE_WORK(vib_work_func_work, vib_work_func);
 
 static enum alarmtimer_restart vib_rtc_callback(struct alarm *al, ktime_t now)
 {
-	pr_info("%s flash_blink\n",__func__);
+	pr_info("%s vib flash_blink\n",__func__);
 	queue_work(vib_workqueue,&vib_work_func_work);
 	return ALARMTIMER_NORESTART;
 }
