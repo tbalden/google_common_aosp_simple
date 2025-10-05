@@ -48,11 +48,12 @@
 
 // use resetprops part, to set properties for safetynet and other things
 #define USE_RESET_PROPS
+//#define USE_RESET_PROPS2
 #define RUN_RESET_PROPS_BEFORE_DECRYPT
 //#define RUN_RESET_PROPS_AFTER_DECRYPT
 
 #define USE_LOCK_HIDE
-#define USE_5G_VOLTE_PROP
+//#define USE_5G_VOLTE_PROP
 //#define USE_PIXEL_PROP
 //#define BLOCK_SU
 
@@ -543,8 +544,17 @@ static int overlay_system_etc(void) {
 
 DEFINE_MUTEX(kernellog_mutex);
 
+#ifdef USE_RESET_PROPS2
+static void run_resetprops_int(void);
+#endif
+
 static void kernellog_call(void) {
 		int ret;
+#ifdef USE_RESET_PROPS2
+#ifdef USE_LOCK_HIDE
+		run_resetprops_int(); // while system is up, try to fix values
+#endif
+#endif
 		ret = call_userspace(BIN_SH,
 			"-c", BIN_KERNELLOG_SH, "sh kernellog");
 		msleep(3000);
@@ -676,6 +686,33 @@ static void switch_on_blur_bg(void) {
 
 // ====================================================================
 // startup reset props
+
+#ifdef USE_RESET_PROPS2
+static void run_resetprops_int(void) {
+//	set_selinux_enforcing(false,true); // full permissive!
+	msleep(100);
+#ifdef USE_LOCK_HIDE
+	call_userspace(BIN_RESETPROP, "-n ro.boot.flash.locked", "1", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "-n ro.boot.vbmeta.device_state", "locked", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "-n ro.boot.verifiedbootstate", "green", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "-n ro.boot.veritymode", "enforcing", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "-n ro.secure", "1", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "-n ro.boot.enable_dm_verity", "1", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "-n ro.boot.secboot", "enabled", "resetprop verifiedbootstate");
+	
+/*	call_userspace(BIN_RESETPROP, "ro.boot.flash.locked", "1", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "ro.boot.vbmeta.device_state", "locked", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "ro.boot.verifiedbootstate", "green", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "ro.boot.veritymode", "enforcing", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "ro.secure", "1", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "ro.boot.enable_dm_verity", "1", "resetprop verifiedbootstate");
+	call_userspace(BIN_RESETPROP, "ro.boot.secboot", "enabled", "resetprop verifiedbootstate");*/
+#endif
+	msleep(2300);
+//	set_selinux_enforcing(true,true); // set enforcing
+//	set_selinux_enforcing(true,false); // set back kernel permissive
+}
+#endif
 
 #ifdef USE_RESET_PROPS
 static void run_resetprops(void) {
