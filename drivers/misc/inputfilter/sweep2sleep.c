@@ -127,6 +127,7 @@ static bool setup_done = false;
 // set to true if screen off was executed after the s2s gesture
 static bool screen_off_after_gesture = true;
 
+// should filtering be on for ongoing input events. Set to true when first touch in filtered area is detected (frozen coords)
 static bool filter_coords_status = false;
 
 //extern char* init_get_saved_command_line(void);
@@ -621,8 +622,6 @@ static void s2s_input_callback(struct work_struct *unused) {
 	return;
 }
 
-
-
 #ifdef CONFIG_DEBUG_S2S
 static int log_throttling_count = 0;
 #endif
@@ -639,6 +638,27 @@ static int in_gesture_finger_counter = 0;
 static int frozen_rand = 0;
 static bool freeze_touch_area_detected = false;
 static unsigned long last_outside_area_touch_time = 0;
+
+static int last_fallback_reschedule_time_sec = 4; // after 4 sec without finalized gesture, release finger count and filtering mode and s2s gesture detection
+
+static void last_fallback_reset_filter_callback(struct work_struct *unused) {
+	int status = (get_s2s_filter_mode()&&(filter_coords_status||in_gesture_finger_counter>0))?1:0;
+	pr_info("%s %d sec past after gesture's first touchdown... still in filter_coords_status?...%d\n",__func__,last_fallback_reschedule_time_sec,status);
+	if (status) {
+		pr_info("%s %d sec past after gesture's first touchdown, make sure it's released...\n",__func__,last_fallback_reschedule_time_sec);
+		in_gesture_finger_counter = 0;
+		finger_counter = 0;
+		sweep2sleep_reset(true);
+	}
+}
+
+static DECLARE_DELAYED_WORK(last_fallback_reset_filter_work, last_fallback_reset_filter_callback);
+
+static void start_last_fallback_reset_filter_work(void) {
+	pr_info("%s schedule last fallback reset filter work to %d seconds later...\n",__func__, last_fallback_reschedule_time_sec);
+	cancel_delayed_work_sync(&last_fallback_reset_filter_work);
+	schedule_delayed_work(&last_fallback_reset_filter_work, msecs_to_jiffies(last_fallback_reschedule_time_sec * 1000) );
+}
 
 bool s2s_freeze_coords(int *x, int *y, int r_x2, int r_y2) {
 	int divider = COORD_DIVIDER;
@@ -686,6 +706,8 @@ bool s2s_freeze_coords(int *x, int *y, int r_x2, int r_y2) {
 				frozen_first_x = r_x;
 				frozen_first_y = r_y;
 				freeze_touch_area_detected = true;
+				// if filtering mode is on start a last fallback reset work, if things get bad and screen would turn irresponsive due to stuck filtering...
+				start_last_fallback_reset_filter_work();
 				return true;
 			}
 		}
@@ -714,6 +736,7 @@ static bool filtering_on(void) {
 	return get_s2s_switch() && get_s2s_filter_mode() && (((filter_coords_status || freeze_touch_area_detected) && finger_counter<=1) || in_gesture_finger_counter>0);
 }
 #endif
+
 
 
 static bool __s2s_input_filter(struct input_handle *handle, unsigned int type,
@@ -1035,7 +1058,7 @@ static bool __s2s_input_filter(struct input_handle *handle, unsigned int type,
 				}
 			}
 			// in touch area, set filter status True...
-			if (!filter_coords_status) {
+			if (!filter_coords_status) { // if this is the first touch, store where the input coords were in frozen_x/y
 				frozen_x = touch_x;
 				frozen_y = touch_y;
 				frozen_rand = 0;
@@ -1144,6 +1167,8 @@ static void ntf_listener(char* event, int num_param, char* str_param) {
 #ifdef CONFIG_DEBUG_S2S
 		pr_info("%s [screen_wake], setting screen on before touch events...\n",__func__);
 #endif
+		freeze_touch_area_detected = false;
+		filter_coords_status = false;
 		in_gesture_finger_counter = 0;
 		screen_on_but_before_touch_events = true;
 		screen_on_untouch_events_after = 0;
