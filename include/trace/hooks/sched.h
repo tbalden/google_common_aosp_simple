@@ -438,6 +438,10 @@ DECLARE_HOOK(android_vh_mmput,
 	TP_PROTO(void *unused),
 	TP_ARGS(unused));
 
+DECLARE_HOOK(android_vh_mmput_mm,
+	TP_PROTO(struct mm_struct *mm),
+	TP_ARGS(mm));
+
 DECLARE_RESTRICTED_HOOK(android_rvh_attach_entity_load_avg,
 	TP_PROTO(struct cfs_rq *cfs_rq, struct sched_entity *se),
 	TP_ARGS(cfs_rq, se), 1);
@@ -481,6 +485,14 @@ DECLARE_HOOK(android_vh_prio_restore,
 	TP_ARGS(saved_prio));
 
 DECLARE_HOOK(android_vh_set_task_comm,
+	TP_PROTO(struct task_struct *p),
+	TP_ARGS(p));
+
+DECLARE_HOOK(android_vh_chk_task,
+	TP_PROTO(struct task_struct **pp, struct rq *rq),
+	TP_ARGS(pp, rq));
+
+DECLARE_HOOK(android_vh_put_task,
 	TP_PROTO(struct task_struct *p),
 	TP_ARGS(p));
 
