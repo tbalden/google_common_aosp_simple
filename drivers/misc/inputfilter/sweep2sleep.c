@@ -27,9 +27,13 @@
 #define FILTER_ONLY_AFTER_SOME_TOUCH_EVENTS
 
 
-#ifdef DEVICE_SHUSKY
 // in case of drivers that filter touch events like with offload google input driver...
+#ifdef DEVICE_SHUSKY
 #define DIRECT_INPUT
+#endif
+#ifdef DEVICE_CAIMITO
+#define DIRECT_INPUT
+#undef FILTER_ONLY_AFTER_SOME_TOUCH_EVENTS
 #endif
 
 #ifdef DIRECT_INPUT
@@ -41,9 +45,15 @@ static int first_touch_id_down = 0;
 //sweep2sleep
 #define S2S_PWRKEY_DUR         20
 
+static int COORD_DIVIDER = 1;
+
 #if 1
-#ifdef DEVICE_SHUSKY
-// 3120x1440 P8PRO 2992x1344
+#ifdef DEVICE_CAIMITO
+// P9PROXL 2992x1344
+static int S2S_Y_MAX = 2992;
+static int S2S_X_MAX = 1344;
+#elif defined(DEVICE_SHUSKY)
+// P8PRO 2992x1344
 static int S2S_Y_MAX = 2992;
 static int S2S_X_MAX = 1344;
 #else
@@ -97,6 +107,8 @@ static int s2s_reenable_after_screen_off = 1;
 static int s2s_kill_app_mode = 0;
 
 static int touch_x = 0, touch_y = 0, firstx = 0;
+static int frozen_first_x = 0;
+static int frozen_first_y = 0;
 static bool touch_x_called = false, touch_y_called = false, touch_down_called = false;
 static bool scr_on_touch = false, barrier[2] = {false, false};
 static bool exec_count = true;
@@ -114,6 +126,7 @@ static bool setup_done = false;
 // set to true if screen off was executed after the s2s gesture
 static bool screen_off_after_gesture = true;
 
+// should filtering be on for ongoing input events. Set to true when first touch in filtered area is detected (frozen coords)
 static bool filter_coords_status = false;
 
 //extern char* init_get_saved_command_line(void);
@@ -178,11 +191,16 @@ static int get_s2s_y_above(void) {
 
 extern bool machine_is_cheetah(void);
 extern bool machine_is_raven(void);
-extern bool machine_is_pro(void);
+extern bool machine_is_husky(void);
+extern bool machine_is_komodo(void);
 
 // device specifics
 static void s2s_setup_values(void) {
-	if (machine_is_pro()) {
+	if (machine_is_komodo()) {
+		pr_info("%s hw komodo (pro xl)\n",__func__);
+		// leave original values
+	} else
+	if (machine_is_husky()) {
 		pr_info("%s hw husky (pro)\n",__func__);
 		// leave original values
 	} else
@@ -194,11 +212,18 @@ static void s2s_setup_values(void) {
 		pr_info("%s hw raven\n",__func__);
 		// leave original values
 	} else {
-		pr_info("%s hw panther or oriole or sushy\n",__func__);
+		pr_info("%s hw panther or oriole or sushy or caiman\n",__func__);
+#ifdef DEVICE_CAIMITO
+		S2S_Y_MAX = 2856;
+		S2S_X_MAX = 1280;
+		S2S_X_LEFT_CORNER_END = 100;
+		S2S_X_RIGHT_CORNER_START = 1280-100;
+#else
 		S2S_Y_MAX = 2400;
 		S2S_X_MAX = 1080;
 		S2S_X_LEFT_CORNER_END = 100;
 		S2S_X_RIGHT_CORNER_START = 1080-100;
+#endif
 	}
 }
 
@@ -206,10 +231,10 @@ static void s2s_setup_values(void) {
 //#define HZ_250
 
 // detailed debug logs, grep for S2S_EVENTS for main events, grep for fresult=? for all event FILTER results
-//#define CONFIG_DEBUG_S2S
+#define CONFIG_DEBUG_S2S
 
 // to log all events detailed in __s2s filter
-//#define CONFIG_DEBUG_S2S_EVENTS
+#define CONFIG_DEBUG_S2S_EVENTS
 
 
 // pixel lockscreen would kick in, define this:
@@ -439,11 +464,12 @@ static DECLARE_WORK(sweep2sleep_longtap_count_work, sweep2sleep_longtap_count);
 
 
 
-
 /* Sweep2sleep main function */
-static void detect_sweep2sleep(int x, int y, bool st)
+static void detect_sweep2sleep(int x1, int y, bool st)
 {
+	int local_first_x = 0;
         int prevx = 0, nextx = 0;
+        int x = x1;
 #ifdef CONFIG_UCI
 	static unsigned long last_scheduled_vib_time = 0;
 	int s2s_y_limit = get_s2s_y_limit();
@@ -469,13 +495,16 @@ static void detect_sweep2sleep(int x, int y, bool st)
 		return;
 	}
 
+	// if in filter mode, we have a more precise first touch X coordinate stored in frozen_first_x. Use that, to avoid discrepancies between later events X coord differing too much from that original one.
+	if (get_s2s_filter_mode()) { local_first_x = frozen_first_x; } else { local_first_x = firstx; }
+
 #ifdef CONFIG_DEBUG_S2S
-	pr_info("%s sweep detection: from_corner %d firstx %d > width_cutoff %d && < corner_width %d\n", __func__, get_s2s_from_corner(), firstx, get_s2s_width_cutoff(), get_s2s_corner_width());
-	pr_info("%s sweep detection: from_corner %d firstx %d >= S2S_X_MAX - corner_width %d && < S2S_X_MAX - width_cutoff %d\n", __func__, get_s2s_from_corner(), firstx, S2S_X_MAX - get_s2s_corner_width(), S2S_X_MAX - get_s2s_width_cutoff());
+	pr_info("%s S2S_EVENT sweep detection: from_corner %d firstx %d (local_first_x %d)  > width_cutoff %d && < corner_width %d COMPARED x: %d y: %d\n", __func__, get_s2s_from_corner(), firstx, local_first_x, get_s2s_width_cutoff(), get_s2s_corner_width(), x, y);
+	pr_info("%s S2S_EVENT sweep detection: from_corner %d firstx %d >= S2S_X_MAX - corner_width %d && < S2S_X_MAX - width_cutoff %d\n", __func__, get_s2s_from_corner(), firstx, S2S_X_MAX - get_s2s_corner_width(), S2S_X_MAX - get_s2s_width_cutoff());
 #endif
 
 	//left->right
-	if (single_touch && ((firstx < (S2S_X_RIGHT_CORNER_START-40) && firstx < (S2S_X_MAX/2) && !get_s2s_from_corner()) || ((firstx > get_s2s_width_cutoff()) && firstx < get_s2s_corner_width())) && (get_s2s_switch() & SWEEP_RIGHT)) {
+	if (single_touch && ((local_first_x < (S2S_X_RIGHT_CORNER_START-40) && local_first_x < (S2S_X_MAX/2) && !get_s2s_from_corner()) || ((local_first_x > get_s2s_width_cutoff()) && local_first_x < get_s2s_corner_width())) && (get_s2s_switch() & SWEEP_RIGHT)) {
 		scr_on_touch=true;
 		prevx = firstx;
 		nextx = prevx + x_threshold_1;
@@ -529,7 +558,7 @@ static void detect_sweep2sleep(int x, int y, bool st)
 			}
 		}
 	//right->left
-	} else if (((firstx >= (S2S_X_LEFT_CORNER_END-40) && firstx > (S2S_X_MAX/2) && !get_s2s_from_corner()) || (firstx >= S2S_X_MAX - get_s2s_corner_width() && (firstx < S2S_X_MAX - get_s2s_width_cutoff()))) && (get_s2s_switch() & SWEEP_LEFT)) {
+	} else if (((local_first_x >= (S2S_X_LEFT_CORNER_END-40) && local_first_x > (S2S_X_MAX/2) && !get_s2s_from_corner()) || (local_first_x >= S2S_X_MAX - get_s2s_corner_width() && (local_first_x < S2S_X_MAX - get_s2s_width_cutoff()))) && (get_s2s_switch() & SWEEP_LEFT)) {
 		scr_on_touch=true;
 		prevx = firstx;
 		nextx = prevx - x_threshold_1;
@@ -593,8 +622,6 @@ static void s2s_input_callback(struct work_struct *unused) {
 	return;
 }
 
-
-
 #ifdef CONFIG_DEBUG_S2S
 static int log_throttling_count = 0;
 #endif
@@ -612,20 +639,37 @@ static int frozen_rand = 0;
 static bool freeze_touch_area_detected = false;
 static unsigned long last_outside_area_touch_time = 0;
 
+static int last_fallback_reschedule_time_sec = 4; // after 4 sec without finalized gesture, release finger count and filtering mode and s2s gesture detection
+
+static void last_fallback_reset_filter_callback(struct work_struct *unused) {
+	int status = (get_s2s_filter_mode()&&(filter_coords_status||in_gesture_finger_counter>0))?1:0;
+	pr_info("%s %d sec past after gesture's first touchdown... still in filter_coords_status?...%d\n",__func__,last_fallback_reschedule_time_sec,status);
+	if (status) {
+		pr_info("%s %d sec past after gesture's first touchdown, make sure it's released...\n",__func__,last_fallback_reschedule_time_sec);
+		in_gesture_finger_counter = 0;
+		finger_counter = 0;
+		sweep2sleep_reset(true);
+	}
+}
+
+static DECLARE_DELAYED_WORK(last_fallback_reset_filter_work, last_fallback_reset_filter_callback);
+
+static void start_last_fallback_reset_filter_work(void) {
+	pr_info("%s schedule last fallback reset filter work to %d seconds later...\n",__func__, last_fallback_reschedule_time_sec);
+	cancel_delayed_work_sync(&last_fallback_reset_filter_work);
+	schedule_delayed_work(&last_fallback_reset_filter_work, msecs_to_jiffies(last_fallback_reschedule_time_sec * 1000) );
+}
+
 bool s2s_freeze_coords(int *x, int *y, int r_x2, int r_y2) {
-#ifdef COORD_DIV_NEEDED
-// zf8
-	int r_x = r_x2/16;
-	int r_y = r_y2/16;
-#else
-	int r_x = r_x2;
-	int r_y = r_y2;
-#endif
+	int divider = COORD_DIVIDER;
+	int r_x = r_x2/divider;
+	int r_y = r_y2/divider;
+
 	real_x = r_x;
 	real_y = r_y;
 	if (get_s2s_switch() && get_s2s_filter_mode() && filter_coords_status) {
-		*x = frozen_x + (frozen_rand)%2; // make some random variance so input report will actually get it through
-		*y = S2S_Y_MAX + 3 + (frozen_rand++)%2; // don't let real Y get thru, it crashes the framework occasionally
+		*x = (frozen_x + (frozen_rand)%2)*divider; // make some random variance so input report will actually get it through
+		*y = (S2S_Y_MAX + 3 + (frozen_rand++)%2)*divider; // don't let real Y get thru, it crashes the framework occasionally
 
 #ifdef CONFIG_DEBUG_S2S
 		pr_info("%s frozen coords used filtered mode: %d %d\n",__func__,*x,*y);
@@ -637,11 +681,11 @@ bool s2s_freeze_coords(int *x, int *y, int r_x2, int r_y2) {
 		int s2s_y_limit = get_s2s_y_limit();
 		int s2s_y_above = get_s2s_y_above();
 #ifdef CONFIG_DEBUG_S2S
-		pr_info("%s | touch x/y gathered. | filter_coords_status %d finger_counter %d timediff %u \n",__func__, filter_coords_status, finger_counter, time_diff);
+		pr_info("%s | touch x/y gathered. | filter_coords_status %d finger_counter %d timediff %u r_x %d r_y %d \n",__func__, filter_coords_status, finger_counter, time_diff, r_x, r_y);
 #endif
 		if (get_s2s_switch() && get_s2s_filter_mode() && !filter_coords_status && !finger_counter && time_diff>TIME_DIFF) {
 			if (
-			// if ... first touch was not registered (filter_coords_status = false) && register only in corner area, and X is outside cordner area,
+			// if ... first touch was not registered (filter_coords_status = false) && register only in corner area, and X is outside corner area,
 			(!get_s2s_from_corner() || (get_s2s_from_corner() && (r_x > S2S_X_MAX - get_s2s_corner_width() || r_x < get_s2s_corner_width()))) &&
 			// or if... y is not in the touch area or x is not in the whole area,
 			(r_y < s2s_y_above && r_y > s2s_y_limit) &&
@@ -653,13 +697,17 @@ bool s2s_freeze_coords(int *x, int *y, int r_x2, int r_y2) {
 			(get_s2s_filter_mode() == 3 && (r_x > ((S2S_X_MAX * 6) / 10) || r_x < ((S2S_X_MAX * 4) / 10))) // both handed, in the middle region
 			)
 			)
-			{
-				*x = r_x + (frozen_rand)%2; // make some random variance so input report will actually get it through
-				*y = S2S_Y_MAX + 3 + (frozen_rand++)%2; // don't let real Y get thru, it crashes the framework occasionally
-#ifdef CONFIG_DEBUG_S2S
-				pr_info("%s S2S_EVENT: first touch --- frozen coords used filtered mode: %d %d\n",__func__,*x,*y);
-#endif
+			{	// comment out divider mul, as through direct input it will come back to s2s_direct_input too, making calculations incorrect
+				*x = (r_x + (frozen_rand)%2)*divider; // make some random variance so input report will actually get it through
+				*y = (S2S_Y_MAX + 3 + (frozen_rand++)%2)*divider; // don't let real Y get thru, it crashes the framework occasionally
+//#ifdef CONFIG_DEBUG_S2S
+				pr_info("%s S2S_EVENT: first touch on x %d y %d --- frozen coords used filtered mode: %d %d\n",__func__,r_x,r_y,*x,*y);
+//#endif
+				frozen_first_x = r_x;
+				frozen_first_y = r_y;
 				freeze_touch_area_detected = true;
+				// if filtering mode is on start a last fallback reset work, if things get bad and screen would turn irresponsive due to stuck filtering...
+				start_last_fallback_reset_filter_work();
 				return true;
 			}
 		}
@@ -679,7 +727,7 @@ static bool filtering_on(void) {
 	// ... or input will not work till screen off/on
 	if (screen_on_but_before_touch_events) {
 #ifdef CONFIG_DEBUG_S2S
-    		pr_info("%s [screen_wake], letting through events...\n",__func__);
+		pr_info("%s [screen_wake], letting through events...\n",__func__);
 #endif
 		return false;
 	}
@@ -690,8 +738,10 @@ static bool filtering_on(void) {
 #endif
 
 
+
 static bool __s2s_input_filter(struct input_handle *handle, unsigned int type,
 				unsigned int code, int value, bool direct_input, unsigned char touchId) {
+	int divider = COORD_DIVIDER;
 	bool first_touch_detection = false;
 
 	if (!setup_done) {
@@ -890,7 +940,7 @@ static bool __s2s_input_filter(struct input_handle *handle, unsigned int type,
 		if (get_s2s_switch() && get_s2s_filter_mode() && (filter_coords_status||freeze_touch_area_detected)) {
 			touch_x = real_x;
 		} else {
-			touch_x = value / 16; //
+			touch_x = value / divider; //
 		}
 		touch_x_called = true;
 	}
@@ -899,7 +949,7 @@ static bool __s2s_input_filter(struct input_handle *handle, unsigned int type,
 		if (get_s2s_switch() && get_s2s_filter_mode() && (filter_coords_status||freeze_touch_area_detected)) {
 			touch_y = real_y;
 		} else {
-			touch_y = value / 16; //
+			touch_y = value / divider; //
 		}
 		touch_y_called = true;
 	}
@@ -1008,7 +1058,7 @@ static bool __s2s_input_filter(struct input_handle *handle, unsigned int type,
 				}
 			}
 			// in touch area, set filter status True...
-			if (!filter_coords_status) {
+			if (!filter_coords_status) { // if this is the first touch, store where the input coords were in frozen_x/y
 				frozen_x = touch_x;
 				frozen_y = touch_y;
 				frozen_rand = 0;
@@ -1117,9 +1167,14 @@ static void ntf_listener(char* event, int num_param, char* str_param) {
 #ifdef CONFIG_DEBUG_S2S
 		pr_info("%s [screen_wake], setting screen on before touch events...\n",__func__);
 #endif
+		freeze_touch_area_detected = false;
+		filter_coords_status = false;
 		in_gesture_finger_counter = 0;
 		screen_on_but_before_touch_events = true;
 		screen_on_untouch_events_after = 0;
+#ifdef DEVICE_CAIMITO
+		finger_counter = 0;
+#endif
 	}
 }
 
@@ -1138,6 +1193,12 @@ static int input_dev_filter(struct input_dev *dev) {
 		return 0;
 	} else
 	if (strstr(dev->name, "synaptics_tcm_touch")) {
+#ifdef DIRECT_INPUT
+#ifdef DEVICE_CAIMITO
+		direct_input_driver = true;
+		COORD_DIVIDER = 10;
+#endif
+#endif
 		return 0;
 	} else
 	if (strstr(dev->name, "fts")) {
